@@ -219,6 +219,7 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
     let now_ms = snapshot.now_ms;
     let cal_event;
     let bpt_now;
+    let pipe_bps;
     {
         let mut live = state.live.lock().unwrap();
         if !live.history_done() {
@@ -229,6 +230,7 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
         let live_now = live.measure(now_ms);
         cal_event = live.take_calibration();
         bpt_now = live.bytes_per_token();
+        pipe_bps = live_now.pipe_bps;
         if live_now.available {
             if live_now.streaming {
                 snapshot.is_live = true;
@@ -276,13 +278,25 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
             }));
         }
         if let Some(cal) = &cal_event {
+            // 对账：清洗流按本调用区间积分 ÷ 生成长秒 ÷ 当前系数 = 该调用期间
+            // 显示口径的平均 t/s 预测，与落盘真值 true_tps 对比即可评估实时准确性
+            let pred_tps = if cal.gen_ms > 0 && cal.bpt_now > 0.0 {
+                cal.clean_bytes / (cal.gen_ms as f64 / 1000.0) / cal.bpt_now
+            } else {
+                0.0
+            };
             log.write(serde_json::json!({
                 "kind": "cal",
                 "t": now_ms,
                 "id": cal.id,
-                "bytes_kb": (cal.bytes / 1024.0 * 10.0).round() / 10.0,
+                "gen_ms": cal.gen_ms,
+                "eff": cal.eff,
+                "true_tps": (cal.true_tps * 10.0).round() / 10.0,
+                "raw_kb": (cal.raw_bytes / 1024.0 * 10.0).round() / 10.0,
+                "clean_kb": (cal.clean_bytes / 1024.0 * 10.0).round() / 10.0,
                 "bpt_sample": (cal.bpt_sample * 10.0).round() / 10.0,
                 "bpt_now": (cal.bpt_now * 10.0).round() / 10.0,
+                "pred_tps": (pred_tps * 10.0).round() / 10.0,
                 "skipped": cal.cal_skipped,
             }));
         }
@@ -303,6 +317,7 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
                 "t": now_ms,
                 "src": snapshot.live_source,
                 "tps": (snapshot.current_tps * 10.0).round() / 10.0,
+                "pipe": (pipe_bps / 10.0).round() * 10.0,
                 "stream": snapshot.is_live,
                 "ramp": snapshot.ramping,
                 "est": snapshot.is_estimating,

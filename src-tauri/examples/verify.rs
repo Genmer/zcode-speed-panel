@@ -257,15 +257,25 @@ fn main() {
             });
             writeln!(out, "{}", line).ok();
         }
-        // 校准事件（字节侧对单次调用的估计与样本）
+        // 校准事件（字节侧对单次调用的估计与样本，含与显示同口径的清洗积分对账）
         if let Some(cal) = &cal {
+            let pred_tps = if cal.gen_ms > 0 && cal.bpt_now > 0.0 {
+                cal.clean_bytes / (cal.gen_ms as f64 / 1000.0) / cal.bpt_now
+            } else {
+                0.0
+            };
             let line = serde_json::json!({
                 "kind": "cal",
                 "t": s.now_ms,
                 "id": cal.id,
-                "bytes_kb": (cal.bytes / 1024.0 * 10.0).round() / 10.0,
+                "gen_ms": cal.gen_ms,
+                "eff": cal.eff,
+                "true_tps": (cal.true_tps * 10.0).round() / 10.0,
+                "raw_kb": (cal.raw_bytes / 1024.0 * 10.0).round() / 10.0,
+                "clean_kb": (cal.clean_bytes / 1024.0 * 10.0).round() / 10.0,
                 "bpt_sample": (cal.bpt_sample * 10.0).round() / 10.0,
                 "bpt_now": (cal.bpt_now * 10.0).round() / 10.0,
+                "pred_tps": (pred_tps * 10.0).round() / 10.0,
                 "skipped": cal.cal_skipped,
             });
             writeln!(out, "{}", line).ok();
