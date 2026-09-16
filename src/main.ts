@@ -255,14 +255,14 @@ function enableDrag(el: HTMLElement) {
       .catch(() => {});
   });
 }
-enableDrag($("header"));
+enableDrag($("app-header"));
 enableDrag($("float-gauge"));
 enableDrag($("float-pill"));
 enableDrag($("float-pet"));
 
 // ---- 自绘标题栏：拖动移动、双击最大化，— / ▢ / ✕ 窗口控制 ----
 const currentWindow = () => import("@tauri-apps/api/window").then((m) => m.getCurrentWindow());
-$("header").addEventListener("dblclick", (e) => {
+$("app-header").addEventListener("dblclick", (e) => {
   if ((e.target as HTMLElement).closest("button, select, input")) return;
   if (hasTauri) currentWindow().then((w) => w.toggleMaximize()).catch(() => {});
 });
