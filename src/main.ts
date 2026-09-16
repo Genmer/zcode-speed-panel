@@ -1,6 +1,6 @@
 import "./style.css";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { ArcGauge, MiniGauge, drawSpark, fmtClock, fmtTokens, fmtTps } from "./gauges";
+import { ArcGauge, MiniGauge, SPEED_TIERS, drawSpark, fmtClock, fmtTokens, fmtTps } from "./gauges";
 import { PetWidget } from "./pet";
 import { startMock, type Snapshot } from "./mock";
 
@@ -32,6 +32,7 @@ const gCurrent = new ArcGauge($("g-current"), {
   color2: "#0ea5e9",
   kind: "speed",
   minScale: 60, // 最小量程 60 t/s，常见速度落在弧形中段更好读
+  tiers: SPEED_TIERS, // 0–30 绿 / 30–60 黄 / 60+ 红，随当前速度换色
 });
 
 const gAvg = new ArcGauge($("g-avg"), {
@@ -50,7 +51,7 @@ const gTotal = new ArcGauge($("g-total"), {
   kind: "tokens",
 });
 
-const miniGauge = new MiniGauge($("mini-gauge"));
+const miniGauge = new MiniGauge($("mini-gauge"), { tiers: SPEED_TIERS });
 // 存储键升级到 v2：让老用户也拿到一次新默认（鲸鱼女仆），之后的选择照常记住
 const PET_PACK_KEY = "petPack.v2";
 let currentPetPack = localStorage.getItem(PET_PACK_KEY) ?? "maid-deepseek-whale";
@@ -101,8 +102,15 @@ for (const id of ["float-pet", "float-gauge", "float-pill"]) {
 }
 window.addEventListener("mousedown", (e) => {
   if (!floatMenu.contains(e.target as Node)) hideFloatMenu();
+  if (!styleDropdown.contains(e.target as Node)) setStyleDropdownOpen(false);
 });
-window.addEventListener("blur", hideFloatMenu);
+window.addEventListener("blur", () => {
+  hideFloatMenu();
+  setStyleDropdownOpen(false);
+});
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") setStyleDropdownOpen(false);
+});
 $("float-menu-restore").addEventListener("click", () => {
   hideFloatMenu();
   requestMode("full");
@@ -202,17 +210,46 @@ function onSnapshot(s: Snapshot) {
 
 window.addEventListener("resize", redrawSpark);
 
-// ---- 模式与悬浮窗样式 ----
+// ---- 模式与悬浮窗样式（自绘下拉，替代原生 select：WebView2 弹层在浅色系统主题下看不清） ----
 function applyModeUi(mode: string) {
   document.body.classList.toggle("float-mode", mode === "float");
 }
 
+const STYLE_LABELS: Record<string, string> = {
+  pet: "桌宠",
+  gauge: "仪表悬浮窗",
+  pill: "胶囊悬浮窗",
+};
+
+let currentStyle = localStorage.getItem("floatStyle") ?? "gauge";
+const styleDropdown = $("float-style");
+const styleOptions = Array.from(
+  $<HTMLElement>("float-style-list").querySelectorAll<HTMLButtonElement>("button[data-value]"),
+);
+
 function applyStyleUi(style: string) {
+  currentStyle = style;
   document.body.classList.toggle("style-pet", style === "pet");
   document.body.classList.toggle("style-gauge", style === "gauge");
   document.body.classList.toggle("style-pill", style === "pill");
-  const sel = $<HTMLSelectElement>("float-style");
-  sel.value = style === "pill" || style === "pet" ? style : "gauge";
+  $("float-style-label").textContent = STYLE_LABELS[style] ?? STYLE_LABELS.gauge;
+  for (const opt of styleOptions) {
+    opt.classList.toggle("selected", opt.dataset.value === style);
+  }
+}
+
+function setStyleDropdownOpen(open: boolean) {
+  styleDropdown.classList.toggle("open", open);
+  $<HTMLButtonElement>("float-style-btn").setAttribute("aria-expanded", String(open));
+}
+
+function selectFloatStyle(style: string) {
+  setStyleDropdownOpen(false);
+  localStorage.setItem("floatStyle", style);
+  applyStyleUi(style);
+  if (document.body.classList.contains("float-mode")) {
+    tauriInvoke("set_float_style", { style }).catch(() => {});
+  }
 }
 
 function requestMode(mode: "full" | "float") {
@@ -220,8 +257,7 @@ function requestMode(mode: "full" | "float") {
     applyModeUi(mode);
     return;
   }
-  const style = $<HTMLSelectElement>("float-style").value;
-  tauriInvoke("set_mode", { mode, style }).catch(() => {});
+  tauriInvoke("set_mode", { mode, style: currentStyle }).catch(() => {});
 }
 
 $("btn-float").addEventListener("click", () => requestMode("float"));
@@ -233,21 +269,19 @@ $("float-pet-cycle").addEventListener("click", () => {
   localStorage.setItem(PET_PACK_KEY, currentPetPack);
 });
 
-$("float-style").addEventListener("change", () => {
-  const style = $<HTMLSelectElement>("float-style").value;
-  localStorage.setItem("floatStyle", style);
-  applyStyleUi(style);
-  if (document.body.classList.contains("float-mode")) {
-    tauriInvoke("set_float_style", { style }).catch(() => {});
-  }
+$("float-style-btn").addEventListener("click", () => {
+  setStyleDropdownOpen(!styleDropdown.classList.contains("open"));
 });
+for (const opt of styleOptions) {
+  opt.addEventListener("click", () => selectFloatStyle(opt.dataset.value!));
+}
 
 // 顶栏/悬浮窗拖动：mousedown 调 startDragging（按钮、下拉框除外）。
 // 目标自身带 data-tauri-drag-region 时由 Tauri 内核直接处理（跳过，避免双重拖动）
 function enableDrag(el: HTMLElement) {
   el.addEventListener("mousedown", (e) => {
     const target = e.target as HTMLElement;
-    if (target.closest("button, select, input")) return;
+    if (target.closest("button, select, input, .dropdown")) return;
     if (target.hasAttribute("data-tauri-drag-region")) return;
     e.preventDefault();
     import("@tauri-apps/api/window")
@@ -263,7 +297,7 @@ enableDrag($("float-pet"));
 // ---- 自绘标题栏：拖动移动、双击最大化，— / ▢ / ✕ 窗口控制 ----
 const currentWindow = () => import("@tauri-apps/api/window").then((m) => m.getCurrentWindow());
 $("app-header").addEventListener("dblclick", (e) => {
-  if ((e.target as HTMLElement).closest("button, select, input")) return;
+  if ((e.target as HTMLElement).closest("button, select, input, .dropdown")) return;
   if (hasTauri) currentWindow().then((w) => w.toggleMaximize()).catch(() => {});
 });
 if (hasTauri) {

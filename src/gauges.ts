@@ -40,6 +40,24 @@ const A0 = Math.PI * 0.75;
 const SWEEP = Math.PI * 1.5;
 const EST_COLOR = "#fbbf24";
 
+/** 速度分档：当前速度落在哪一档，进度弧与数字就用哪一档的颜色 */
+export interface SpeedTier {
+  /** 该档上界（含），最后一档为 Infinity */
+  upTo: number;
+  /** 6 位 hex；暗色轨道由代码追加透明度生成 */
+  color: string;
+}
+
+export const SPEED_TIERS: readonly SpeedTier[] = [
+  { upTo: 30, color: "#34d399" }, // 0–30 低速 · 绿
+  { upTo: 60, color: "#fbbf24" }, // 30–60 中速 · 黄
+  { upTo: Infinity, color: "#f87171" }, // 60+ 高速 · 红
+];
+
+function speedTier(v: number): SpeedTier {
+  return SPEED_TIERS.find((t) => v <= t.upTo) ?? SPEED_TIERS[SPEED_TIERS.length - 1];
+}
+
 function fitCanvas(
   canvas: HTMLCanvasElement,
 ): { ctx: CanvasRenderingContext2D; w: number; h: number } | null {
@@ -104,6 +122,8 @@ interface GaugeOptions {
   color: string;
   color2?: string;
   minScale: number;
+  /** 设置后进度弧/背景轨道按分档区间分段着色（当前速度表用） */
+  tiers?: readonly SpeedTier[];
 }
 
 abstract class BaseGauge {
@@ -151,13 +171,14 @@ export class ArcGauge extends BaseGauge {
   private unit: string;
   private kind: "speed" | "tokens";
 
-  constructor(canvas: HTMLCanvasElement, opts: { label: string; unit: string; color: string; color2?: string; kind: "speed" | "tokens"; minScale?: number }) {
+  constructor(canvas: HTMLCanvasElement, opts: { label: string; unit: string; color: string; color2?: string; kind: "speed" | "tokens"; minScale?: number; tiers?: readonly SpeedTier[] }) {
     // 默认：速度表最小量程 10 t/s，今日总量表 1 亿（超过后再按峰值放大）；
     // 可用 opts.minScale 覆盖（如当前速度表用 60，低速段分辨率更高）
     super(canvas, {
       color: opts.color,
       color2: opts.color2,
       minScale: opts.minScale ?? (opts.kind === "speed" ? 10 : 1e8),
+      tiers: opts.tiers,
     });
     this.label = opts.label;
     this.unit = opts.unit;
@@ -178,6 +199,8 @@ export class ArcGauge extends BaseGauge {
     ctx.textBaseline = "middle";
     ctx.fillText(this.label, cx, 16);
 
+    const frac = Math.max(0.0001, Math.min(1, this.value / this.max));
+    // 背景轨道统一灰色
     ctx.lineWidth = 13;
     ctx.lineCap = "round";
     ctx.strokeStyle = "rgba(255,255,255,0.07)";
@@ -185,17 +208,29 @@ export class ArcGauge extends BaseGauge {
     ctx.arc(cx, cy, r, A0, A0 + SWEEP);
     ctx.stroke();
 
-    const frac = Math.max(0.0001, Math.min(1, this.value / this.max));
-    const color = this.est ? EST_COLOR : this.opts.color;
-    const color2 = this.est ? "#d97706" : (this.opts.color2 ?? this.opts.color);
-    ctx.save();
-    ctx.shadowColor = color;
-    ctx.shadowBlur = 14;
-    ctx.strokeStyle = progressGradient(ctx, cx, cy, frac, color, color2);
-    ctx.beginPath();
-    ctx.arc(cx, cy, r, A0, A0 + SWEEP * frac);
-    ctx.stroke();
-    ctx.restore();
+    if (this.opts.tiers && !this.est) {
+      // 整条进度弧随当前速度所在档位整体换色：0–30 绿 / 30–60 黄 / 60+ 红
+      const tierColor = speedTier(this.value).color;
+      ctx.save();
+      ctx.shadowColor = tierColor;
+      ctx.shadowBlur = 14;
+      ctx.strokeStyle = tierColor;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, A0, A0 + SWEEP * frac);
+      ctx.stroke();
+      ctx.restore();
+    } else {
+      const color = this.est ? EST_COLOR : this.opts.color;
+      const color2 = this.est ? "#d97706" : (this.opts.color2 ?? this.opts.color);
+      ctx.save();
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 14;
+      ctx.strokeStyle = progressGradient(ctx, cx, cy, frac, color, color2);
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, A0, A0 + SWEEP * frac);
+      ctx.stroke();
+      ctx.restore();
+    }
 
     ctx.strokeStyle = "rgba(255,255,255,0.16)";
     ctx.lineWidth = 2;
@@ -231,7 +266,9 @@ export class ArcGauge extends BaseGauge {
       fs -= 2;
       ctx.font = `600 ${fs}px ${FONT}`;
     }
-    ctx.fillStyle = "#e6e9f0";
+    // 数字随当前档位换色（估算态/未分档保持原白色），待机为 0 时仍是默认白
+    ctx.fillStyle =
+      this.value > 0 && this.opts.tiers && !this.est ? speedTier(this.value).color : "#e6e9f0";
     ctx.fillText(main, cx, cy + 2);
     ctx.fillStyle = "#8b93a7";
     ctx.font = `11px ${FONT}`;
@@ -241,8 +278,8 @@ export class ArcGauge extends BaseGauge {
 
 /** 悬浮窗用的迷你仪表盘 */
 export class MiniGauge extends BaseGauge {
-  constructor(canvas: HTMLCanvasElement, opts?: { color?: string; color2?: string }) {
-    super(canvas, { color: opts?.color ?? "#22d3ee", color2: opts?.color2 ?? "#0ea5e9", minScale: 10 });
+  constructor(canvas: HTMLCanvasElement, opts?: { color?: string; color2?: string; tiers?: readonly SpeedTier[] }) {
+    super(canvas, { color: opts?.color ?? "#22d3ee", color2: opts?.color2 ?? "#0ea5e9", minScale: 10, tiers: opts?.tiers });
   }
 
   protected draw() {
@@ -253,6 +290,8 @@ export class MiniGauge extends BaseGauge {
     const cy = h * 0.52;
     const r = Math.min(w, h) * 0.36;
 
+    const frac = Math.max(0.0001, Math.min(1, this.value / this.max));
+    // 背景轨道统一灰色
     ctx.lineWidth = 7;
     ctx.lineCap = "round";
     ctx.strokeStyle = "rgba(255,255,255,0.08)";
@@ -260,21 +299,38 @@ export class MiniGauge extends BaseGauge {
     ctx.arc(cx, cy, r, A0, A0 + SWEEP);
     ctx.stroke();
 
-    const frac = Math.max(0.0001, Math.min(1, this.value / this.max));
-    const color = this.est ? EST_COLOR : this.opts.color;
-    const color2 = this.est ? "#d97706" : (this.opts.color2 ?? this.opts.color);
-    ctx.save();
-    ctx.shadowColor = color;
-    ctx.shadowBlur = 9;
-    ctx.strokeStyle = progressGradient(ctx, cx, cy, frac, color, color2);
-    ctx.beginPath();
-    ctx.arc(cx, cy, r, A0, A0 + SWEEP * frac);
-    ctx.stroke();
-    ctx.restore();
+    if (this.opts.tiers && !this.est) {
+      // 整条进度弧随当前速度所在档位整体换色
+      const tierColor = speedTier(this.value).color;
+      ctx.save();
+      ctx.shadowColor = tierColor;
+      ctx.shadowBlur = 9;
+      ctx.strokeStyle = tierColor;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, A0, A0 + SWEEP * frac);
+      ctx.stroke();
+      ctx.restore();
+    } else {
+      const color = this.est ? EST_COLOR : this.opts.color;
+      const color2 = this.est ? "#d97706" : (this.opts.color2 ?? this.opts.color);
+      ctx.save();
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 9;
+      ctx.strokeStyle = progressGradient(ctx, cx, cy, frac, color, color2);
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, A0, A0 + SWEEP * frac);
+      ctx.stroke();
+      ctx.restore();
+    }
 
     ctx.textAlign = "center";
     ctx.textBaseline = "alphabetic";
-    ctx.fillStyle = this.value > 0 ? "#e6e9f0" : "#8b93a7";
+    ctx.fillStyle =
+      this.value <= 0
+        ? "#8b93a7"
+        : this.opts.tiers && !this.est
+          ? speedTier(this.value).color
+          : "#e6e9f0";
     ctx.font = `600 ${Math.round(r * 0.5)}px ${FONT}`;
     ctx.fillText((this.est ? "≈" : "") + fmtTps(this.value), cx, cy + r * 0.12);
     ctx.fillStyle = "#8b93a7";

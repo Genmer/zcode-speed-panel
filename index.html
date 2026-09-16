@@ -9,7 +9,7 @@
     <div id="app">
       <header id="app-header" data-tauri-drag-region>
         <div class="brand">
-          <span class="logo">⚡</span>
+          <img class="logo" src="/app-icon.png" alt="ZCode" />
           <span>ZCode 速度仪表盘</span>
         </div>
         <div class="status">
@@ -17,11 +17,17 @@
           <span id="live-text">待机</span>
           <span class="sep">·</span>
           <span id="updated-at">--:--:--</span>
-          <select id="float-style" class="ghost-btn" title="悬浮窗样式">
-            <option value="pet">桌宠</option>
-            <option value="gauge">仪表悬浮窗</option>
-            <option value="pill">胶囊悬浮窗</option>
-          </select>
+          <div id="float-style" class="dropdown" title="悬浮窗样式">
+            <button id="float-style-btn" class="ghost-btn" type="button" aria-haspopup="listbox" aria-expanded="false">
+              <span id="float-style-label">仪表悬浮窗</span>
+              <span class="caret">▾</span>
+            </button>
+            <div id="float-style-list" class="dropdown-list" role="listbox" aria-label="悬浮窗样式">
+              <button type="button" role="option" data-value="pet">桌宠</button>
+              <button type="button" role="option" data-value="gauge">仪表悬浮窗</button>
+              <button type="button" role="option" data-value="pill">胶囊悬浮窗</button>
+            </div>
+          </div>
           <button id="btn-float" class="ghost-btn accent-btn" title="收起为悬浮窗（置顶、可拖动；点窗口关闭按钮效果相同）">⧉ 收起为悬浮窗</button>
           <span id="win-controls" title="拖动顶栏移动窗口；双击顶栏最大化/还原">
             <button id="wc-min" title="最小化">—</button>
