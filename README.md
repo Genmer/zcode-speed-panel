@@ -7,7 +7,7 @@
 
 <p><img src="app-icon.png" width="96" alt="应用图标" /></p>
 
-**[⬇ 下载最新版 Release](https://github.com/Masterchiefm/zcode-speed-panel/releases/latest)** —— Windows 安装包（NSIS）由 GitHub Actions 构建：推送 `v*` 标签自动发布新版，也可在 [Actions](https://github.com/Masterchiefm/zcode-speed-panel/actions) 页手动触发构建并下载产物（Artifacts）；普通推送不会自动编译。
+**[⬇ 下载最新版 Release](https://github.com/Masterchiefm/zcode-speed-panel/releases/latest)**
 
 ## 截图
 
