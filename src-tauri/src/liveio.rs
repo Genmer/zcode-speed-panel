@@ -348,47 +348,59 @@ mod imp {
                 self.files_hist.pop_front();
             }
             self.files_last_total = ft;
-
-            // 10s 窗口字节速率 + 自适应噪声底（逐进程）
-            let mut clean: HashMap<u32, f64> = HashMap::new();
-            for (pid, ring) in self.procs.iter_mut() {
-                let Some((last_t, last_w)) = ring.samples.back().copied() else {
-                    continue;
-                };
-                let base = ring
-                    .samples
-                    .iter()
-                    .rev()
-                    .find(|(t, _)| last_t.duration_since(*t).as_millis() >= WINDOW_MS as u128)
-                    .copied();
-                let raw = match base {
-                    Some((bt, bw)) => {
-                        let dt = last_t.duration_since(bt).as_secs_f64();
-                        if dt > 0.2 {
-                            (last_w.saturating_sub(bw)) as f64 / dt
-                        } else {
-                            0.0
-                        }
+            let files: Vec<(Instant, u64)> = self.files_hist.iter().copied().collect();
+            // [t0,t1] 区间内的落盘字节（rollout/日志/WAL），完成尖峰的来源
+            let file_growth = |t0: Instant, t1: Instant| -> f64 {
+                let mut acc = 0f64;
+                for w in files.windows(2) {
+                    let (pt, pv) = w[0];
+                    let (ct, cv) = w[1];
+                    if ct >= t0 && pt <= t1 {
+                        acc += cv.saturating_sub(pv) as f64;
                     }
-                    None => 0.0,
-                };
-                // 每拍最小增量 × 2 作为该进程的心跳噪声底
+                }
+                acc
+            };
+
+            // 10s 窗口字节速率：逐拍计算，先扣该拍的落盘字节再扣噪声底，
+            // 避免调用完成瞬间的落盘尖峰在窗口内形成 ~10s 的假速度激增
+            let mut clean: HashMap<u32, f64> = HashMap::new();
+            let window_start = now - Duration::from_millis(WINDOW_MS as u64);
+            for (pid, ring) in self.procs.iter_mut() {
                 let pairs: Vec<(Instant, u64)> = ring.samples.iter().copied().collect();
+                // 每拍最小增量的低分位 × 2 作为该进程的心跳噪声底（字节/拍）
                 let mut deltas: Vec<f64> = pairs
                     .windows(2)
                     .map(|w| w[1].1.saturating_sub(w[0].1) as f64)
                     .collect();
                 if !deltas.is_empty() {
                     deltas.sort_by(|a: &f64, b: &f64| a.partial_cmp(b).unwrap());
-                    let m = deltas[deltas.len() / 10];
-                    ring.min_delta = m * 2.0;
+                    ring.min_delta = deltas[deltas.len() / 10] * 2.0;
                 }
-                let floor = ring
-                    .min_delta
-                    .is_finite()
-                    .then_some(ring.min_delta / 0.5)
-                    .unwrap_or(0.0);
-                clean.insert(*pid, (raw - floor - BASE_NOISE_BPS).max(0.0));
+                let mut clean_sum = 0f64;
+                let mut time_sum = 0f64;
+                for w in pairs.windows(2) {
+                    let (pt, pw) = w[0];
+                    let (ct, cw) = w[1];
+                    if ct < window_start {
+                        continue;
+                    }
+                    let dt = ct.duration_since(pt).as_secs_f64();
+                    if dt <= 0.0 {
+                        continue;
+                    }
+                    // 该拍真实的 UI 管道写入 = 总写入 − 落盘写入
+                    let pipe = (cw.saturating_sub(pw)) as f64 - file_growth(pt, ct);
+                    let floor = ring.min_delta + BASE_NOISE_BPS * dt;
+                    clean_sum += (pipe - floor).max(0.0);
+                    time_sum += dt;
+                }
+                let rate = if time_sum > 1.0 {
+                    clean_sum / time_sum
+                } else {
+                    0.0
+                };
+                clean.insert(*pid, rate);
             }
 
             // 流式判定与换算（先做归属与校准，再判定，保证同拍生效）
