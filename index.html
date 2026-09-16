@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ZCode 速度仪表盘</title>
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <div class="brand">
+          <span class="logo">⚡</span>
+          <span>ZCode 速度仪表盘</span>
+        </div>
+        <div class="status">
+          <span id="live-dot" class="dot idle"></span>
+          <span id="live-text">待机</span>
+          <span class="sep">·</span>
+          <span id="updated-at">--:--:--</span>
+          <select id="float-style" class="ghost-btn" title="悬浮窗样式">
+            <option value="pet">桌宠</option>
+            <option value="gauge">仪表悬浮窗</option>
+            <option value="pill">胶囊悬浮窗</option>
+          </select>
+          <button id="btn-float" class="ghost-btn" title="收起为悬浮窗（置顶、可拖动）">⧉ 悬浮窗</button>
+        </div>
+      </header>
+
+      <main>
+        <section class="cards">
+          <div class="card gauge-card">
+            <canvas id="g-current"></canvas>
+            <div class="sub" id="sub-current">等待数据…</div>
+          </div>
+          <div class="card gauge-card">
+            <canvas id="g-avg"></canvas>
+            <div class="sub" id="sub-avg">等待数据…</div>
+          </div>
+          <div class="card gauge-card">
+            <canvas id="g-total"></canvas>
+            <div class="sub" id="sub-total">等待数据…</div>
+          </div>
+        </section>
+
+        <section class="card chart-card">
+          <div class="chart-head">
+            <span>近 15 分钟输出速度（token/s）</span>
+            <span id="chart-max" class="dim">峰值 0</span>
+          </div>
+          <canvas id="spark"></canvas>
+        </section>
+
+        <footer class="dim" id="statusbar">
+          <span id="st-dir">监控目录：…</span>
+          <span id="st-calls"></span>
+          <span id="st-sessions"></span>
+          <span id="st-last"></span>
+        </footer>
+      </main>
+
+      <!-- 悬浮窗·桌宠样式（默认）：精灵动画 + 头顶速度气泡，整块可拖动 -->
+      <div id="float-pet">
+        <canvas id="pet-canvas"></canvas>
+        <button id="float-pet-cycle" class="float-expand ghost-btn" title="换一只宠物" style="right: 34px;">🔄</button>
+        <button id="float-pet-expand" class="float-expand ghost-btn" title="展开完整面板">⤢</button>
+      </div>
+
+      <!-- 悬浮窗·仪表样式 -->
+      <div id="float-gauge">
+        <canvas id="mini-gauge"></canvas>
+        <button id="float-gauge-expand" class="float-expand ghost-btn" title="展开完整面板">⤢</button>
+      </div>
+
+      <!-- 悬浮窗·胶囊样式：整块可拖动，⤢ 展开 -->
+      <div id="float-pill">
+        <span id="float-dot" class="dot idle"></span>
+        <div id="float-val">
+          <span id="float-approx">≈</span>
+          <span id="float-tps">0.0</span>
+          <span class="float-unit">t/s</span>
+        </div>
+        <button id="float-pill-expand" class="float-expand ghost-btn" title="展开完整面板">⤢</button>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

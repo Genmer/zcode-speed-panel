@@ -1,0 +1,11 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/schemas/
+*.log
+
+*.log
+probe.log
+io_probe.log
+cal_samples.json
+title_trace.log

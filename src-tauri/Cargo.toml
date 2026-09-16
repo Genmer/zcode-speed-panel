@@ -1,0 +1,22 @@
+[package]
+name = "zcode-speed-panel"
+version = "0.1.0"
+description = "ZCode 输出速度仪表盘（托盘常驻）"
+edition = "2021"
+rust-version = "1.77"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-single-instance = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
