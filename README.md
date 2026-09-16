@@ -70,7 +70,7 @@
 python scripts/live_vs_true.py            # 实时 vs 真值 对账（旧格式日志自动退化 tick 回放）
 ```
 
-- 今日 Token 总量与 ZCode 官方统计同口径 = `input + output + reasoning + cache_creation`；**缓存命中（cache_read）是提示复用、不计入总量**，明细中单独展示。按事件完成时间归属"今日"，跨天自动重置。
+- 今日 Token 总量与 ZCode 官方统计同口径 = `input + output + reasoning + cache_creation`；**缓存命中（cache_read）是提示复用、不计入总量**，明细中以**缓存命中率**展示（cache_read ÷ 全部提示 token，即 input + cache_creation + cache_read）。按事件完成时间归属"今日"，跨天自动重置。
 
 > 隐私：所有数据仅从本地文件与进程读取，不上传任何内容。
 

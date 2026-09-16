@@ -140,6 +140,13 @@ function statusClass(s: Snapshot): string {
   return "dot idle";
 }
 
+/** 缓存命中率 = cache_read ÷ 全部提示 token（input + cache_creation + cache_read） */
+const cacheHitRate = (s: Snapshot): string => {
+  const prompt = s.inputTokens + s.cacheCreationTokens + s.cacheReadTokens;
+  if (prompt <= 0) return "0%";
+  return ((s.cacheReadTokens / prompt) * 100).toFixed(1) + "%";
+};
+
 function onSnapshot(s: Snapshot) {
   gCurrent.setTarget(s.currentTps, s.isEstimating);
   gAvg.setTarget(s.avgTps);
@@ -155,7 +162,7 @@ function onSnapshot(s: Snapshot) {
         ? "生成中 · 此段无增量字节，按近期真实速度估算 ≈"
         : "待机 · 已无生成任务";
   subAvg.textContent = `Σ输出 ÷ Σ生成时长 · 今日 ${s.callsToday} 次调用`;
-  subTotal.textContent = `输出 ${fmtTokens(s.outputTokens)} · 输入 ${fmtTokens(s.inputTokens)} · 缓存命中 ${fmtTokens(s.cacheReadTokens)}（未计入）`;
+  subTotal.textContent = `输出 ${fmtTokens(s.outputTokens)} · 输入 ${fmtTokens(s.inputTokens)} · 缓存命中率 ${cacheHitRate(s)}`;
 
   document.body.classList.toggle("live", s.isLive);
   document.body.classList.toggle("est", s.isEstimating);
