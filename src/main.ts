@@ -31,6 +31,7 @@ const gCurrent = new ArcGauge($("g-current"), {
   color: "#22d3ee",
   color2: "#0ea5e9",
   kind: "speed",
+  minScale: 60, // 最小量程 60 t/s，常见速度落在弧形中段更好读
 });
 
 const gAvg = new ArcGauge($("g-avg"), {

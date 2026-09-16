@@ -151,9 +151,14 @@ export class ArcGauge extends BaseGauge {
   private unit: string;
   private kind: "speed" | "tokens";
 
-  constructor(canvas: HTMLCanvasElement, opts: { label: string; unit: string; color: string; color2?: string; kind: "speed" | "tokens" }) {
-    // 速度表最小量程 10 t/s；今日总量表默认量程 1 亿（超过后再按峰值放大）
-    super(canvas, { color: opts.color, color2: opts.color2, minScale: opts.kind === "speed" ? 10 : 1e8 });
+  constructor(canvas: HTMLCanvasElement, opts: { label: string; unit: string; color: string; color2?: string; kind: "speed" | "tokens"; minScale?: number }) {
+    // 默认：速度表最小量程 10 t/s，今日总量表 1 亿（超过后再按峰值放大）；
+    // 可用 opts.minScale 覆盖（如当前速度表用 60，低速段分辨率更高）
+    super(canvas, {
+      color: opts.color,
+      color2: opts.color2,
+      minScale: opts.minScale ?? (opts.kind === "speed" ? 10 : 1e8),
+    });
     this.label = opts.label;
     this.unit = opts.unit;
     this.kind = opts.kind;
