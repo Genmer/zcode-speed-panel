@@ -9,6 +9,33 @@
 
 **[⬇ 下载最新版 Release](https://github.com/Masterchiefm/zcode-speed-panel/releases/latest)** —— Windows 安装包（NSIS）由 GitHub Actions 自动构建；推送 `v*` 标签即自动发布新版，任意提交的构建产物也可在 [Actions](https://github.com/Masterchiefm/zcode-speed-panel/actions) 页下载（Artifacts）。
 
+## 截图
+
+完整面板：当前速度 / 今日平均 / 今日总量三块仪表 + 近 15 分钟速度曲线 + 状态栏
+
+![主界面](docs/images/main-ui.png)
+
+两种悬浮窗形态（整块可拖动、右键菜单恢复/退出）：
+
+| 桌宠（头顶气泡显示实时速度） | 迷你仪表（弧线随速度分档变色） |
+|---|---|
+| ![桌宠](docs/images/pet.png) | ![迷你仪表](docs/images/mini-gauge.png) |
+
+## 下载与安装
+
+**推荐：直接使用 Release 里打包好的安装包**
+
+1. 打开 [最新 Release](https://github.com/Masterchiefm/zcode-speed-panel/releases/latest)；
+2. 在 Assets 里下载 `zcode-speed-panel_x.y.z_x64-setup.exe`；
+3. 双击运行安装向导即可，完成后从开始菜单启动；已装旧版本会被直接覆盖升级。
+
+其他方式：
+
+- **下载某次提交的构建产物**：到 [Actions](https://github.com/Masterchiefm/zcode-speed-panel/actions) 页选一次成功的 Build 运行，在 Artifacts 下载 `windows-installer`（与 Release 同一安装包，适用于体验尚未发版的最新改动）；
+- **从源码构建**：见下方[开发与构建](#开发与构建)。
+
+> 运行环境：Windows 10/11 x64，需 WebView2 运行时（Win11 自带）。所有数据仅从本地文件与进程读取，不上传任何内容。
+
 ## 功能
 
 - **悬浮窗模式**（点右上角高亮的"⧉ 收起为悬浮窗"，或直接点窗口关闭按钮）
