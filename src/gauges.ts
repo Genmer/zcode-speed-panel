@@ -277,7 +277,10 @@ export class MiniGauge extends BaseGauge {
   }
 }
 
-/** 近 15 分钟速度曲线；phase 让整条曲线随时间连续左移 */
+/** 近 15 分钟速度曲线（10 秒一档）；x 轴为真实墙钟时刻，整条曲线随时间连续左移 */
+const SPARK_BUCKET_MS = 10_000;
+const SPARK_GRID_MS = 5 * 60_000;
+
 export function drawSpark(
   canvas: HTMLCanvasElement,
   values: number[],
@@ -311,23 +314,36 @@ export function drawSpark(
     ctx.fillText(fmtTps((peak * (2 - i)) / 2), padL - 6, y);
   }
 
-  ctx.textAlign = "center";
-  ctx.textBaseline = "top";
-  const labels: Array<[string, number]> = [
-    ["-15m", 0],
-    ["-10m", 1 / 3],
-    ["-5m", 2 / 3],
-    ["现在", 1],
-  ];
-  for (const [text, frac] of labels) {
-    ctx.fillText(text, padL + iw * frac, h - padB + 4);
-  }
-
   if (n < 2) return;
-  const phase = ((nowMs % 10000) + 10000) % 10000 / 10000;
+  const phase = (((nowMs % SPARK_BUCKET_MS) + SPARK_BUCKET_MS) % SPARK_BUCKET_MS) / SPARK_BUCKET_MS;
   const dx = iw / n;
   const x = (i: number) => padL + iw - ((n - 1 - i) + phase) * dx;
   const y = (v: number) => padT + ih - (Math.min(v, peak) / peak) * ih;
+
+  // ---- x 轴真实时刻刻度（5 分钟整分）：与数据点同一时间映射反解 x，可直接对表验证。
+  // 最新桶结束时刻 = 下一个 10s 边界；右缘即"现在"（差 ≤1 档，肉眼不可辨）
+  const tLastEnd = Math.floor(nowMs / SPARK_BUCKET_MS) * SPARK_BUCKET_MS + SPARK_BUCKET_MS;
+  const xAt = (t: number) => padL + iw - ((tLastEnd - t) / SPARK_BUCKET_MS) * dx;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  let t = Math.ceil((tLastEnd - n * SPARK_BUCKET_MS) / SPARK_GRID_MS) * SPARK_GRID_MS;
+  for (; t <= tLastEnd; t += SPARK_GRID_MS) {
+    const gx = xAt(t);
+    if (gx < padL || gx > padL + iw) continue;
+    ctx.strokeStyle = "rgba(255,255,255,0.05)";
+    ctx.beginPath();
+    ctx.moveTo(gx, padT);
+    ctx.lineTo(gx, padT + ih);
+    ctx.stroke();
+    const d = new Date(t);
+    const hh = d.getHours().toString().padStart(2, "0");
+    const mm = d.getMinutes().toString().padStart(2, "0");
+    ctx.fillText(`${hh}:${mm}`, gx, h - padB + 4);
+  }
+  // 右缘：当前时刻（靠右对齐避免溢出）
+  ctx.textAlign = "right";
+  ctx.fillStyle = "rgba(139,147,167,0.9)";
+  ctx.fillText(`现在 ${fmtClock(nowMs).slice(0, 5)}`, padL + iw, h - padB + 4);
 
   const grad = ctx.createLinearGradient(0, padT, 0, padT + ih);
   grad.addColorStop(0, color + "52");

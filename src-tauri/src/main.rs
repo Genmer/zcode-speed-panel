@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, LogicalSize, Manager, WindowEvent};
+use tauri::{AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, WindowEvent};
 
 /// 窗口显示模式：完整面板 / 悬浮窗
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -61,16 +61,38 @@ impl FloatStyle {
     }
 }
 
+/// 持久化状态：模式、样式与两种模式各自记住的窗口位置/桌宠尺寸。
+/// 桌宠位置与完整面板位置互相独立——收起为桌宠时桌宠回到自己上次的位置
+/// （无记忆时锚定窗体中心，而不是窗体左上角），展开时窗体回到自己的老位置。
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+struct Persisted {
+    mode: String,
+    style: String,
+    /// 完整面板上次位置（物理像素）
+    #[serde(default)]
+    full_pos: Option<(i32, i32)>,
+    /// 悬浮窗上次位置（物理像素）
+    #[serde(default)]
+    float_pos: Option<(i32, i32)>,
+    /// 桌宠悬浮窗边长（逻辑像素）
+    #[serde(default)]
+    pet_size: Option<f64>,
+}
+
 struct AppState {
     engine: Mutex<Engine>,
     mode: Mutex<Mode>,
     style: Mutex<FloatStyle>,
     live: Mutex<LiveIo>,
     debug: Mutex<DebugLog>,
+    persist: Mutex<Persisted>,
+    /// 位置落盘节流（拖动期间每 2s 一次，关闭/退出立即落盘）
+    last_pos_save: Mutex<Option<std::time::Instant>>,
 }
 
 /// 调试日志：记录实时显示值、统计值与每轮调用完成后的真值，
-/// 供"实时读数 vs 落盘统计"的偏差分析。JSONL 追加写，超限轮转保留一代。
+/// 供"实时读数 vs 落盘统计"的偏差分析。JSONL 追加写，超限轮转保留一代；
+/// 轮转出的旧文件超过 7 天在启动时自动清理。
 struct DebugLog {
     file: Option<fs::File>,
     written: u64,
@@ -78,16 +100,37 @@ struct DebugLog {
 }
 
 const DEBUG_LOG_MAX: u64 = 8 * 1024 * 1024;
+/// 轮转旧日志的保留时长
+const DEBUG_LOG_KEEP: std::time::Duration = std::time::Duration::from_secs(7 * 86400);
 
 impl DebugLog {
     fn new() -> Self {
         let mut log = DebugLog { file: None, written: 0, last_heartbeat: std::time::Instant::now() };
+        log.cleanup_rotated();
         log.reopen();
         log
     }
 
     fn path() -> Option<PathBuf> {
         home_dir().map(|h| h.join(".zcode").join("speed-panel-debug.jsonl"))
+    }
+
+    /// 自动清理：删除超过保留期的轮转日志（speed-panel-debug.jsonl.N）
+    fn cleanup_rotated(&mut self) {
+        let Some(p) = DebugLog::path() else { return };
+        let Some(dir) = p.parent() else { return };
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            if !e.file_name().to_string_lossy().starts_with("speed-panel-debug.jsonl.") {
+                continue;
+            }
+            let Ok(meta) = e.metadata() else { continue };
+            if let Ok(mtime) = meta.modified() {
+                if mtime < std::time::SystemTime::now() - DEBUG_LOG_KEEP {
+                    let _ = fs::remove_file(e.path());
+                }
+            }
+        }
     }
 
     fn reopen(&mut self) {
@@ -119,38 +162,67 @@ impl DebugLog {
 const FULL_SIZE: (f64, f64) = (1000.0, 700.0);
 const FLOAT_GAUGE_SIZE: (f64, f64) = (116.0, 116.0);
 const FLOAT_PILL_SIZE: (f64, f64) = (224.0, 78.0);
-const FLOAT_PET_SIZE: (f64, f64) = (200.0, 200.0);
+/// 桌宠默认边长（逻辑像素），滚轮缩放范围 [100, 480]
+const FLOAT_PET_SIZE: f64 = 200.0;
+const PET_SIZE_MIN: f64 = 100.0;
+const PET_SIZE_MAX: f64 = 480.0;
 
 fn mode_file() -> Option<PathBuf> {
     home_dir().map(|h| h.join(".zcode").join("speed-panel-mode.txt"))
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct Persisted {
-    mode: String,
-    style: String,
-}
-
-fn load_state() -> (Mode, FloatStyle) {
+fn load_persisted() -> Persisted {
     let raw = mode_file().and_then(|p| fs::read_to_string(p).ok());
     match raw {
         Some(s) => match serde_json::from_str::<Persisted>(&s) {
-            Ok(p) => (Mode::parse(&p.mode), FloatStyle::parse(&p.style)),
+            Ok(p) => p,
             // 旧格式：纯文本 "full"/"float"
-            Err(_) => (Mode::parse(&s), FloatStyle::Gauge),
+            Err(_) => Persisted {
+                mode: s,
+                ..Default::default()
+            },
         },
-        None => (Mode::Full, FloatStyle::Gauge),
+        None => Persisted::default(),
     }
 }
 
-fn save_state(mode: Mode, style: FloatStyle) {
-    if let Some(p) = mode_file() {
-        let json = serde_json::json!({ "mode": mode.as_str(), "style": style.as_str() });
-        let _ = fs::write(p, json.to_string());
+fn save_all(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let mode = *state.mode.lock().unwrap();
+    let style = *state.style.lock().unwrap();
+    let p = state.persist.lock().unwrap().clone();
+    if let Some(path) = mode_file() {
+        let json = serde_json::json!({
+            "mode": mode.as_str(),
+            "style": style.as_str(),
+            "full_pos": p.full_pos,
+            "float_pos": p.float_pos,
+            "pet_size": p.pet_size,
+        });
+        let _ = fs::write(path, json.to_string());
     }
 }
 
-fn apply_mode(window: &tauri::WebviewWindow, mode: Mode, style: FloatStyle) {
+/// 把窗口完整拉回它所在显示器的可见区域（多屏时以窗口当前点定位）
+fn clamp_to_screen(window: &tauri::WebviewWindow, x: i32, y: i32, w: u32, h: u32) -> (i32, i32) {
+    let monitor = window
+        .monitor_from_point(x as f64, y as f64)
+        .ok()
+        .flatten()
+        .or_else(|| window.current_monitor().ok().flatten())
+        .or_else(|| window.primary_monitor().ok().flatten());
+    let Some(m) = monitor else {
+        return (x, y);
+    };
+    let mp = m.position();
+    let ms = m.size();
+    let max_x = (mp.x + ms.width as i32 - w as i32).max(mp.x);
+    let max_y = (mp.y + ms.height as i32 - h as i32).max(mp.y);
+    (x.clamp(mp.x, max_x), y.clamp(mp.y, max_y))
+}
+
+fn apply_mode(window: &tauri::WebviewWindow, mode: Mode, style: FloatStyle, p: &Persisted) {
+    let scale = window.scale_factor().unwrap_or(1.0);
     match mode {
         Mode::Full => {
             let _ = window.set_min_size(Some(LogicalSize::new(720.0, 520.0)));
@@ -160,12 +232,26 @@ fn apply_mode(window: &tauri::WebviewWindow, mode: Mode, style: FloatStyle) {
             let _ = window.set_always_on_top(false);
             let _ = window.set_skip_taskbar(false);
             let _ = window.set_shadow(true);
+            // 回到完整面板自己的老位置（无记忆时保持当前左上角，钳回可见区域）
+            if let Some((x, y)) = p.full_pos {
+                let (px, py) = clamp_to_screen(
+                    window,
+                    x,
+                    y,
+                    (FULL_SIZE.0 * scale) as u32,
+                    (FULL_SIZE.1 * scale) as u32,
+                );
+                let _ = window.set_position(PhysicalPosition::new(px, py));
+            }
         }
         Mode::Float => {
             let (w, h) = match style {
                 FloatStyle::Gauge => FLOAT_GAUGE_SIZE,
                 FloatStyle::Pill => FLOAT_PILL_SIZE,
-                FloatStyle::Pet => FLOAT_PET_SIZE,
+                FloatStyle::Pet => {
+                    let s = p.pet_size.unwrap_or(FLOAT_PET_SIZE).clamp(PET_SIZE_MIN, PET_SIZE_MAX);
+                    (s, s)
+                }
             };
             let _ = window.set_min_size(None::<LogicalSize<f64>>);
             let _ = window.set_size(LogicalSize::new(w, h));
@@ -175,17 +261,45 @@ fn apply_mode(window: &tauri::WebviewWindow, mode: Mode, style: FloatStyle) {
             let _ = window.set_always_on_top(true);
             let _ = window.set_skip_taskbar(true);
             let _ = window.set_shadow(false);
+            // 位置：桌宠/悬浮窗自己上次的位置；无记忆时锚定当前窗体中心
+            //（而不是跟随左上角——旧版收起后桌宠总落在原窗体左上角的问题）
+            let (pw, ph) = ((w * scale) as u32, (h * scale) as u32);
+            let target = match p.float_pos {
+                Some((x, y)) => clamp_to_screen(window, x, y, pw, ph),
+                None => {
+                    let cur = window.outer_position().unwrap_or_default();
+                    let sz = window.outer_size().unwrap_or_default();
+                    let cx = cur.x + sz.width as i32 / 2;
+                    let cy = cur.y + sz.height as i32 / 2;
+                    clamp_to_screen(window, cx - pw as i32 / 2, cy - ph as i32 / 2, pw, ph)
+                }
+            };
+            let _ = window.set_position(PhysicalPosition::new(target.0, target.1));
         }
     }
 }
 
 fn switch_mode(app: &AppHandle, mode: Mode) {
-    let style = *app.state::<AppState>().style.lock().unwrap();
-    if let Some(window) = app.get_webview_window("main") {
-        apply_mode(&window, mode, style);
+    let state = app.state::<AppState>();
+    let style = *state.style.lock().unwrap();
+    let prev = *state.mode.lock().unwrap();
+    // 记住旧模式下窗口的位置（两种模式各自独立记忆）
+    if let Some(win) = app.get_webview_window("main") {
+        if let Ok(pos) = win.outer_position() {
+            let mut p = state.persist.lock().unwrap();
+            match prev {
+                Mode::Full => p.full_pos = Some((pos.x, pos.y)),
+                Mode::Float => p.float_pos = Some((pos.x, pos.y)),
+            }
+        }
     }
-    save_state(mode, style);
-    *app.state::<AppState>().mode.lock().unwrap() = mode;
+    // 先更新模式再应用新尺寸/位置：应用过程触发的 Moved 事件按新模式回写
+    *state.mode.lock().unwrap() = mode;
+    let p = state.persist.lock().unwrap().clone();
+    if let Some(window) = app.get_webview_window("main") {
+        apply_mode(&window, mode, style, &p);
+    }
+    save_all(app);
     let _ = app.emit("mode", mode.as_str());
 }
 
@@ -361,13 +475,38 @@ fn set_float_style(app: AppHandle, style: String) {
         let mode = *state.mode.lock().unwrap();
         if mode == Mode::Float {
             if let Some(window) = app.get_webview_window("main") {
-                apply_mode(&window, mode, st);
+                let p = state.persist.lock().unwrap().clone();
+                apply_mode(&window, mode, st, &p);
             }
         }
     }
-    let mode = *app.state::<AppState>().mode.lock().unwrap();
-    save_state(mode, st);
+    save_all(&app);
     let _ = app.emit("float-style", st.as_str());
+}
+
+/// 桌宠滚轮缩放：调整悬浮窗边长（逻辑像素）并持久化
+#[tauri::command]
+fn set_float_size(app: AppHandle, size: f64) {
+    let size = size.clamp(PET_SIZE_MIN, PET_SIZE_MAX);
+    {
+        let state = app.state::<AppState>();
+        state.persist.lock().unwrap().pet_size = Some(size);
+        let mode = *state.mode.lock().unwrap();
+        let style = *state.style.lock().unwrap();
+        if mode == Mode::Float && style == FloatStyle::Pet {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_size(LogicalSize::new(size, size));
+            }
+        }
+    }
+    save_all(&app);
+}
+
+/// 悬浮窗右键菜单"退出"：保存状态后退出应用
+#[tauri::command]
+fn quit_app(app: AppHandle) {
+    save_all(&app);
+    app.exit(0);
 }
 
 fn show_main(app: &AppHandle) {
@@ -394,6 +533,30 @@ fn toggle_main(app: &AppHandle) {
     }
 }
 
+/// 窗口移动：按当前模式回写位置到内存，节流落盘（拖动每 2s 最多一次）
+fn on_window_moved(app: &AppHandle, pos: PhysicalPosition<i32>) {
+    let state = app.state::<AppState>();
+    let mode = *state.mode.lock().unwrap();
+    {
+        let mut p = state.persist.lock().unwrap();
+        match mode {
+            Mode::Full => p.full_pos = Some((pos.x, pos.y)),
+            Mode::Float => p.float_pos = Some((pos.x, pos.y)),
+        }
+    }
+    let due = {
+        let mut last = state.last_pos_save.lock().unwrap();
+        let due = last.map_or(true, |t| t.elapsed() > Duration::from_secs(2));
+        if due {
+            *last = Some(std::time::Instant::now());
+        }
+        due
+    };
+    if due {
+        save_all(app);
+    }
+}
+
 /// 后台轮询线程：增量解析 model-io 文件并推送快照
 fn poller(app: AppHandle) {
     loop {
@@ -415,8 +578,16 @@ fn main() {
             style: Mutex::new(FloatStyle::Gauge),
             live: Mutex::new(LiveIo::new()),
             debug: Mutex::new(DebugLog::new()),
+            persist: Mutex::new(Persisted::default()),
+            last_pos_save: Mutex::new(None),
         })
-        .invoke_handler(tauri::generate_handler![snapshot, set_mode, set_float_style])
+        .invoke_handler(tauri::generate_handler![
+            snapshot,
+            set_mode,
+            set_float_style,
+            set_float_size,
+            quit_app
+        ])
         .setup(|app| {
             // ---- 系统托盘 ----
             let show = MenuItem::with_id(app, "show", "显示面板", true, None::<&str>)?;
@@ -440,7 +611,10 @@ fn main() {
                         let cur = *app.state::<AppState>().mode.lock().unwrap();
                         switch_mode(app, if cur == Mode::Float { Mode::Full } else { Mode::Float });
                     }
-                    "quit" => app.exit(0),
+                    "quit" => {
+                        save_all(app);
+                        app.exit(0);
+                    }
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, ev| {
@@ -455,28 +629,34 @@ fn main() {
                 })
                 .build(app)?;
 
-            // ---- 关闭窗口 = 隐藏到托盘 ----
+            // ---- 关闭按钮 = 收起为悬浮窗；移动时记忆位置（两种模式各自独立） ----
             let win_handle = app.handle().clone();
             app.get_webview_window("main")
                 .unwrap()
-                .on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { api, .. } = event {
+                .on_window_event(move |event| match event {
+                    WindowEvent::CloseRequested { api, .. } => {
                         api.prevent_close();
-                        if let Some(win) = win_handle.get_webview_window("main") {
-                            let _ = win.hide();
-                        }
+                        save_all(&win_handle);
+                        // 点关闭 = 立刻变悬浮窗（不藏托盘；完全退出走托盘/右键菜单）
+                        switch_mode(&win_handle, Mode::Float);
                     }
+                    WindowEvent::Moved(pos) => on_window_moved(&win_handle, *pos),
+                    _ => {}
                 });
 
-            // ---- 恢复上次显示模式与悬浮窗样式后再亮出窗口，避免闪一下完整尺寸 ----
-            let (mode, style) = load_state();
+            // ---- 恢复上次显示模式、样式与位置后再亮出窗口，避免闪一下完整尺寸 ----
+            let persisted = load_persisted();
+            let mode = Mode::parse(&persisted.mode);
+            let style = FloatStyle::parse(&persisted.style);
             {
                 let state = app.state::<AppState>();
                 *state.mode.lock().unwrap() = mode;
                 *state.style.lock().unwrap() = style;
+                *state.persist.lock().unwrap() = persisted;
             }
             let window = app.get_webview_window("main").unwrap();
-            apply_mode(&window, mode, style);
+            let p = app.state::<AppState>().persist.lock().unwrap().clone();
+            apply_mode(&window, mode, style, &p);
             let _ = window.show();
 
             // ---- 启动轮询线程 ----

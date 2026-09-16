@@ -205,6 +205,55 @@ footer span {
   background: rgba(255, 255, 255, 0.12);
 }
 
+/* 收起为悬浮窗的主按钮：高亮渐变实底，与旁边的幽灵按钮明显区分 */
+.accent-btn {
+  background: linear-gradient(135deg, #22d3ee, #0ea5e9);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  color: #06131f;
+  font-weight: 700;
+  box-shadow: 0 2px 14px rgba(34, 211, 238, 0.35);
+}
+
+.accent-btn:hover {
+  color: #06131f;
+  filter: brightness(1.12);
+  box-shadow: 0 2px 18px rgba(34, 211, 238, 0.5);
+}
+
+/* 悬浮窗/桌宠右键菜单 */
+#float-menu {
+  display: none;
+  position: fixed;
+  z-index: 99;
+  flex-direction: column;
+  width: max-content;
+  min-width: 104px;
+  padding: 4px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(13, 20, 36, 0.97);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+}
+
+#float-menu button {
+  all: unset;
+  display: block;
+  padding: 6px 12px;
+  border-radius: 7px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+#float-menu button:hover {
+  background: rgba(34, 211, 238, 0.16);
+}
+
+#float-menu-quit:hover {
+  background: rgba(248, 113, 113, 0.18);
+}
+
 .dot.est {
   background: var(--amber);
   box-shadow: 0 0 10px rgba(251, 191, 36, 0.9);

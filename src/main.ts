@@ -50,12 +50,66 @@ const gTotal = new ArcGauge($("g-total"), {
 });
 
 const miniGauge = new MiniGauge($("mini-gauge"));
-let currentPetPack = localStorage.getItem("petPack") ?? "yuexinmiao";
+// 存储键升级到 v2：让老用户也拿到一次新默认（鲸鱼女仆），之后的选择照常记住
+const PET_PACK_KEY = "petPack.v2";
+let currentPetPack = localStorage.getItem(PET_PACK_KEY) ?? "maid-deepseek-whale";
 const petWidget = new PetWidget($<HTMLCanvasElement>("pet-canvas"), currentPetPack, () => {
   currentPetPack = petWidget.packId;
-  localStorage.setItem("petPack", currentPetPack);
+  localStorage.setItem(PET_PACK_KEY, currentPetPack);
 });
 petWidget.start();
+
+// ---- 桌宠滚轮缩放：上下滚动调整悬浮窗大小（后端记忆，重启后保持） ----
+const PET_BASE_SIZE = 200;
+const PET_SIZE_MIN = 100;
+const PET_SIZE_MAX = 480;
+let petSize = Math.min(PET_SIZE_MAX, Math.max(PET_SIZE_MIN, Number(localStorage.getItem("petSize.v1")) || PET_BASE_SIZE));
+$("float-pet").addEventListener(
+  "wheel",
+  (e) => {
+    e.preventDefault();
+    const next = petSize * (e.deltaY < 0 ? 1.08 : 1 / 1.08);
+    const clamped = Math.min(PET_SIZE_MAX, Math.max(PET_SIZE_MIN, next));
+    if (Math.round(clamped) === Math.round(petSize)) return;
+    petSize = clamped;
+    localStorage.setItem("petSize.v1", String(Math.round(clamped)));
+    if (hasTauri) {
+      tauriInvoke("set_float_size", { size: Math.round(clamped) }).catch(() => {});
+    }
+  },
+  { passive: false }
+);
+
+// ---- 悬浮窗/桌宠右键菜单：恢复窗体 / 退出 ----
+const floatMenu = $("float-menu");
+const showFloatMenu = (x: number, y: number) => {
+  floatMenu.style.display = "flex";
+  const mw = floatMenu.offsetWidth || 110;
+  const mh = floatMenu.offsetHeight || 60;
+  floatMenu.style.left = `${Math.max(0, Math.min(x, window.innerWidth - mw - 2))}px`;
+  floatMenu.style.top = `${Math.max(0, Math.min(y, window.innerHeight - mh - 2))}px`;
+};
+const hideFloatMenu = () => {
+  floatMenu.style.display = "none";
+};
+for (const id of ["float-pet", "float-gauge", "float-pill"]) {
+  $(id).addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    showFloatMenu(e.clientX, e.clientY);
+  });
+}
+window.addEventListener("mousedown", (e) => {
+  if (!floatMenu.contains(e.target as Node)) hideFloatMenu();
+});
+window.addEventListener("blur", hideFloatMenu);
+$("float-menu-restore").addEventListener("click", () => {
+  hideFloatMenu();
+  requestMode("full");
+});
+$("float-menu-quit").addEventListener("click", () => {
+  hideFloatMenu();
+  tauriInvoke("quit_app");
+});
 
 const sparkCanvas = $<HTMLCanvasElement>("spark");
 const liveDot = $("live-dot");
@@ -168,9 +222,8 @@ $("float-pill-expand").addEventListener("click", () => requestMode("full"));
 $("float-pet-expand").addEventListener("click", () => requestMode("full"));
 $("float-pet-cycle").addEventListener("click", () => {
   currentPetPack = petWidget.cyclePack();
-  localStorage.setItem("petPack", currentPetPack);
+  localStorage.setItem(PET_PACK_KEY, currentPetPack);
 });
-$("float-pet-expand").addEventListener("click", () => requestMode("full"));
 
 $("float-style").addEventListener("change", () => {
   const style = $<HTMLSelectElement>("float-style").value;

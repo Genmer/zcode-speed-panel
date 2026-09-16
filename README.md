@@ -1,19 +1,23 @@
 # ZCode 速度仪表盘（zcode-speed-panel）
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Build](https://github.com/Masterchiefm/zcode-speed-panel/actions/workflows/build.yml/badge.svg)](https://github.com/Masterchiefm/zcode-speed-panel/actions/workflows/build.yml)
 
 一个 Tauri 2 + Rust 的桌面常驻小工具：实时展示 ZCode CLI 的模型输出速度与今日 Token 用量，支持桌宠、迷你仪表盘与速度胶囊三种悬浮窗形态，可最小化到系统托盘。
 
-![预览](app-icon.png)
+<p><img src="app-icon.png" width="96" alt="应用图标" /></p>
+
+**[⬇ 下载最新版 Release](https://github.com/Masterchiefm/zcode-speed-panel/releases/latest)** —— Windows 安装包（NSIS）由 GitHub Actions 自动构建；推送 `v*` 标签即自动发布新版，任意提交的构建产物也可在 [Actions](https://github.com/Masterchiefm/zcode-speed-panel/actions) 页下载（Artifacts）。
 
 ## 功能
 
-- **悬浮窗模式**（点右上角"⧉ 悬浮窗"收起，置顶、不占任务栏）
-  - 三种样式可选（完整面板右上角下拉框）：**桌宠**（200×200，精灵动画随状态切换：生成中跑步、待机站立，头顶气泡显示实时速度，🔄 换宠物）/ **迷你仪表盘**（116×116）/ **速度胶囊**（224×78）
-  - 按住悬浮窗任意位置拖动；点右下角 ⤢ 展开回完整面板；托盘菜单也可切换
-  - 模式与样式都会记住，下次启动直接恢复
-- **近 15 分钟速度曲线**（10 秒一档，对齐墙钟边界，整条曲线随时间连续左移）
-- **窗口/托盘**：标题栏实时显示当前速度；托盘左键单击显示/隐藏；右键菜单（显示面板 / 隐藏到托盘 / 悬浮窗切换 / 退出）；点窗口关闭按钮 = 隐藏到托盘；重复启动自动唤起已有窗口
+- **悬浮窗模式**（点右上角高亮的"⧉ 收起为悬浮窗"，或直接点窗口关闭按钮）
+  - 三种样式可选（完整面板右上角下拉框）：**桌宠**（默认鲸鱼女仆，200×200；**滚轮上下滚动缩放** 100~480；双击或 🔄 换宠物；生成中跑步、待机站立，头顶气泡只显示实时速度）/ **迷你仪表盘**（116×116）/ **速度胶囊**（224×78）
+  - 按住任意位置拖动；点 ⤢ 或**右键菜单 → 恢复窗体**展开回完整面板；右键菜单还可**退出程序**
+  - 桌宠位置与完整面板位置**各自独立记忆**：收起时桌宠回到自己上次的位置（首次锚定窗体中心），展开时窗体回到自己的老位置，互不拉扯
+  - 模式、样式、两种位置与桌宠尺寸都会记住，下次启动直接恢复
+- **近 15 分钟速度曲线**（10 秒一档；横轴标注**真实墙钟时刻**，每 5 分钟一条刻度，整条曲线随时间连续左移，可直接对表验证）
+- **窗口/托盘**：标题栏实时显示当前速度；**点窗口关闭按钮 = 收起为悬浮窗**（不再藏进托盘）；托盘左键单击显示/隐藏；右键菜单（显示面板 / 隐藏到托盘 / 悬浮窗切换 / 退出）；重复启动自动唤起已有窗口
 - 状态栏：数据源（usage 数据库）、今日调用次数、会话数、最近活动时间
 
 ## 数据源
@@ -91,7 +95,7 @@ npm run tauri build    # 正式版（内嵌前端 + NSIS 安装包）
 cd src-tauri && cargo run --example dump
 ```
 
-**调试日志**：面板运行时持续把三类数据追加到 `~/.zcode/speed-panel-debug.jsonl`（8MB 自动轮转）：`tick`（实时显示值/清洗管道字节率 `pipe`/生效系数/统计图尾桶，活跃期逐拍+待机心跳 30s 一条）、`call`（每轮调用完成后的真实 token 与真实速度）、`cal`（每次校准与对账：真值 `true_tps`、原始/清洗积分字节 `raw_kb`/`clean_kb`、样本系数 `bpt_sample`、显示口径预测 `pred_tps`）。离线验证工具同样记录这三类事件：
+**调试日志**：面板运行时持续把三类数据追加到 `~/.zcode/speed-panel-debug.jsonl`（8MB 自动轮转保留一代，**轮转出的旧文件超过 7 天在启动时自动清理**）：`tick`（实时显示值/清洗管道字节率 `pipe`/生效系数/统计图尾桶，活跃期逐拍+待机心跳 30s 一条）、`call`（每轮调用完成后的真实 token 与真实速度）、`cal`（每次校准与对账：真值 `true_tps`、原始/清洗积分字节 `raw_kb`/`clean_kb`、样本系数 `bpt_sample`、显示口径预测 `pred_tps`）。离线验证工具同样记录这三类事件：
 
 ```bash
 cd src-tauri && cargo run --example verify -- 300 target/verify-log.jsonl   # 采样 5 分钟
@@ -103,6 +107,10 @@ python scripts/compare3.py src-tauri/target/verify-log.jsonl                # �
 ```bash
 cd src-tauri && cargo test
 ```
+
+### 自动构建与发布（GitHub Actions）
+
+推送到 `main` 或提交 PR 会自动编译 Windows 安装包（产物在 [Actions](https://github.com/Masterchiefm/zcode-speed-panel/actions) 页的 Artifacts 里）；打 `v*` 标签（如 `git tag v0.2.0 && git push --tags`）会自动创建 [Release](https://github.com/Masterchiefm/zcode-speed-panel/releases) 并附上 NSIS 安装包。配置见 [`.github/workflows/build.yml`](.github/workflows/build.yml)。
 
 ## 浏览器预览
 

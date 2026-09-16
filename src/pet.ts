@@ -72,7 +72,7 @@ export class PetWidget {
   private frame = 0;
   private lastFrameAt = 0;
   private tps = "";
-  private stateText = "待机";
+  private running = false;
   private est = false;
   private raf = 0;
   private expandBtn: HTMLElement | null = null;
@@ -103,7 +103,7 @@ export class PetWidget {
   setLive(tps: number, state: "idle" | "running" | "estimating") {
     this.tps = state === "estimating" ? "≈" + tps.toFixed(1) : tps.toFixed(1);
     this.est = state === "estimating";
-    this.stateText = state === "idle" ? "待机" : state === "estimating" ? "估算中" : "生成中";
+    this.running = state === "running";
     // 只有 IO 实测到流式输出才播放跑步动画；估算回退时保持站立
     this.anim = state === "running" ? "running" : "idle";
   }
@@ -173,7 +173,7 @@ export class PetWidget {
       if (this.cycleBtn) this.cycleBtn.style.right = `${rightGap + 26}px`;
     }
 
-    // 头顶速度气泡（贴顶）
+    // 头顶速度气泡（贴顶；估算用黄色、生成中用青色描边）
     ctx.textAlign = "center";
     ctx.font = `600 15px "Segoe UI", "Microsoft YaHei", sans-serif`;
     const label = `${this.tps} t/s`;
@@ -183,7 +183,7 @@ export class PetWidget {
     ctx.fillStyle = "rgba(13,20,36,0.88)";
     ctx.strokeStyle = this.est
       ? "rgba(251,191,36,0.75)"
-      : this.stateText === "生成中"
+      : this.running
         ? "rgba(34,211,238,0.75)"
         : "rgba(255,255,255,0.22)";
     ctx.lineWidth = 1;
@@ -199,10 +199,7 @@ export class PetWidget {
     ctx.closePath();
     ctx.fillStyle = "rgba(13,20,36,0.88)";
     ctx.fill();
-    ctx.fillStyle = this.est ? "#fbbf24" : this.stateText === "生成中" ? "#22d3ee" : "#8b93a7";
+    ctx.fillStyle = this.est ? "#fbbf24" : this.running ? "#22d3ee" : "#8b93a7";
     ctx.fillText(label, w / 2, by + 18);
-    ctx.font = `10px "Segoe UI", sans-serif`;
-    ctx.fillStyle = "rgba(139,147,167,0.9)";
-    ctx.fillText(this.stateText, w / 2, by + 44);
   }
 }

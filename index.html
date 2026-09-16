@@ -22,7 +22,7 @@
             <option value="gauge">仪表悬浮窗</option>
             <option value="pill">胶囊悬浮窗</option>
           </select>
-          <button id="btn-float" class="ghost-btn" title="收起为悬浮窗（置顶、可拖动）">⧉ 悬浮窗</button>
+          <button id="btn-float" class="ghost-btn accent-btn" title="收起为悬浮窗（置顶、可拖动；点窗口关闭按钮效果相同）">⧉ 收起为悬浮窗</button>
         </div>
       </header>
 
@@ -44,7 +44,7 @@
 
         <section class="card chart-card">
           <div class="chart-head">
-            <span>近 15 分钟输出速度（token/s）</span>
+            <span>近 15 分钟输出速度（10 秒一档 · token/s，横轴为真实时刻）</span>
             <span id="chart-max" class="dim">峰值 0</span>
           </div>
           <canvas id="spark"></canvas>
@@ -58,7 +58,7 @@
         </footer>
       </main>
 
-      <!-- 悬浮窗·桌宠样式（默认）：精灵动画 + 头顶速度气泡，整块可拖动 -->
+      <!-- 悬浮窗·桌宠样式（默认）：精灵动画 + 头顶速度气泡，整块可拖动，右键出菜单 -->
       <div id="float-pet">
         <canvas id="pet-canvas"></canvas>
         <button id="float-pet-cycle" class="float-expand ghost-btn" title="换一只宠物" style="right: 34px;">🔄</button>
@@ -80,6 +80,12 @@
           <span class="float-unit">t/s</span>
         </div>
         <button id="float-pill-expand" class="float-expand ghost-btn" title="展开完整面板">⤢</button>
+      </div>
+
+      <!-- 悬浮窗右键菜单：恢复窗体 / 退出 -->
+      <div id="float-menu">
+        <button id="float-menu-restore">⤢ 恢复窗体</button>
+        <button id="float-menu-quit">✕ 退出程序</button>
       </div>
     </div>
     <script type="module" src="/src/main.ts"></script>
