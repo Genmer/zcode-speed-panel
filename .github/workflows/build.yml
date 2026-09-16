@@ -50,9 +50,28 @@ jobs:
           releaseBody: "Windows 安装包（NSIS）。下载 `zcode-speed-panel_x.y.z_x64-setup.exe` 安装即可。"
           args: --target x86_64-pc-windows-msvc
 
-      - name: Upload installer artifact
+      # 免安装版：直接复制主程序 exe 并按版本号命名（与安装版 _x64-setup.exe 区分）
+      - name: Prepare portable exe
+        shell: bash
+        run: |
+          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          cp "src-tauri/target/x86_64-pc-windows-msvc/release/zcode-speed-panel.exe" \
+             "zcode-speed-panel_${VERSION}_x64-portable.exe"
+          echo "PORTABLE=zcode-speed-panel_${VERSION}_x64-portable.exe" >> "$GITHUB_ENV"
+
+      # 标签构建时把免安装版也附到 Release（安装版由 tauri-action 上传）
+      - name: Upload portable exe to release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${GITHUB_REF_NAME}" "${PORTABLE}" --clobber
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: windows-installer
-          path: src-tauri/target/**/bundle/nsis/*.exe
+          name: windows
+          path: |
+            src-tauri/target/**/bundle/nsis/*.exe
+            ${{ env.PORTABLE }}
           if-no-files-found: error

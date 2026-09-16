@@ -23,15 +23,16 @@
 
 ## 下载与安装
 
-**推荐：直接使用 Release 里打包好的安装包**
+**推荐：直接使用 Release 里打包好的文件**（每个版本两个文件，按需下载其一）
 
-1. 打开 [最新 Release](https://github.com/Masterchiefm/zcode-speed-panel/releases/latest)；
-2. 在 Assets 里下载 `zcode-speed-panel_x.y.z_x64-setup.exe`；
-3. 双击运行安装向导即可，完成后从开始菜单启动；已装旧版本会被直接覆盖升级。
+1. 打开 [最新 Release](https://github.com/Masterchiefm/zcode-speed-panel/releases/latest)，在 Assets 里二选一：
+   - `zcode-speed-panel_x.y.z_x64-setup.exe` —— **安装版**（推荐）：双击按向导安装，开始菜单启动，旧版本覆盖升级；
+   - `zcode-speed-panel_x.y.z_x64-portable.exe` —— **免安装版**：下载后放到任意目录直接双击运行，不写注册表、不建开始菜单，删掉文件即卸载。
+2. 两个版本功能完全一致，数据都存放在 `~/.zcode/` 下，可共存。
 
 其他方式：
 
-- **下载某次提交的构建产物**：到 [Actions](https://github.com/Masterchiefm/zcode-speed-panel/actions) 页选一次成功的 Build 运行，在 Artifacts 下载 `windows-installer`（与 Release 同一安装包，适用于体验尚未发版的最新改动）；
+- **下载某次提交的构建产物**：到 [Actions](https://github.com/Masterchiefm/zcode-speed-panel/actions) 页选一次成功的 Build 运行，在 Artifacts 下载 `windows`（含安装版与免安装版两个 exe，适用于体验尚未发版的最新改动）；
 - **从源码构建**：见下方[开发与构建](#开发与构建)。
 
 > 运行环境：Windows 10/11 x64，需 WebView2 运行时（Win11 自带）。所有数据仅从本地文件与进程读取，不上传任何内容。
@@ -142,7 +143,7 @@ cd src-tauri && cargo test
 
 ### 自动构建与发布（GitHub Actions）
 
-普通推送**不会**触发构建。两种出包方式：打 `v*` 标签（如 `git tag v0.2.0 && git push --tags`）会自动创建 [Release](https://github.com/Masterchiefm/zcode-speed-panel/releases) 并附上 NSIS 安装包；或在 [Actions](https://github.com/Masterchiefm/zcode-speed-panel/actions) 页选择 Build → **Run workflow**（选 `main` 分支）手动触发，产物在本次运行的 Artifacts 里。配置见 [`.github/workflows/build.yml`](.github/workflows/build.yml)。
+普通推送**不会**触发构建。两种出包方式：打 `v*` 标签（如 `git tag v0.2.0 && git push --tags`）会自动创建 [Release](https://github.com/Masterchiefm/zcode-speed-panel/releases)，Assets 附**安装版**（`_x64-setup.exe`）与**免安装版**（`_x64-portable.exe`）两个文件；或在 [Actions](https://github.com/Masterchiefm/zcode-speed-panel/actions) 页选择 Build → **Run workflow**（选 `main` 分支）手动触发，产物在本次运行的 Artifacts（`windows`，含两个 exe）。配置见 [`.github/workflows/build.yml`](.github/workflows/build.yml)。
 
 ## 浏览器预览
 

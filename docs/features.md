@@ -53,7 +53,7 @@
 
 ## CI 与发布
 
-- `.github/workflows/build.yml`：**不随普通推送自动触发**；`v*` 标签 → 自动创建 GitHub Release 附 NSIS 安装包；`workflow_dispatch` → Actions 页手动触发，产物在本次运行的 Artifacts。
+- `.github/workflows/build.yml`：**不随普通推送自动触发**；`v*` 标签 → 自动创建 GitHub Release，Assets 附安装版（`_x64-setup.exe`）与免安装版（`_x64-portable.exe`，主程序 exe 直接改名）两个文件；`workflow_dispatch` → Actions 页手动触发，产物在本次运行的 Artifacts（`windows`，含两个 exe）。
 - 本地正式版：`npm run tauri build` → `src-tauri/target/release/bundle/nsis/*.exe`。
 
 ## 已知边界情况
