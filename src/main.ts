@@ -242,19 +242,42 @@ $("float-style").addEventListener("change", () => {
   }
 });
 
-// 悬浮窗拖动：mousedown 调 startDragging（按钮除外）
+// 顶栏/悬浮窗拖动：mousedown 调 startDragging（按钮、下拉框除外）。
+// 目标自身带 data-tauri-drag-region 时由 Tauri 内核直接处理（跳过，避免双重拖动）
 function enableDrag(el: HTMLElement) {
   el.addEventListener("mousedown", (e) => {
-    if ((e.target as HTMLElement).closest("button")) return;
+    const target = e.target as HTMLElement;
+    if (target.closest("button, select, input")) return;
+    if (target.hasAttribute("data-tauri-drag-region")) return;
     e.preventDefault();
     import("@tauri-apps/api/window")
       .then(({ getCurrentWindow: g }) => g().startDragging().catch(() => {}))
       .catch(() => {});
   });
 }
+enableDrag($("header"));
 enableDrag($("float-gauge"));
 enableDrag($("float-pill"));
 enableDrag($("float-pet"));
+
+// ---- 自绘标题栏：拖动移动、双击最大化，— / ▢ / ✕ 窗口控制 ----
+const currentWindow = () => import("@tauri-apps/api/window").then((m) => m.getCurrentWindow());
+$("header").addEventListener("dblclick", (e) => {
+  if ((e.target as HTMLElement).closest("button, select, input")) return;
+  if (hasTauri) currentWindow().then((w) => w.toggleMaximize()).catch(() => {});
+});
+if (hasTauri) {
+  $("wc-min").addEventListener("click", () => {
+    currentWindow().then((w) => w.minimize()).catch(() => {});
+  });
+  $("wc-max").addEventListener("click", () => {
+    currentWindow().then((w) => w.toggleMaximize()).catch(() => {});
+  });
+  $("wc-close").addEventListener("click", () => requestMode("float"));
+} else {
+  // 浏览器预览无窗口控制
+  ($("win-controls") as HTMLElement).style.display = "none";
+}
 
 applyStyleUi(localStorage.getItem("floatStyle") ?? "gauge");
 

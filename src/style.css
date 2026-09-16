@@ -41,6 +41,37 @@ header {
   align-items: center;
   justify-content: space-between;
   padding: 14px 20px 10px;
+  user-select: none;
+}
+
+/* 自绘标题栏的窗口控制组（无边框窗口）：— 最小化 / ▢ 最大化 / ✕ 收起为悬浮窗 */
+#win-controls {
+  display: inline-flex;
+  margin-left: 10px;
+  gap: 2px;
+}
+
+#win-controls button {
+  all: unset;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 24px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--dim);
+  cursor: pointer;
+}
+
+#win-controls button:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text);
+}
+
+#wc-close:hover {
+  background: rgba(232, 17, 35, 0.85);
+  color: #fff;
 }
 
 .brand {

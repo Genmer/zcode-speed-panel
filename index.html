@@ -7,7 +7,7 @@
   </head>
   <body>
     <div id="app">
-      <header>
+      <header data-tauri-drag-region>
         <div class="brand">
           <span class="logo">⚡</span>
           <span>ZCode 速度仪表盘</span>
@@ -23,6 +23,11 @@
             <option value="pill">胶囊悬浮窗</option>
           </select>
           <button id="btn-float" class="ghost-btn accent-btn" title="收起为悬浮窗（置顶、可拖动；点窗口关闭按钮效果相同）">⧉ 收起为悬浮窗</button>
+          <span id="win-controls" title="拖动顶栏移动窗口；双击顶栏最大化/还原">
+            <button id="wc-min" title="最小化">—</button>
+            <button id="wc-max" title="最大化 / 还原">▢</button>
+            <button id="wc-close" title="收起为悬浮窗">✕</button>
+          </span>
         </div>
       </header>
 

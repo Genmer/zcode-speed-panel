@@ -227,7 +227,8 @@ fn apply_mode(window: &tauri::WebviewWindow, mode: Mode, style: FloatStyle, p: &
         Mode::Full => {
             let _ = window.set_min_size(Some(LogicalSize::new(720.0, 520.0)));
             let _ = window.set_size(LogicalSize::new(FULL_SIZE.0, FULL_SIZE.1));
-            let _ = window.set_decorations(true);
+            // 无边框：顶栏为前端自绘（拖动/双击最大化/— ▢ ✕），不再恢复系统装饰
+            let _ = window.set_decorations(false);
             let _ = window.set_resizable(true);
             let _ = window.set_always_on_top(false);
             let _ = window.set_skip_taskbar(false);
