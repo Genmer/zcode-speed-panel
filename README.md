@@ -36,6 +36,10 @@
 
 > 运行环境：Windows 10/11 x64，需 WebView2 运行时（Win11 自带）。所有数据仅从本地文件与进程读取，不上传任何内容。
 
+## 🙏 诚征桌宠素材：质谱娘
+
+现在的桌宠阵容太单薄了——特别想看 **质谱娘** 登场！如果你手上有质谱娘的桌宠素材（或愿意画一套），**恳请投稿**：到[征集 issue](https://github.com/Masterchiefm/zcode-speed-panel/issues/1) 留言，或直接提 PR。格式很简单，一个 `pet.json` + 一张 `spritesheet.webp`（参考 [`public/pets/`](public/pets/) 里现有宠物包），不会写代码也没关系，素材收到后由我们来集成，收录后会在 README 与 Release note 致谢。
+
 ## 功能
 
 - **悬浮窗模式**（点右上角高亮的"⧉ 收起为悬浮窗"，或直接点窗口关闭按钮）
@@ -147,10 +151,6 @@ cd src-tauri && cargo test
 ## 技术栈
 
 Tauri 2（Rust 后端：usage 数据库轮询 + 进程 IO 实测 + 托盘）、原生 Canvas 绘制仪表盘与桌宠（无图表库依赖）、Vite + TypeScript。
-
-## 🙏 诚征桌宠素材：质谱娘
-
-现在的桌宠阵容太单薄了——特别想看 **质谱娘** 登场！如果你手上有质谱娘的桌宠素材（或愿意画一套），**恳请投稿**：提 PR 或开 issue 均可。格式很简单，一个 `pet.json` + 一张 `spritesheet.webp`（参考 [`public/pets/`](public/pets/) 里现有宠物包），收录后会在页致谢。
 
 ## 致谢
 
