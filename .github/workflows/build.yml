@@ -1,10 +1,11 @@
 name: Build
 
+# 不随普通推送自动编译（省机时）；出包走两条路：
+#   1. 推送 v* 标签 → 自动创建 Release 并附安装包
+#   2. Actions 页 Run workflow 手动触发 → 产物在本次运行的 Artifacts
 on:
   push:
-    branches: [main]
     tags: ["v*"]
-  pull_request:
   workflow_dispatch:
 
 concurrency:
@@ -36,7 +37,7 @@ jobs:
         run: npm ci
 
       # 推送 v* 标签时自动创建 GitHub Release 并附上安装包；
-      # 分支/PR 构建只出产物（Artifacts），不发 Release
+      # 手动触发（workflow_dispatch）只出产物（Artifacts），不发 Release
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:

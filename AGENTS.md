@@ -38,6 +38,7 @@ public/pets/               宠物包资源；scripts/*.py 调试日志分析；.
 - 无系统标题栏：顶栏自绘（`#app-header` + `data-tauri-drag-region`，左侧为 `app-icon.png` 应用图标）；点 ✕ = 收起为悬浮窗，退出走托盘/右键菜单。
 - UI 下拉一律自绘（`.dropdown`），禁用原生 `<select>`——WebView2 弹层跟随系统浅色主题，深色界面里看不见字（key-rules #8）；顶栏新增交互组件须加入拖动/双击排除选择器。
 - 仪表配色：速度表分档色定义在 `src/gauges.ts` 顶部 `SPEED_TIERS`（0–30 绿 / 30–60 黄 / 60+ 红，整弧换色不分段，背景轨道恒灰），主表与迷你仪表共用。
+- CI 不随推送自动触发（省机时）：出包走 `v*` 标签（自动发 Release）或 Actions 页手动 Run workflow（Artifacts）；改动 workflow 触发逻辑须同步 README 与 `docs/features.md`。
 - 完整面板与悬浮窗位置各自独立记忆（`~/.zcode/speed-panel-mode.txt`）；悬浮窗尺寸用逻辑像素，物理换算走 `scale_factor()`，多屏定位必须 `clamp_to_screen`。
 
 ## 文档索引（按需阅读）

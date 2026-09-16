@@ -7,7 +7,7 @@
 
 <p><img src="app-icon.png" width="96" alt="应用图标" /></p>
 
-**[⬇ 下载最新版 Release](https://github.com/Masterchiefm/zcode-speed-panel/releases/latest)** —— Windows 安装包（NSIS）由 GitHub Actions 自动构建；推送 `v*` 标签即自动发布新版，任意提交的构建产物也可在 [Actions](https://github.com/Masterchiefm/zcode-speed-panel/actions) 页下载（Artifacts）。
+**[⬇ 下载最新版 Release](https://github.com/Masterchiefm/zcode-speed-panel/releases/latest)** —— Windows 安装包（NSIS）由 GitHub Actions 构建：推送 `v*` 标签自动发布新版，也可在 [Actions](https://github.com/Masterchiefm/zcode-speed-panel/actions) 页手动触发构建并下载产物（Artifacts）；普通推送不会自动编译。
 
 ## 截图
 
@@ -138,7 +138,7 @@ cd src-tauri && cargo test
 
 ### 自动构建与发布（GitHub Actions）
 
-推送到 `main` 或提交 PR 会自动编译 Windows 安装包（产物在 [Actions](https://github.com/Masterchiefm/zcode-speed-panel/actions) 页的 Artifacts 里）；打 `v*` 标签（如 `git tag v0.2.0 && git push --tags`）会自动创建 [Release](https://github.com/Masterchiefm/zcode-speed-panel/releases) 并附上 NSIS 安装包。配置见 [`.github/workflows/build.yml`](.github/workflows/build.yml)。
+普通推送**不会**触发构建。两种出包方式：打 `v*` 标签（如 `git tag v0.2.0 && git push --tags`）会自动创建 [Release](https://github.com/Masterchiefm/zcode-speed-panel/releases) 并附上 NSIS 安装包；或在 [Actions](https://github.com/Masterchiefm/zcode-speed-panel/actions) 页选择 Build → **Run workflow**（选 `main` 分支）手动触发，产物在本次运行的 Artifacts 里。配置见 [`.github/workflows/build.yml`](.github/workflows/build.yml)。
 
 ## 浏览器预览
 
