@@ -12,6 +12,10 @@ export interface Snapshot {
   sessionsToday: number;
   isLive: boolean;
   isEstimating: boolean;
+  /** 实测流式已开始但 30s 滑窗未填满（显示"统计中"） */
+  ramping: boolean;
+  /** 近 10 分钟已完成调用的真实速度（落盘口径） */
+  windowTps: number;
   liveSource: string;
   lastActivityMs: number;
   nowMs: number;
@@ -134,6 +138,8 @@ function snapshot(now: number): Snapshot {
     sessionsToday: sessions.size,
     isLive,
     isEstimating,
+    ramping: isLive && since < 30_000,
+    windowTps: wDur > 0 ? wOut / (wDur / 1000) : 0,
     liveSource: isLive ? "io" : isEstimating ? "window" : "idle",
     lastActivityMs: last,
     nowMs: now,

@@ -48,6 +48,11 @@ pub struct Snapshot {
     pub is_live: bool,
     /// 调用尚未落盘但按调用间隔推断仍在生成，速度为窗口回退值
     pub is_estimating: bool,
+    /// 实测流式已开始但 30s 滑窗未填满（读数来自已活跃区间，前端显示"统计中"）
+    pub ramping: bool,
+    /// 近 10 分钟已完成调用的真实速度（落盘口径，与速度曲线同源）。
+    /// 部分调用期间 UI 管道无增量字节（IO 实测不可用），用它做回退显示
+    pub window_tps: f64,
     /// 当前速度来源："io"=进程流实测 / "window"=窗口回退 / "idle"=待机
     pub live_source: String,
     pub last_activity_ms: i64,
@@ -218,6 +223,11 @@ impl Aggregator {
                 }
             }
         }
+        let window_tps = if w_dur > 0 {
+            w_out as f64 / (w_dur as f64 / 1000.0)
+        } else {
+            0.0
+        };
 
         // 总量口径与 ZCode 官方统计一致：input + output + reasoning + cache_creation，
         // 缓存命中（cache_read）是提示复用、不是新增用量，单独展示不计入
@@ -234,6 +244,8 @@ impl Aggregator {
             sessions_today: sessions.len() as u64,
             is_live: false,
             is_estimating,
+            ramping: false,
+            window_tps,
             live_source: if is_estimating {
                 "window".to_string()
             } else {
@@ -384,7 +396,43 @@ impl Engine {
 
     /// 今日已摄取的全部调用（供实时模块确定当前会话）
     pub fn calls(&self) -> &[Call] {
-        self.agg.calls()
+        &self.agg.calls()
+    }
+
+    /// 当前会话最新 assistant 消息的创建时刻。message 行在调用开始瞬间即提交
+    /// （实测 ≤200ms 可读），可与已完成调用的 completed_at 比较判断"调用进行中"。
+    pub fn latest_assistant_created(&self, session: &str) -> Option<i64> {
+        let conn = self.conn.as_ref()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT time_created, substr(data,1,80) FROM message \
+                 WHERE session_id = ?1 ORDER BY time_created DESC LIMIT 6",
+            )
+            .ok()?;
+        let rows = stmt
+            .query_map([session], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .ok()?;
+        for row in rows.flatten() {
+            if row.1.contains("\"assistant\"") {
+                return Some(row.0);
+            }
+        }
+        None
+    }
+
+    /// 是否有调用正在进行：最新 assistant 消息创建时间 > 最新已完成调用的完成时间
+    /// （同一调用完成时 completed_at 必然晚于其消息创建时刻，行落盘即视为结束）。
+    /// 返回 (会话, 调用开始时刻)。10 分钟上限兜底异常调用（崩溃后无完成行）。
+    pub fn call_in_flight(&self) -> Option<(String, i64)> {
+        let latest = self.agg.calls.iter().max_by_key(|c| c.completed_ms)?;
+        let created = self.latest_assistant_created(&latest.session)?;
+        if created > latest.completed_ms
+            && created > Utc::now().timestamp_millis() - 600_000
+        {
+            Some((latest.session.clone(), created))
+        } else {
+            None
+        }
     }
 }
 

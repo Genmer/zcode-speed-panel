@@ -94,9 +94,11 @@ function onSnapshot(s: Snapshot) {
 
   subCurrent.textContent =
     s.liveSource === "io"
-      ? `实时实测 · 进程流式输出（10s 真实测量）`
+      ? s.ramping
+        ? "实时实测 · 统计中…（30s 滑窗建立中）"
+        : "实时实测 · 进程流式输出（30s 滑窗实测）"
       : s.isEstimating
-        ? "长任务估算中 · 调用完成后自动校正"
+        ? "生成中 · 此段无增量字节，按近期真实速度估算 ≈"
         : "待机 · 已无生成任务";
   subAvg.textContent = `Σ输出 ÷ Σ生成时长 · 今日 ${s.callsToday} 次调用`;
   subTotal.textContent = `输出 ${fmtTokens(s.outputTokens)} · 输入 ${fmtTokens(s.inputTokens)} · 缓存命中 ${fmtTokens(s.cacheReadTokens)}（未计入）`;

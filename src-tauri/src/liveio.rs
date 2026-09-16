@@ -10,24 +10,51 @@
 use crate::metrics::Call;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
-
-const WINDOW_MS: u64 = 10_000;
-const RING_CAP: usize = 260; // ~130s @500ms
+const WINDOW_MS: u64 = 30_000;
+const RING_CAP: usize = 260; // ~180s @700ms
 const REFRESH_EVERY: Duration = Duration::from_secs(30);
 /// 流式判定阈值（扣除噪声底后）
 const STREAMING_BPS: f64 = 4_000.0;
+/// 启停由调用门控决定；该短窗仅用于定位幅度锚点（首字节拍）
+const DETECT_MS: u64 = 2_500;
+/// 显示路径的单拍增量钳位（≈140KB/s ≈ 90 t/s 上限）。调用开始瞬间有一次
+/// 请求体写网络的大突发（实测 ~190KB/拍，远超真实流式节奏），钳位将其从
+/// 读数与积分中剔除；校准链路不用钳位（突发按比例被 bpt 自校准吸收）
+const TICK_CLAMP_BYTES: f64 = 48_000.0;
 /// 待机心跳底噪的粗略上界（B/s），叠加每进程自适应底噪后足以过滤心跳
 const BASE_NOISE_BPS: f64 = 3_000.0;
 const DEFAULT_BPT: f64 = 1_600.0;
 const CAL_MIN: f64 = 400.0;
 const CAL_MAX: f64 = 8_000.0;
+/// 校准样本的调用规模下限：小调用的 UI 固定帧开销占比大，B/token 样本动辄
+/// 4000~8000，会把中位数系数抬高数倍、把读数压低到真值的 1/4~1/5（实测），
+/// 禁止入样本。系数只在长输出调用上校准
+const CAL_MIN_TOKENS: u64 = 300;
 
 #[derive(Default, Clone)]
 pub struct LiveNow {
     /// 是否成功发现了 CLI 进程（false 时前端回退到窗口/估算显示）
     pub available: bool,
     pub streaming: bool,
+    /// 流式已开始但 30s 滑窗尚未填满（读数来自已活跃区间，前端显示"统计中"）
+    pub ramping: bool,
     pub tps: f64,
+}
+
+/// 一次调用完成后的字节侧校准事件（调试日志用）
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CalEvent {
+    pub id: String,
+    pub session: String,
+    pub completed_ms: i64,
+    /// 流式区间实测字节（已扣落盘，未钳位）
+    pub bytes: f64,
+    /// 本次校准样本 B/token（0 = 未产生样本，如纯工具调用）
+    pub bpt_sample: f64,
+    /// 事件后生效的系数
+    pub bpt_now: f64,
+    /// 调用过短（<300 tok）未入校准
+    pub cal_skipped: bool,
 }
 
 struct ProcRing {
@@ -238,6 +265,14 @@ mod imp {
         current_session: Option<String>,
         attributed: HashSet<String>,
         history_done: bool,
+        /// 进行中的调用（Engine 由 message 表判定）：(会话, 调用开始时刻)
+        inflight: Option<(String, i64)>,
+        /// 本段调用的幅度锚点：首个达到流式阈值的字节拍
+        active_since: Option<Instant>,
+        /// 锚点所属的会话进程（变化时重置）
+        active_pid: Option<u32>,
+        /// 最近一次校准事件（供调试日志取用）
+        pending_cal: Option<CalEvent>,
     }
 
     impl LiveIo {
@@ -255,6 +290,10 @@ mod imp {
                 current_session: None,
                 attributed: HashSet::new(),
                 history_done: false,
+                inflight: None,
+                active_since: None,
+                active_pid: None,
+                pending_cal: None,
             }
         }
 
@@ -302,6 +341,21 @@ mod imp {
             while self.pending.len() > 8 {
                 self.pending.pop_front();
             }
+        }
+
+        /// 每拍更新"调用进行中"信号（Engine 由 message 表与完成行比较得出）
+        pub fn set_inflight(&mut self, inflight: Option<(String, i64)>) {
+            self.inflight = inflight;
+        }
+
+        /// 当前生效的字节→token 系数（调试日志用）
+        pub fn bytes_per_token(&self) -> f64 {
+            self.bytes_per_token
+        }
+
+        /// 取走最近一次校准事件（如有）
+        pub fn take_calibration(&mut self) -> Option<CalEvent> {
+            self.pending_cal.take()
         }
 
         /// 每个轮询周期调用一次
@@ -362,10 +416,11 @@ mod imp {
                 acc
             };
 
-            // 10s 窗口字节速率：逐拍计算，先扣该拍的落盘字节再扣噪声底，
-            // 避免调用完成瞬间的落盘尖峰在窗口内形成 ~10s 的假速度激增
-            let mut clean: HashMap<u32, f64> = HashMap::new();
-            let window_start = now - Duration::from_millis(WINDOW_MS as u64);
+            // 逐拍清洗后的采样对（30s 幅度窗内）：供启停判定与幅度计算共用。
+            // 每拍先扣落盘字节再扣噪声底，避免调用完成瞬间的落盘尖峰形成假速度。
+            let window_start = now - Duration::from_millis(WINDOW_MS);
+            let detect_start = now - Duration::from_millis(DETECT_MS);
+            let mut pairs_by_pid: HashMap<u32, Vec<(f64, f64, Instant)>> = HashMap::new();
             for (pid, ring) in self.procs.iter_mut() {
                 let pairs: Vec<(Instant, u64)> = ring.samples.iter().copied().collect();
                 // 每拍最小增量的低分位 × 2 作为该进程的心跳噪声底（字节/拍）
@@ -375,10 +430,14 @@ mod imp {
                     .collect();
                 if !deltas.is_empty() {
                     deltas.sort_by(|a: &f64, b: &f64| a.partial_cmp(b).unwrap());
-                    ring.min_delta = deltas[deltas.len() / 10] * 2.0;
+                    // 样本太少时不动用自适应底噪（避免冷启动吃掉起步信号）
+                    ring.min_delta = if deltas.len() >= 20 {
+                        deltas[deltas.len() / 10] * 2.0
+                    } else {
+                        0.0
+                    };
                 }
-                let mut clean_sum = 0f64;
-                let mut time_sum = 0f64;
+                let mut rows = Vec::new();
                 for w in pairs.windows(2) {
                     let (pt, pw) = w[0];
                     let (ct, cw) = w[1];
@@ -389,19 +448,14 @@ mod imp {
                     if dt <= 0.0 {
                         continue;
                     }
-                    // 该拍真实的 UI 管道写入 = 总写入 − 落盘写入
+                    // 该拍真实的 UI 管道写入 = 总写入 − 落盘写入（再钳掉请求体突发）
                     let pipe = (cw.saturating_sub(pw)) as f64 - file_growth(pt, ct);
                     let floor = ring.min_delta + BASE_NOISE_BPS * dt;
-                    clean_sum += (pipe - floor).max(0.0);
-                    time_sum += dt;
+                    rows.push((dt, (pipe - floor).max(0.0).min(TICK_CLAMP_BYTES), ct));
                 }
-                let rate = if time_sum > 1.0 {
-                    clean_sum / time_sum
-                } else {
-                    0.0
-                };
-                clean.insert(*pid, rate);
+                pairs_by_pid.insert(*pid, rows);
             }
+
 
             // 流式判定与换算（先做归属与校准，再判定，保证同拍生效）
             // 自校准 + 会话→进程归属：用刚完成的调用（真实 output_tokens）÷ 流式区间实测写字节
@@ -455,15 +509,37 @@ mod imp {
                     }
                 }
                 if call.effective_out() > 0 && bytes > file_bytes {
-                    let bpt = ((bytes - file_bytes) / call.effective_out() as f64)
-                        .clamp(CAL_MIN, CAL_MAX);
-                    self.cal.push_back(bpt);
-                    while self.cal.len() > 5 {
-                        self.cal.pop_front();
+                    let sample = (bytes - file_bytes) / call.effective_out() as f64;
+                    let in_cal = call.effective_out() >= CAL_MIN_TOKENS;
+                    let bpt = sample.clamp(CAL_MIN, CAL_MAX);
+                    if in_cal {
+                        self.cal.push_back(bpt);
+                        while self.cal.len() > 5 {
+                            self.cal.pop_front();
+                        }
+                        let mut sorted: Vec<f64> = self.cal.iter().copied().collect();
+                        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        self.bytes_per_token = sorted[sorted.len() / 2];
                     }
-                    let mut sorted: Vec<f64> = self.cal.iter().copied().collect();
-                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                    self.bytes_per_token = sorted[sorted.len() / 2];
+                    self.pending_cal = Some(CalEvent {
+                        id: call.id.clone(),
+                        session: call.session.clone(),
+                        completed_ms: call.completed_ms,
+                        bytes: bytes - file_bytes,
+                        bpt_sample: bpt,
+                        bpt_now: self.bytes_per_token,
+                        cal_skipped: !in_cal,
+                    });
+                } else {
+                    self.pending_cal = Some(CalEvent {
+                        id: call.id.clone(),
+                        session: call.session.clone(),
+                        completed_ms: call.completed_ms,
+                        bytes: bytes - file_bytes,
+                        bpt_sample: 0.0,
+                        bpt_now: self.bytes_per_token,
+                        cal_skipped: true,
+                    });
                 }
                 self.pending.pop_front();
             }
@@ -474,13 +550,71 @@ mod imp {
                 .as_ref()
                 .and_then(|s| self.session_pid.get(s))
                 .copied();
-            let (clean_total, had_pid) = match live_pid {
-                Some(pid) => (clean.get(&pid).copied().unwrap_or(0.0), true),
-                None => (clean.values().sum(), false), // 无法归属时退化为全局
+            // 会话进程变化时重置幅度锚点，避免跨会话残留
+            if live_pid != self.active_pid {
+                self.active_pid = live_pid;
+                self.active_since = None;
+            }
+
+            // 启停判定（调用门控）：message 表的 assistant 行在调用开始瞬间提交、
+            // 完成行在调用结束落盘，"开始时间 > 完成时间"即调用进行中——
+            // 开始当拍生效（首 token 前即亮"统计中"），完成行落盘当拍归零。
+            // 工具执行/待机期间管道同样有 UI 状态突发，门控将其可靠排除。
+            // 门控不可用时（尚无任何已完成调用做基线）退化为纯字节判定。
+            let model_active = self
+                .inflight
+                .as_ref()
+                .map_or(false, |(s, _)| Some(s) == self.current_session.as_ref());
+            let (det_s, det_d) = match live_pid {
+                Some(pid) => sum_span(pairs_by_pid.get(&pid).into_iter().flatten(), detect_start),
+                None => sum_span(pairs_by_pid.values().flatten(), detect_start),
             };
-            let streaming = clean_total > STREAMING_BPS;
+            let detect_total = if det_d > 0.0 { det_s / det_d } else { 0.0 };
+            let gate_on = if self.inflight.is_some() {
+                model_active
+            } else {
+                self.current_session.is_none() && detect_total > STREAMING_BPS
+            };
+            if gate_on {
+                // 幅度锚点：本段调用内首个达到流式阈值的字节拍
+                if self.active_since.is_none() && detect_total > STREAMING_BPS {
+                    self.active_since = Some(now);
+                }
+            } else {
+                self.active_since = None;
+            }
+
+            // 幅度：30s 滑窗 ∩ [首字节拍, now]。首字节当拍即有真实读数（此前为
+            // TTFT，显示"统计中"）；稳态覆盖满 30s（平滑）；停止当拍归零
+            let mag_total = if gate_on {
+                match self.active_since {
+                    Some(anchor) => {
+                        let left = anchor.max(window_start);
+                        let (s, d) = match live_pid {
+                            Some(pid) => {
+                                sum_span(pairs_by_pid.get(&pid).into_iter().flatten(), left)
+                            }
+                            None => sum_span(pairs_by_pid.values().flatten(), left),
+                        };
+                        if d > 0.0 {
+                            s / d
+                        } else {
+                            0.0
+                        }
+                    }
+                    None => 0.0, // 首字节未到（TTFT），显示统计中
+                }
+            } else {
+                0.0
+            };
+            let streaming = gate_on;
+            let ramping = streaming
+                && (self.active_since.is_none()
+                    || self
+                        .active_since
+                        .map_or(false, |t| now.duration_since(t) < Duration::from_millis(WINDOW_MS)));
             let tps = if streaming {
-                clean_total / self.bytes_per_token
+                mag_total / self.bytes_per_token
             } else {
                 0.0
             };
@@ -488,12 +622,27 @@ mod imp {
             let result = LiveNow {
                 available: !self.procs.is_empty(),
                 streaming,
+                ramping,
                 tps,
             };
-            let _ = had_pid;
             self.last_result = result.clone();
             result
         }
+    }
+
+    /// 统计 [left, +∞) 内清洗后的字节速率分子/分母（秒）
+    fn sum_span<'a, I>(rows: I, left: Instant) -> (f64, f64)
+    where
+        I: Iterator<Item = &'a (f64, f64, Instant)>,
+    {
+        let (mut s, mut d) = (0.0, 0.0);
+        for (dt, v, ct) in rows {
+            if *ct >= left {
+                s += v;
+                d += dt;
+            }
+        }
+        (s, d)
     }
 }
 
@@ -509,6 +658,13 @@ impl LiveIo {
         LiveIo
     }
     pub fn observe(&mut self, _new_calls: &[Call]) {}
+    pub fn set_inflight(&mut self, _inflight: Option<(String, i64)>) {}
+    pub fn bytes_per_token(&self) -> f64 {
+        1600.0
+    }
+    pub fn take_calibration(&mut self) -> Option<CalEvent> {
+        None
+    }
     pub fn measure(&mut self, _now_ms: i64) -> LiveNow {
         LiveNow::default()
     }

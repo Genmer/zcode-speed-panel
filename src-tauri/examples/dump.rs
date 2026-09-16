@@ -14,6 +14,7 @@ fn main() {
     for i in 0..8 {
         let calls = e.poll();
         li.observe(&calls);
+        li.set_inflight(e.call_in_flight());
         let live = li.measure(e.snapshot().now_ms);
         let s = e.snapshot();
         println!(
