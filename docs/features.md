@@ -31,12 +31,12 @@
   | cal_grace_ms（延迟落盘宽限） | 0（当拍处理） | 15_000 | mac 的 ri_diskio_byteswritten 是页缓存异步落盘计数，滞后 write() 数秒~数十秒（实测 117s 调用 96% 字节落在 completed 后）；调用完成后等满宽限再积分，校准积分与 raw 统计窗口上限同步延长到 completed+grace，分子分母同口径 |
   | cal_outlier_ratio（样本离群拒绝） | 0（禁用） | 3.0 | 样本 B/token 与当前生效系数偏差超 3 倍即拒收：延迟落盘的半截样本（实测 186 偏低入队污染中位数）与归因异常样本不进中位数 |
 
-- **启停门控**：usage 库 message 表的 assistant 消息行——调用开始瞬间提交（≤200ms 可读），行内 `time.completed` 在结束（**含取消/出错**）瞬间补写。扫描最近活跃会话（`session.time_updated` 倒序前 6 个，各自走 `(session_id, time_created)` 复合索引取最新 assistant 行）的最新 assistant 行：未带 `completed` 且 10 分钟内 → 进行中（**不限会话**，新开对话首个调用当拍即亮）；带 `completed` → 当拍归零。已归属会话的 CLI 进程退出时强制判停（崩溃后无人补写 `completed` 的僵尸行兜底）。
+- **启停门控**：usage 库 message 表的 assistant 消息行——调用开始瞬间提交（≤200ms 可读），行内 `time.completed` 在结束（**含取消/出错**）瞬间补写。扫描最近活跃会话（`session.time_updated` 倒序前 6 个，各自走 `(session_id, time_created)` 复合索引取最新 assistant 行）的最新 assistant 行：未带 `completed` 且 10 分钟内 → 进行中（**不限会话**，新开对话首个调用当拍即亮）；带 `completed` → 当拍归零。已归属会话的 CLI 进程退出时强制判停（崩溃后无人补写 `completed` 的僵尸行兜底）。**判停兜底（`stale_stop`）**：CLI 补写 `completed` 可延迟数秒~分钟，期间 window 回退会一直挂着"生成中 + ≈ 上轮速度"——流式锚点出现后清洗流速（探测窗口径）持续低于流式阈值达 15s（`SILENT_STOP_MS`）即判定生成已停、读数归零；锚点未建立的管道静默调用不受影响，误判时字节恢复当拍自愈。
 - **启动提示（is_starting）**：门控已开但首字节未到（TTFT，20s 窗口内）→ 表盘/迷你仪表/胶囊/桌宠气泡显示 **"…"**（青色呼吸脉冲弧），不显示估算值；超窗仍无字节 → 视为管道静默调用，回退 ≈ 估算。
 - 状态来源 `live_source`：`io`（实测流式）→ `window`（门控判定生成中但管道静默，显示近期已完成调用的真实速度，前端加 ≈ 标记）→ `idle`（归零）。
 - **IO 不可用时**（进程从未发现：探测环境不可用/刚启动）按门控显示估算或"统计中"，而不是按调用间隔盲估；**CLI 全部退出后**立即归零（旧行为按间隔中位数可空转"估算中"最长 240s）。
 - 首字节后读数当拍可用（此前为 TTFT "…" 提示）；进程发现：常驻 30s 刷新，无任何进程时缩短到 2s（新开 CLI 快速可见）。
-- 系数冷启动为 600（mac 700）先验，完成 1~2 个 ≥300 token 的调用后收敛；管道静默调用不入样（见 key-rules #5）。
+- 系数冷启动为 600（mac 700）先验，完成 1~2 个 ≥300 token 的调用后收敛；管道静默调用不入样（见 key-rules #5）。**系数样本持久化**：队列随变化（入样/重校准）落盘 `~/.zcode/speed-panel-cal.json`（`updated_ms` + `samples`），重启/热重启热启动（生效系数 = 恢复后队列上中位数，与校准路径同口径；值域外样本拒收），无文件/损坏/超 14 天（模型换代后旧样本即过期噪声）回先验重新收敛——此前每次重启从先验 600 起步，系数真值偏离先验的会话（实测高速档 ~160）重启后读数偏低 2~3 倍、收敛约 25 分钟。重校准后队列 [先验] 同样落盘，"重校准意图"跨重启保留。
 - **重新校准（手动 + 漂移自动）**：`LiveIo::reset_calibration` 丢弃已学习的系数样本、回到平台先验的冷启动状态（pending 调用保留以维护会话→进程归属，其旧量级样本在滑动窗口下 1~2 轮即被新样本挤出）。① 手动：完整面板当前速度卡左上角 ⟳ 按钮（`recalibrate` 命令）；② 自动（轮均速漂移，`liveio::RoundDrift`）：一轮 = 门控"进行中"信号连续的一段（相邻调用间无空拍则并为一轮），轮均值 = 该段内 `is_live` 且 >0 的显示速度算术平均（管道静默/估算轮无实测拍、不参与）；上轮均值与之前连续 5 轮均值差异 ≥3 倍（双向，`DRIFT_ROUNDS`/`DRIFT_RATIO`）判定量级突变（换模型/分词器，旧系数过期）自动触发，触发后漂移历史清空重新积累。两类触发均写 `cal_reset` 调试日志并向前端发 `recalibrated` 事件（按钮闪 ✓）。
 - **延迟落盘宽限与离群拒绝（mac）**：调用完成后 pending 校准事件等满 15s 再处理（`cal_grace_ms`，Windows=0 当拍处理），校准积分与 raw 统计窗口上限同步延长到 `completed + 15s`（`stream_start` 下限不变，仍为 completed − min(gen_ms, 300s)；pred_tps 口径不变，分母仍用真实 gen_ms）；样本 B/token 与当前生效系数偏差超 3 倍即拒收（`cal_outlier_ratio`，Windows=0 禁用），防延迟落盘半截样本与归因异常样本污染中位数。cal 日志新增 `attr_pid`（clean 积分实际用的进程，全进程求和分支为 null）与 `top_pid`（raw 最大进程）供归因异常定位。
 - 精度：达标调用 `pred/true` 应在 0.8~1.25（实测 1.00~1.05）；对账命令 `python scripts/live_vs_true.py`。
@@ -82,6 +82,7 @@
 | 文件 | 内容 |
 |---|---|
 | `~/.zcode/speed-panel-mode.txt` | JSON：mode/style/full_pos/float_pos/pet_size（旧格式纯文本兼容） |
+| `~/.zcode/speed-panel-cal.json` | 系数样本队列（updated_ms + samples，超 14 天过期回先验；见"实时速度"节） |
 | `~/.zcode/speed-panel-debug.jsonl` | 调试日志（8MB 轮转 + 7 天清理） |
 
 ## CI 与发布

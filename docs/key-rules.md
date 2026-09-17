@@ -57,6 +57,7 @@
 调用启停判定以 usage 库 message 表 assistant 消息行为准：**行在调用开始瞬间提交（≤200ms），行内 data 的 `time.completed` 在结束瞬间补写（取消/出错也会补）**。`model_usage` 行只记 `status='completed'`——cancelled/error 的调用（实测库中 97+119 条）**永远没有完成行**，用完成行判停会卡"生成中"直到 10 分钟兜底；且它不区分会话，新开对话首个调用要等首个完成行落盘才可见（长调用可达数分钟）。
 - 事故案例：旧口径"最新 assistant 创建时间 > 最新完成调用的 completed_at 且限最新完成调用的会话"——用户取消生成后面板持续显示"生成中 + 估算值"最长 10 分钟；新会话开聊全程无反应。
 - 查询约束：message 表**没有 time_created 单列索引**（全局 `ORDER BY time_created DESC` 实测 ~200ms/次，700ms 轮询不可承受）——必须先取 `session.time_updated` 倒序前几个会话，再走 `(session_id, time_created)` 复合索引按会话查最新 assistant 行。
+- 判停兜底（`liveio::stale_stop`）：`completed` 补写落盘可延迟数秒~分钟，期间门控仍开、window 回退持续挂"生成中 + ≈ 上轮速度"（2026-09-17 用户报告"对话停了还显示生成中、慢慢降"）。锚点出现后清洗流断绝 >15s（`SILENT_STOP_MS`）即强制判停；锚点未建立（管道静默调用）不受影响。纯函数测试 `stale_stop_after_silent_window` 守护。
 - 守护：`inflight_from_rows`（metrics.rs）为门控纯函数单测（僵尸行/多会话/超龄）；`awaiting_hint`（liveio.rs）守护启动期提示窗口。改门控相关代码时这两个测试必须保持通过。
 
 ## 10. mac 平台差异（照搬 Windows 参数会静默失效）

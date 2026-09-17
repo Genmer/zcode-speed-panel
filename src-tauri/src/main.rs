@@ -101,6 +101,8 @@ struct AppState {
     round_was_inflight: Mutex<bool>,
     /// 轮均速漂移检测：上轮均值 vs 之前连续 5 轮均值 ≥3 倍（双向）→ 自动重校准
     drift: Mutex<RoundDrift>,
+    /// 上次已落盘的系数样本队列（变化才写 speed-panel-cal.json）
+    cal_saved: Mutex<Vec<f64>>,
 }
 
 /// 调试日志：记录实时显示值、统计值与每轮调用完成后的真值，
@@ -183,6 +185,54 @@ const PET_SIZE_MAX: f64 = 480.0;
 
 fn mode_file() -> Option<PathBuf> {
     home_dir().map(|h| h.join(".zcode").join("speed-panel-mode.txt"))
+}
+
+/// 系数样本持久化：重启后热启动，不再每次从先验 600 重新收敛（实测高速
+/// 会话真值系数 ~160 时，冷启动读数偏低 2~3 倍、收敛需 ~25 分钟）
+fn cal_file() -> Option<PathBuf> {
+    home_dir().map(|h| h.join(".zcode").join("speed-panel-cal.json"))
+}
+
+/// 恢复有效期：模型/分词器换代后旧样本即过期噪声，超期回先验重新收敛
+const CAL_STALE_MS: i64 = 14 * 24 * 3600 * 1000;
+
+fn load_cal_samples() -> Vec<f64> {
+    let raw = cal_file().and_then(|p| fs::read_to_string(p).ok());
+    let Some(s) = raw else { return Vec::new() };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
+        eprintln!("[zcode-speed-panel] cal 样本文件损坏，回先验");
+        return Vec::new();
+    };
+    let updated = v.get("updated_ms").and_then(|x| x.as_i64()).unwrap_or(0);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    if now_ms - updated > CAL_STALE_MS {
+        eprintln!("[zcode-speed-panel] cal 样本超 14 天过期，回先验");
+        return Vec::new();
+    }
+    v.get("samples")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_f64())
+                .collect::<Vec<f64>>()
+        })
+        .unwrap_or_default()
+}
+
+fn save_cal_samples(samples: &[f64]) {
+    if let Some(path) = cal_file() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let json = serde_json::json!({ "updated_ms": now_ms, "samples": samples });
+        if let Err(e) = fs::write(path, json.to_string()) {
+            eprintln!("[zcode-speed-panel] cal 样本落盘失败: {e}");
+        }
+    }
 }
 
 fn load_persisted() -> Persisted {
@@ -371,6 +421,15 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
         cal_event = live.take_calibration();
         bpt_now = live.bytes_per_token();
         pipe_bps = live_now.pipe_bps;
+        // 系数样本队列变化（新样本入样/手动或漂移重校准）即落盘，重启热启动
+        {
+            let q = live.cal_state();
+            let mut saved = state.cal_saved.lock().unwrap();
+            if *saved != q {
+                save_cal_samples(&q);
+                *saved = q;
+            }
+        }
         let ever_saw = live.ever_saw_procs();
         if live_now.available {
             if live_now.streaming {
@@ -767,6 +826,7 @@ fn main() {
             round_tps: Mutex::new((0.0, 0)),
             round_was_inflight: Mutex::new(false),
             drift: Mutex::new(RoundDrift::new()),
+            cal_saved: Mutex::new(Vec::new()),
         })
         .invoke_handler(tauri::generate_handler![
             snapshot,
@@ -865,6 +925,17 @@ fn main() {
                 *state.mode.lock().unwrap() = mode;
                 *state.style.lock().unwrap() = style;
                 *state.persist.lock().unwrap() = persisted;
+            }
+            // 恢复上次学习的系数样本（无文件/损坏/超 14 天 → 保持先验 600）：
+            // dev 热重启或开机后读数立即可用，不再每次冷启动重新收敛
+            {
+                let state = app.state::<AppState>();
+                let samples = load_cal_samples();
+                if !samples.is_empty() {
+                    let n = state.live.lock().unwrap().restore_cal(samples);
+                    eprintln!("[zcode-speed-panel] 校准样本恢复 {n} 个");
+                }
+                *state.cal_saved.lock().unwrap() = state.live.lock().unwrap().cal_state();
             }
             let window = app.get_webview_window("main").unwrap();
             let p = app.state::<AppState>().persist.lock().unwrap().clone();

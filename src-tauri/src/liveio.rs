@@ -40,6 +40,13 @@ const REFRESH_EVERY: Duration = Duration::from_secs(30);
 const STREAMING_BPS: f64 = 4_000.0;
 /// 启停由调用门控决定；该短窗仅用于定位幅度锚点（首字节拍）
 const DETECT_MS: i64 = 2_500;
+
+/// 判停兜底宽限：门控开着（message 行 completed 未补写落盘，CLI 侧可延迟
+/// 数秒~分钟）但流式锚点出现后清洗流速持续低于流式阈值达该时长 → 判定生成
+/// 实际已停，读数归零不再显示"生成中/估算"。锚点未建立的管道静默调用不受
+/// 影响（全程无字节是其常态，由 window 回退服务）；正常流式的字节间歇远短
+/// 于该值，误判时字节恢复当拍自愈
+const SILENT_STOP_MS: i64 = 15_000;
 /// 启动提示窗口：门控已开但尚未观测到流式字节（TTFT）的时长上限。
 /// 窗口内显示"统计中…"提示（不显示误导性的估算值）；超窗仍无字节则视为
 /// 管道静默调用，回退到近期真值估算（≈）
@@ -315,6 +322,9 @@ pub(crate) fn cal_sample(
     (in_range, ratio)
 }
 
+/// 校准样本队列容量（滑动窗口，含预置先验占位）
+const CAL_QUEUE_CAP: usize = 5;
+
 /// 启动提示判定（纯函数）：门控开启、尚无流式锚点（首字节未到）且距调用开始
 /// 仍在提示窗口内。窗口外保持无锚点 = 管道静默调用，由上层回退到估算显示
 pub(crate) fn awaiting_hint(
@@ -326,6 +336,13 @@ pub(crate) fn awaiting_hint(
         (Some(started), None) => now_ms - started <= TTFT_HINT_MS,
         _ => false,
     }
+}
+
+/// 判停兜底（纯函数）：门控开着且流式锚点已建立，但最近一次达到流式阈值的
+/// 时刻距今超过宽限 → 生成实际已停（等 completed 落盘期间不再挂着"生成中"）
+pub(crate) fn stale_stop(anchor: Option<i64>, last_stream_ms: Option<i64>, now_ms: i64) -> bool {
+    anchor.is_some()
+        && last_stream_ms.map_or(false, |t| now_ms - t > SILENT_STOP_MS)
 }
 
 /// 轮均速漂移检测（纯函数便于测试）：逐轮喂入显示速度均值，与之前连续
@@ -846,6 +863,8 @@ pub struct LiveIo {
     last_result: LiveNow,
     /// 会话 → 最近一次为其生成输出的 CLI 进程
     session_pid: HashMap<String, u32>,
+    /// 最近一次清洗流速达到流式阈值的时刻（判停兜底的计时起点）
+    last_stream_ms: Option<i64>,
     /// 当前关注的会话 = 最近完成调用的会话
     current_session: Option<String>,
     attributed: HashSet<String>,
@@ -879,6 +898,7 @@ impl LiveIo {
             bytes_per_token: params.default_bpt,
             last_result: LiveNow::default(),
             session_pid: HashMap::new(),
+            last_stream_ms: None,
             current_session: None,
             attributed: HashSet::new(),
             history_done: false,
@@ -943,6 +963,33 @@ impl LiveIo {
         self.cal.push_back(self.params.default_bpt);
         self.bytes_per_token = self.params.default_bpt;
         self.bytes_per_token
+    }
+
+    /// 导出系数样本队列（供持久化；重校准后为 [先验]，随队列变化落盘即可
+    /// 让"重校准意图"跨重启保留）
+    pub fn cal_state(&self) -> Vec<f64> {
+        self.cal.iter().copied().collect()
+    }
+
+    /// 从持久化恢复系数样本：只收值域内的有限值，注入队列（容量与实时校准
+    /// 一致，超出丢最旧），生效系数取恢复后队列的上中位数（与校准路径同
+    /// 口径）。空/全非法时保持先验不动，返回实际接受数
+    pub fn restore_cal(&mut self, samples: Vec<f64>) -> usize {
+        let valid: Vec<f64> = samples
+            .into_iter()
+            .filter(|v| v.is_finite() && *v >= self.params.cal_min && *v <= self.params.cal_max)
+            .collect();
+        let n = valid.len();
+        for v in valid {
+            self.cal.push_back(v);
+        }
+        while self.cal.len() > CAL_QUEUE_CAP {
+            self.cal.pop_front();
+        }
+        let mut sorted: Vec<f64> = self.cal.iter().copied().collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        self.bytes_per_token = sorted[sorted.len() / 2];
+        n
     }
 
     /// 每个轮询周期调用一次。now_ms 为墙钟毫秒（与 Engine 快照同源）
@@ -1085,7 +1132,7 @@ impl LiveIo {
             let (in_cal, bpt_sample) =
                 cal_sample(eff, clean_bytes, raw_total, self.bytes_per_token, &self.params);
             if in_cal {
-                self.bytes_per_token = median_bpt(&mut self.cal, bpt_sample, 5);
+                self.bytes_per_token = median_bpt(&mut self.cal, bpt_sample, CAL_QUEUE_CAP);
             }
             self.pending_cal = Some(CalEvent {
                 id: call.id.clone(),
@@ -1165,8 +1212,13 @@ impl LiveIo {
             if self.active_since.is_none() && detect_bps > STREAMING_BPS {
                 self.active_since = Some(now_ms);
             }
+            // 判停兜底计时：清洗流速仍在流式阈值上时持续续期
+            if detect_bps > STREAMING_BPS {
+                self.last_stream_ms = Some(now_ms);
+            }
         } else {
             self.active_since = None;
+            self.last_stream_ms = None;
         }
 
         // 幅度：30s 滑窗 ∩ [首字节拍, now] 的清洗流积分。首字节当拍即有真实读数
@@ -1188,7 +1240,11 @@ impl LiveIo {
         } else {
             0.0
         };
-        let streaming = gate_on;
+        // 判停兜底：门控仍开（completed 未落盘）但锚点后清洗流断绝超过宽限 →
+        // 生成实际已停，归零显示；上层 streaming=false 走 idle 分支，不再用
+        // window 回退挂着"生成中"。字节恢复当拍自愈（计时随流刷新）
+        let streaming =
+            gate_on && !stale_stop(self.active_since, self.last_stream_ms, now_ms);
         let ramping = streaming
             && (self.active_since.is_none()
                 || self
@@ -1330,6 +1386,24 @@ mod tests {
         assert!(!awaiting_hint(None, Some(1_000), 5_000));
     }
 
+    /// 判停兜底：门控开着（completed 未落盘）但锚点后清洗流断绝超宽限 → 判停。
+    /// 现场实例（2026-09-17 日志）：调用已停、completed 落盘前窗口回退持续
+    /// 挂"生成中 + ≈上轮速度"，用户观感"停了还在生成、慢慢降"
+    #[test]
+    fn stale_stop_after_silent_window() {
+        // 锚点已建立、最近流时刻距今未超宽限 → 仍流式
+        assert!(!stale_stop(Some(1_000), Some(16_000), 16_000));
+        // 断绝恰好 15s → 未超（> 判定），仍流式
+        assert!(!stale_stop(Some(1_000), Some(1_000), 16_000));
+        // 断绝超 15s → 判停
+        assert!(stale_stop(Some(1_000), Some(1_000), 16_001));
+        // 锚点未建立（管道静默调用，全程无字节）→ 永不判停，由 window 回退服务
+        assert!(!stale_stop(None, None, 100_000));
+        assert!(!stale_stop(None, Some(1_000), 100_000));
+        // 锚点在但从未记录到流时刻（理论不达：锚点建立即有流）→ 不判停
+        assert!(!stale_stop(Some(1_000), None, 100_000));
+    }
+
     /// 轮均速漂移：上轮均值 vs 之前连续 5 轮均值，双向 ≥3 倍触发重校准
     #[test]
     fn round_drift_triggers_on_threefold_jump() {
@@ -1404,6 +1478,28 @@ mod tests {
         assert!((bpt - io.params.default_bpt).abs() < 1e-9);
         assert_eq!(io.cal.len(), 1, "队列应只余先验占位");
         assert!((io.bytes_per_token - io.params.default_bpt).abs() < 1e-9);
+    }
+
+    /// 重启恢复：越界/非有限值拒收，生效系数按恢复后队列的上中位数重算
+    /// （与校准路径同口径）；空恢复不动先验
+    #[test]
+    fn restore_cal_filters_and_recomputes_median() {
+        let mut io = LiveIo::new();
+        // 30 越下界、9999 越上界、NaN 非有限 → 拒；500/540 入队得 [600,500,540]
+        let n = io.restore_cal(vec![500.0, 540.0, 30.0, 9999.0, f64::NAN]);
+        assert_eq!(n, 2);
+        assert!((io.bytes_per_token() - 540.0).abs() < 1e-9);
+        // 空恢复不动状态
+        assert_eq!(io.restore_cal(vec![]), 0);
+        assert!((io.bytes_per_token() - 540.0).abs() < 1e-9);
+        // 容量挤出：再注入 5 个合法值，队列保最新 5 个（600/500/540 被挤出）
+        let q0 = io.cal_state();
+        assert_eq!(q0.len(), 3);
+        io.restore_cal(vec![450.0, 460.0, 470.0, 480.0, 490.0]);
+        assert_eq!(io.cal_state().len(), CAL_QUEUE_CAP);
+        assert!(!io.cal_state().contains(&io.params.default_bpt));
+        // [450,460,470,480,490] 上中位 = 470
+        assert!((io.bytes_per_token() - 470.0).abs() < 1e-9);
     }
 
     /// 样本准入用例取自真实调试日志（2026-09-17 现场）：
