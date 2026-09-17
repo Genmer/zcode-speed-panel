@@ -85,9 +85,21 @@
 | `~/.zcode/speed-panel-cal.json` | 系数样本队列（updated_ms + samples，超 14 天过期回先验；见"实时速度"节） |
 | `~/.zcode/speed-panel-debug.jsonl` | 调试日志（8MB 轮转 + 7 天清理） |
 
+## 应用内更新（updater.rs）
+
+- **版本号**：来源 `tauri.conf.json` 的 `version`（与 `Cargo.toml`/`package.json` 三处同值，发版一起 bump），运行时读 `app.package_info().version`。完整面板状态栏最右显示（如 `v0.2.1`；悬浮窗/桌宠形态与浏览器 mock 模式下隐藏），**点击即手动检查更新**——检查中前缀 ↻ 旋转，结果以右下角轻提示反馈（"已是最新版本 vX.Y.Z" / "检查更新失败：网络异常"）。
+- **检查时机**：① 启动后 8s（避开启动期 SQLite/IO 高峰）后台静默查一次；② 常驻期间每小时醒一次，距上次成功检查 ≥24h 才发请求（每天一次）；③ 手动点击版本号。数据源：GitHub API `repos/Masterchiefm/zcode-speed-panel/releases/latest`（必须带 User-Agent；latest 端点天然排除 draft/prerelease；403 限流同网络失败处理）。
+- **静默原则**：自动路径上任何失败（断网、限流、解析失败、无本平台安装包、tag 解析不了）一律视为"无更新"，不弹窗不出提示——宁可漏报，不打扰。唯一如实反馈的场景：用户点了"立即更新"后下载/启动安装失败（静默会让按钮看起来失灵）。
+- **版本比较**：`parse_version` 取 tag 的 `v?主.次.修` 三段数值（`-rc.1`/`+build` 后缀忽略，本项目不发预发布），严格大于当前版本才算更新；任一侧解析失败不算（防怪 tag 诱导更新）。
+- **安装包匹配（CI 命名耦合，key-rules #12）**：win-x64 → `*_x64-setup.exe`（NSIS 安装版；免安装 portable 版不参与自动安装）；mac-x64 → `*_x64.dmg`；mac-aarch64 → `*_aarch64.dmg`。改 build.yml 产物名/加架构须同一提交同步 `updater::pick_asset` 及其测试。
+- **流程**：检查到新版本 → emit `update`(available) 弹右下角更新卡片（新旧版本对比 + Release 说明摘要 + "更新内容 ↗"链接经 `open_url` 命令走系统浏览器打开，仅放行 https）→ 立即**后台静默预下载**到系统临时目录 `zcode-speed-panel-update/<资产名>`（进度按 250ms 节流 emit downloading 事件）→ 就绪 emit ready，卡片按钮变"立即安装"。点"立即更新"时若尚未下载则标记待装，就绪后自动安装，无需二次点击。
+- **安装**：Windows 运行 NSIS 安装包、600ms 后保存状态并退出应用（安装器接管，等一下再退避免撞上进程锁）；macOS `open` 打开 dmg 由用户拖入 Applications（应用不退出，旧版本跑到用户重启）。安装是**用户点击触发**而非全自动无人值守——安装器窗口未经同意弹出与"不打扰"原则冲突，且未签名包静默替换有风险；若将来要完全自动，Windows 侧启动安装包时加 `/S` 参数（NSIS 静默安装）即可，下载/就绪链路不用动。
+- **免打扰细节**：卡片 ✕ 关闭后该版本不再自动弹（前端 localStorage 记忆，版本号旁留青色小圆点提醒；手动检查会重新打开卡片）；悬浮窗模式下卡片/提示不显示（回到完整面板仍可见）；用户没在等安装时预下载失败完全静默（点"立即更新"会重新拉起下载）。
+
 ## CI 与发布
 
 - `.github/workflows/build.yml`：**不随普通推送自动触发**；`v*` 标签 → 自动创建 GitHub Release，Assets 附 Windows 安装版（`_x64-setup.exe`）、免安装版（`_x64-portable.exe`，主程序 exe 直接改名）与 macOS 双架构 dmg（`_x64.dmg` = Intel 10.15+、`_aarch64.dmg` = Apple Silicon 11+，独立包不做 universal，未签名公证见 README 绕过指引）；`workflow_dispatch` → Actions 页手动触发，产物在本次运行的 Artifacts（`windows` 含两个 exe；`macos-x86_64-apple-darwin` / `macos-aarch64-apple-darwin` 各含一个 dmg）。
+- **发版流程（应用内更新依赖，key-rules #12）**：版本号三处同步 bump——`src-tauri/tauri.conf.json`（权威：运行时读取用于显示与比较）、`src-tauri/Cargo.toml`、`package.json`——再打 `v*` 标签。更新检查按 Release 资产名后缀匹配安装包（见"应用内更新"节），build.yml 的产物命名不可随意改。
 - **build-macos job**：`runs-on: macos-15`，matrix 双目标（`x86_64-apple-darwin` + `MACOSX_DEPLOYMENT_TARGET=10.15`、`aarch64-apple-darwin` + `11.0`），tauri-action `--bundles dmg`；最低系统版本双重注入——环境变量决定二进制 `LC_BUILD_VERSION`，`--config '{"bundle":{"macOS":{"minimumSystemVersion":"…"}}}'` 决定 Info.plist 的 `LSMinimumSystemVersion`（plist 只认 config，缺省恒 10.13，不读环境变量）。产物名 `zcode-speed-panel_版本_x64.dmg` / `_aarch64.dmg` 由 tauri 默认命名，恰好满足双独立包要求。
 - 本地正式版：`npm run tauri build` → Windows `src-tauri/target/release/bundle/nsis/*.exe`；macOS `bundle/dmg/*.dmg`（交叉构建 aarch64 见 README 开发章节）。
 
@@ -98,3 +110,4 @@
 - 冷启动后系数需 1~2 个达标调用收敛，此前读数可能有偏差。
 - 硬崩溃（CLI 进程被杀、assistant 行无人补写 `completed`）最多残留 10 分钟门控（兜底上限）；已归属会话的进程退出会被进程守卫立即判停，未归属的新会话只能等兜底。
 - mac 的 CleanParams（burst 禁用/无静态底噪/系数先验 700/延迟落盘宽限 15s/离群拒绝 3 倍）中，先验与宽限已按 2026-09-17 的 6 条 cal 事件真值对账修正（归因正确时 pred/true 完全一致 62.1=62.1），尚未做 Windows 侧同等长度的对账回归；读数异常时先跑 `python scripts/live_vs_true.py` 对账、看 cal 事件 `attr_pid`/`top_pid` 归因再调参（key-rules #10）。
+- 应用内更新能力**随版本生效**：只有装了含 updater.rs 版本的用户才会收到后续更新提示，存量旧版本需手动升级一次铺底；dev 实例（`npm run tauri dev`）同样做真实检查与下载——版本等于最新 Release tag 时显示"已是最新"，属预期（热重启每次都会触发一次启动检查，量级远低于 API 限流）。

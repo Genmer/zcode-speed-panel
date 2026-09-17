@@ -76,3 +76,9 @@
 - **busy_timeout 与只读优化**：Engine 打开 `db.sqlite` 必须开启 `OpenFlags::SQLITE_OPEN_NO_MUTEX`，且连接初始化时必须设置 `busy_timeout(3000ms)` 并开启 `PRAGMA query_only = ON;`。否则当 ZCode CLI 高频写事务或 checkpoint 时，读连接会立即报 `database is locked (SQLITE_BUSY)` 丢当拍。
 - **进程扫描 buffer 零分配**：macOS 的 `KERN_PROCARGS2` 必须复用 scratch buffer（64KB），禁止在 PID 循环中分配，避免每轮刷新引发 64MB 堆分配毛刺。
 - **session_pid 随进程存活淘汰**：liveio 维护的会话-PID 映射在进程轮询检测退出时必须调用 `session_pid.retain` 清理，防止多会话长时间运行累积脏数据与 PID 复用误归因。
+
+## 12. 应用内更新：CI 产物命名即匹配协议，且失效是静默的
+
+- **产物名即协议**：`updater::pick_asset` 按 Release 资产名后缀匹配本平台安装包：`*_x64-setup.exe`（win-x64，portable 版不参与自动安装）、`*_x64.dmg`（mac-x64）、`*_aarch64.dmg`（mac-aarch64）。改产物命名、加新架构而不同步 `pick_asset` 的后果是**静默的**——检查正常返回但找不到安装包，用户永远收不到更新且没有任何报错（更新模块按设计宁可漏报不打扰，见 updater.rs 模块注释）。改名/加架构必须同一提交内同步 `asset_picking` 测试。
+- **版本号三处同步**：`tauri.conf.json`（运行时权威：`package_info().version` 用于显示与比较）、`Cargo.toml`、`package.json`。发版漏 bump `tauri.conf.json` 时新 Release 的 tag 与旧版本号相等 → 判"已是最新"，更新功能同样静默失效。
+- **GitHub API 必带 User-Agent**（无 UA 直接拒绝）；403 限流与断网同按"无更新"处理。HTTP 客户端为 ureq（同步阻塞 + rustls，无 OpenSSL，mac 交叉构建友好），全部网络操作在后台线程，失败不触碰 UI。

@@ -590,3 +590,196 @@ body.float-mode #tray-hint {
   background: rgba(13, 20, 36, 0.95);
   transform: rotate(45deg);
 }
+
+/* ---- 应用内更新：footer 最右的版本号是检查入口，更新卡片与轻提示在其上方 ---- */
+
+#st-version {
+  margin-left: auto; /* footer 为 flex：把版本号推到整行最右 */
+  margin-right: -6px; /* 视觉上贴住 footer 右缘（补偿点击热区 padding） */
+  padding: 1px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: color 0.15s;
+}
+
+#st-version:hover {
+  color: var(--cyan);
+}
+
+#st-version.checking::before {
+  content: "↻ ";
+  display: inline-block;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* 用户关过提示、但该新版本还没处理：版本号旁挂小圆点持续提醒 */
+#st-version.has-update::after {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 5px;
+  border-radius: 50%;
+  background: var(--cyan);
+  vertical-align: middle;
+}
+
+#update-card {
+  display: none;
+  position: fixed;
+  right: 20px;
+  bottom: 46px; /* footer 状态栏上方 */
+  z-index: 110;
+  width: 320px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(13, 20, 36, 0.97);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  font-size: 12px;
+}
+
+#update-card.show {
+  display: block;
+}
+
+.update-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.update-head b {
+  color: var(--cyan);
+}
+
+#update-close {
+  all: unset;
+  cursor: pointer;
+  color: var(--dim);
+  padding: 2px 5px;
+  border-radius: 6px;
+}
+
+#update-close:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.update-sub {
+  color: var(--dim);
+  margin-top: 2px;
+}
+
+#update-link {
+  color: var(--cyan);
+  cursor: pointer;
+}
+
+#update-link:hover {
+  text-decoration: underline;
+}
+
+.update-notes {
+  margin-top: 8px;
+  max-height: 108px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--dim);
+  font-size: 11px;
+  line-height: 1.5;
+  font-family: inherit;
+  user-select: text;
+}
+
+.update-notes:empty {
+  display: none;
+}
+
+.update-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.update-bar {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.update-bar i {
+  display: block;
+  height: 100%;
+  width: 0%;
+  border-radius: 3px;
+  background: linear-gradient(90deg, #22d3ee, #0ea5e9);
+  transition: width 0.2s;
+}
+
+#update-progress-text {
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+  min-width: 108px;
+  text-align: right;
+}
+
+.update-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.update-actions button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+#update-status {
+  color: var(--dim);
+}
+
+#update-status.error {
+  color: #f87171;
+}
+
+#update-toast {
+  position: fixed;
+  right: 20px;
+  bottom: 46px;
+  z-index: 115;
+  padding: 8px 14px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(13, 20, 36, 0.97);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  color: var(--text);
+  font-size: 12px;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 0.3s ease, visibility 0.3s;
+}
+
+#update-toast.show {
+  opacity: 1;
+  visibility: visible;
+}
+
+/* 悬浮窗/桌宠窗口太小放不下更新 UI：不显示（回到完整面板仍可见） */
+body.float-mode #update-card,
+body.float-mode #update-toast {
+  display: none !important;
+}

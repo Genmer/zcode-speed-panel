@@ -300,6 +300,163 @@ btnRecal.addEventListener("click", () => {
   tauriInvoke("recalibrate").catch((err) => console.warn("recalibrate 失败:", err));
 });
 
+// ---- 应用内更新：footer 右下角版本号（点击=手动检查）；后端启动+每日静默检查，
+//      发现新版本自动预下载并弹此卡片；无更新/网络异常静默，不打扰 ----
+interface UpdateEvent {
+  state: "available" | "downloading" | "ready" | "launching" | "error";
+  currentVersion: string;
+  newVersion: string;
+  releaseUrl: string;
+  notes: string;
+  downloadedBytes: number;
+  totalBytes: number;
+  message: string;
+}
+type CheckOutcome =
+  | { kind: "upToDate"; current: string }
+  | { kind: "available"; current: string; newVersion: string }
+  | { kind: "failed"; message: string };
+
+const DISMISS_KEY = "updateDismissed.v1";
+const stVersion = $("st-version");
+const updateCard = $("update-card");
+const updateVersion = $("update-version");
+const updateCurrent = $("update-current");
+const updateNotes = $("update-notes");
+const updateLink = $("update-link");
+const updateProgress = $("update-progress");
+const updateBarFill = $("update-bar-fill");
+const updateProgressText = $("update-progress-text");
+const updateInstall = $<HTMLButtonElement>("update-install");
+const updateStatus = $("update-status");
+const updateToast = $("update-toast");
+let currentVersion = "";
+let updateDismissed = localStorage.getItem(DISMISS_KEY) ?? "";
+let toastTimer = 0;
+let checkingUpdate = false;
+
+if (!hasTauri) {
+  stVersion.style.display = "none"; // 浏览器预览无后端，隐藏入口
+} else {
+  tauriInvoke<string>("app_version").then((v) => {
+    if (v) {
+      currentVersion = v;
+      stVersion.textContent = `v${v}`;
+    }
+  });
+}
+
+const toast = (msg: string) => {
+  updateToast.textContent = msg;
+  updateToast.classList.add("show");
+  window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => updateToast.classList.remove("show"), 2600);
+};
+
+const setUpdateProgress = (done: number, total: number) => {
+  const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+  updateBarFill.style.width = `${pct}%`;
+  updateProgressText.textContent =
+    total > 0 ? `${pct}% · ${(done / 1048576).toFixed(1)}/${(total / 1048576).toFixed(1)} MB` : "下载中…";
+};
+
+/** 弹卡片（用户没关过这个版本的提示）；关过则只给版本号挂小圆点 */
+const maybeOpenCard = (e: UpdateEvent) => {
+  if (updateDismissed && updateDismissed === e.newVersion) {
+    stVersion.classList.add("has-update");
+  } else {
+    updateCard.classList.add("show");
+  }
+};
+
+function applyUpdateEvent(e: UpdateEvent) {
+  if (e.currentVersion) currentVersion = e.currentVersion;
+  if (e.newVersion) {
+    updateVersion.textContent = `v${e.newVersion}`;
+    updateCurrent.textContent = currentVersion ? `v${currentVersion}` : "";
+    updateNotes.textContent = e.notes;
+    updateLink.dataset.url = e.releaseUrl;
+  }
+  updateStatus.classList.toggle("error", e.state === "error");
+  updateStatus.textContent = e.message;
+  switch (e.state) {
+    case "available":
+      updateProgress.style.display = "none";
+      updateInstall.disabled = false;
+      updateInstall.textContent = "⤓ 立即更新";
+      maybeOpenCard(e);
+      break;
+    case "downloading":
+      updateProgress.style.display = "";
+      setUpdateProgress(e.downloadedBytes, e.totalBytes);
+      updateInstall.disabled = true;
+      updateInstall.textContent = "⤓ 下载中…";
+      maybeOpenCard(e);
+      break;
+    case "ready":
+      updateProgress.style.display = "none";
+      updateInstall.disabled = false;
+      updateInstall.textContent = "⤓ 立即安装";
+      maybeOpenCard(e);
+      break;
+    case "launching":
+      updateInstall.disabled = true;
+      updateInstall.textContent = "正在安装…";
+      updateCard.classList.add("show");
+      break;
+    case "error":
+      updateInstall.disabled = false;
+      updateInstall.textContent = "重试";
+      updateCard.classList.add("show");
+      break;
+  }
+}
+
+async function manualCheck() {
+  if (!hasTauri || checkingUpdate) return;
+  checkingUpdate = true;
+  // 先清"已关闭提示"再检查：手动检查视为重新关注，"available" 事件（可能先于
+  // invoke 返回到达）到达时能正常弹卡片
+  updateDismissed = "";
+  localStorage.removeItem(DISMISS_KEY);
+  stVersion.classList.remove("has-update");
+  stVersion.classList.add("checking");
+  try {
+    const r = await tauriInvoke<CheckOutcome>("check_update");
+    if (r?.kind === "upToDate") toast(`已是最新版本 v${r.current}`);
+    else if (r?.kind === "failed") toast("检查更新失败：网络异常，请稍后重试");
+    // available → 卡片由 "update" 事件渲染
+  } finally {
+    stVersion.classList.remove("checking");
+    checkingUpdate = false;
+  }
+}
+
+stVersion.addEventListener("click", () => manualCheck());
+updateInstall.addEventListener("click", () => {
+  updateInstall.disabled = true;
+  updateInstall.textContent = "准备中…";
+  tauriInvoke("install_update").catch((err) => {
+    updateStatus.classList.add("error");
+    updateStatus.textContent = String(err);
+    updateInstall.disabled = false;
+    updateInstall.textContent = "重试";
+  });
+});
+$("update-close").addEventListener("click", () => {
+  updateCard.classList.remove("show");
+  const v = updateVersion.textContent?.replace(/^v/, "") ?? "";
+  if (v) {
+    updateDismissed = v;
+    localStorage.setItem(DISMISS_KEY, v);
+  }
+});
+updateLink.addEventListener("click", (e) => {
+  e.preventDefault();
+  const url = updateLink.dataset.url;
+  if (url) tauriInvoke("open_url", { url }).catch(() => {});
+});
+
 $("float-style-btn").addEventListener("click", () => {
   setStyleDropdownOpen(!styleDropdown.classList.contains("open"));
 });
@@ -382,6 +539,7 @@ if (hasTauri) {
       localStorage.setItem("floatStyle", e.payload);
       applyStyleUi(e.payload);
     });
+    await listen<UpdateEvent>("update", (e) => applyUpdateEvent(e.payload));
     const p = await tauriInvoke<SnapshotPayload>("snapshot");
     if (p) {
       applyModeUi(p.mode);

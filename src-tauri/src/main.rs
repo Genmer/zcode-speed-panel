@@ -2,9 +2,11 @@
 
 mod liveio;
 mod metrics;
+mod updater;
 
 use liveio::{LiveIo, RoundDrift};
 use metrics::{home_dir, Engine, Snapshot};
+use updater::Release;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -103,6 +105,24 @@ struct AppState {
     drift: Mutex<RoundDrift>,
     /// 上次已落盘的系数样本队列（变化才写 speed-panel-cal.json）
     cal_saved: Mutex<Vec<f64>>,
+    /// 应用内更新（updater.rs）：最新 Release、预下载产物与并发门旗。
+    /// 网络操作全在后台线程；自动检查路径失败一律静默（见 updater.rs 模块注释）
+    update: Mutex<UpdateMem>,
+}
+
+/// 更新流程的内存态（不落盘：每次启动都检查一次，无需跨启动记忆检查时间）
+#[derive(Default)]
+struct UpdateMem {
+    /// 上次成功查到 Release 的时间（网络失败不记，下个小时仍会重试）
+    last_check_ms: i64,
+    checking: bool,
+    downloading: bool,
+    /// 发现的新版本（Some 即有更新）
+    latest: Option<Release>,
+    /// 预下载完成的安装包 (tag, 路径)
+    downloaded: Option<(String, PathBuf)>,
+    /// 下载完成即自动启动安装（用户已点过"立即更新"，等下载就位）
+    install_when_ready: bool,
 }
 
 /// 调试日志：记录实时显示值、统计值与每轮调用完成后的真值，
@@ -697,7 +717,7 @@ fn recalibrate(app: AppHandle) {
 }
 
 /// mac 启动引导提示（一次性）：由前端页面就绪后主动 invoke 领取——
-/// setup 内 emit 会早于 WKWebView 加载被丢弃。非 mac 恒返回 false
+/// setup 内 emit 必然早于页面加载被丢弃，改为前端就绪后 invoke 领取。非 mac 恒返回 false
 #[tauri::command]
 fn tray_hint_once(app: AppHandle) -> bool {
     let state = app.state::<AppState>();
@@ -705,6 +725,293 @@ fn tray_hint_once(app: AppHandle) -> bool {
     let pending = *guard;
     *guard = false;
     pending
+}
+
+// ---- 应用内更新（updater.rs）：检查 / 预下载 / 安装编排，事件驱动前端卡片 ----
+
+/// 前端 "update" 事件载荷：扁平结构按 state 分支（available / downloading /
+/// ready / launching / error），不需要的字段留空
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateEvent {
+    state: &'static str,
+    current_version: String,
+    new_version: String,
+    release_url: String,
+    notes: String,
+    downloaded_bytes: u64,
+    total_bytes: u64,
+    message: String,
+}
+
+/// 手动检查（check_update 命令）的同步返回：前端据此弹轻提示
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(tag = "kind")]
+enum CheckOutcome {
+    UpToDate { current: String },
+    Available { current: String, new_version: String },
+    Failed { message: String },
+}
+
+fn current_version(app: &AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
+/// Release 说明截断（按字符计，防超长 body 撑爆前端卡片；前端另有 max-height）
+fn truncate_chars(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(n).collect::<String>())
+    }
+}
+
+fn update_event(state: &'static str, current: &str, rel: Option<&Release>) -> UpdateEvent {
+    UpdateEvent {
+        state,
+        current_version: current.to_string(),
+        new_version: rel.map(|r| r.version.clone()).unwrap_or_default(),
+        release_url: rel.map(|r| r.url.clone()).unwrap_or_default(),
+        notes: rel.map(|r| truncate_chars(&r.notes, 400)).unwrap_or_default(),
+        downloaded_bytes: 0,
+        total_bytes: rel.map(|r| r.asset_size).unwrap_or(0),
+        message: String::new(),
+    }
+}
+
+/// 执行一次检查（手动/自动共用）：取到 Release 才记 last_check（网络失败
+/// 不记，下个小时重试）；有新版本时 emit + 静默预下载（装时免等）。
+/// 失败结果只返回给手动调用方提示，自动路径直接丢弃
+fn do_check(app: &AppHandle) -> CheckOutcome {
+    let state = app.state::<AppState>();
+    {
+        let mut u = state.update.lock().unwrap();
+        if u.checking {
+            return CheckOutcome::Failed { message: "已有检查正在进行".into() };
+        }
+        u.checking = true;
+    }
+    let current = current_version(app);
+    let outcome = match updater::fetch_latest(&format!("zcode-speed-panel/{current}")) {
+        None => CheckOutcome::Failed { message: "网络异常或 Release 信息不可用".into() },
+        Some(rel) => {
+            {
+                let mut u = state.update.lock().unwrap();
+                u.last_check_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+            }
+            if updater::is_newer(&rel.tag, &current) {
+                let ev = update_event("available", &current, Some(&rel));
+                state.update.lock().unwrap().latest = Some(rel.clone());
+                let _ = app.emit("update", ev);
+                let new_version = rel.version.clone();
+                spawn_download(app.clone(), rel);
+                CheckOutcome::Available { current, new_version }
+            } else {
+                CheckOutcome::UpToDate { current }
+            }
+        }
+    };
+    state.update.lock().unwrap().checking = false;
+    outcome
+}
+
+/// 后台预下载安装包：进度以 "update" 事件推送（250ms 节流），完成 emit
+/// ready；用户已点"立即更新"（install_when_ready）则顺势启动安装。
+/// 自动预下载失败完全静默（安装时再试）；等待安装时失败才 emit error
+fn spawn_download(app: AppHandle, rel: Release) {
+    let current = current_version(&app);
+    {
+        let state = app.state::<AppState>();
+        let mut u = state.update.lock().unwrap();
+        if let Some((tag, _)) = &u.downloaded {
+            if *tag == rel.tag {
+                // 该版本已预下载过（前端刷新后恢复状态也走这里）
+                drop(u);
+                let _ = app.emit("update", update_event("ready", &current, Some(&rel)));
+                return;
+            }
+        }
+        if u.downloading {
+            return;
+        }
+        u.downloading = true;
+    }
+    std::thread::spawn(move || {
+        let mut ev = update_event("downloading", &current, Some(&rel));
+        let mut last_emit = std::time::Instant::now();
+        let progress_app = app.clone();
+        let result = updater::download(&rel, &format!("zcode-speed-panel/{current}"), &mut |done, total| {
+            if last_emit.elapsed() >= Duration::from_millis(250) {
+                last_emit = std::time::Instant::now();
+                ev.downloaded_bytes = done;
+                ev.total_bytes = total;
+                let _ = progress_app.emit("update", ev.clone());
+            }
+        });
+        match result {
+            Ok(path) => {
+                let mut ev_ready = update_event("ready", &current, Some(&rel));
+                ev_ready.downloaded_bytes = rel.asset_size;
+                let launch = {
+                    let state = app.state::<AppState>();
+                    let mut u = state.update.lock().unwrap();
+                    u.downloading = false;
+                    u.downloaded = Some((rel.tag.clone(), path));
+                    u.install_when_ready
+                };
+                let _ = app.emit("update", ev_ready);
+                if launch {
+                    launch_update(&app);
+                }
+            }
+            Err(msg) => {
+                let wait = {
+                    let state = app.state::<AppState>();
+                    let mut u = state.update.lock().unwrap();
+                    u.downloading = false;
+                    let wait = u.install_when_ready;
+                    u.install_when_ready = false; // 失败后等用户再点，不自动重试
+                    wait
+                };
+                if wait {
+                    // 用户已在等安装却装不上：如实告知（唯一打扰的场景，
+                    // 静默会让"立即更新"按钮看起来失灵）
+                    let mut ev = update_event("error", &current, Some(&rel));
+                    ev.message = msg;
+                    let _ = app.emit("update", ev);
+                }
+            }
+        }
+    });
+}
+
+/// 启动安装：Windows 运行 NSIS 安装包后退出应用（安装器接管，等 600ms
+/// 再退避免安装器撞上尚在退出的进程锁）；macOS 打开 dmg 由用户拖入
+/// Applications（应用不退出，旧版本跑到用户重启）
+fn launch_update(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let rel = state.update.lock().unwrap().latest.clone();
+    let downloaded = state.update.lock().unwrap().downloaded.clone();
+    let (Some(rel), Some((tag, path))) = (rel, downloaded) else {
+        return;
+    };
+    if tag != rel.tag {
+        return; // 陈旧产物不装（latest 变更时预下载会重新拉新包）
+    }
+    let mut ev = update_event("launching", &current_version(app), Some(&rel));
+    #[cfg(target_os = "windows")]
+    let msg = "安装程序已启动，应用即将退出…".to_string();
+    #[cfg(target_os = "macos")]
+    let msg = "已打开安装镜像：请将 zcode-speed-panel 拖入 Applications 覆盖安装".to_string();
+    ev.message = msg;
+    let _ = app.emit("update", ev);
+    if updater::launch_installer(&path).is_err() {
+        let mut ev = update_event("error", &current_version(app), Some(&rel));
+        ev.message = "启动安装程序失败".into();
+        let _ = app.emit("update", ev);
+        return;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        save_all(app);
+        let handle = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(600));
+            handle.exit(0);
+        });
+    }
+}
+
+/// 手动检查（footer 右下角版本号点击）：同步返回结果给前端做轻提示；
+/// 有更新时卡片由 "update" 事件渲染（本命令只负责结果提示）
+#[tauri::command]
+fn check_update(app: AppHandle) -> CheckOutcome {
+    do_check(&app)
+}
+
+/// 前端"立即更新"按钮：已预下载 → 直接启动安装；否则标记待装并确保
+/// 下载线程在跑（就绪后自动安装，无需再点一次）
+#[tauri::command]
+fn install_update(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let rel = state.update.lock().unwrap().latest.clone().ok_or("没有可用更新")?;
+    let ready = {
+        let u = state.update.lock().unwrap();
+        matches!(&u.downloaded, Some((tag, _)) if *tag == rel.tag)
+    };
+    if ready {
+        launch_update(&app);
+        return Ok(());
+    }
+    state.update.lock().unwrap().install_when_ready = true;
+    spawn_download(app.clone(), rel); // 已在下载则内部 no-op
+    Ok(())
+}
+
+/// 当前版本号（footer 右下角显示，来源 tauri.conf.json）
+#[tauri::command]
+fn app_version(app: AppHandle) -> String {
+    current_version(&app)
+}
+
+/// 用系统默认浏览器打开链接（更新说明页）。WebView 内 <a> 导航行为不可控，
+/// 统一由后端代开；仅接受 https，防前端注入 file:// 一类协议
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err("仅支持 https 链接".into());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW：cmd 窗口一闪而过的问题
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &url])
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("打开链接失败: {e}"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("打开链接失败: {e}"))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = url;
+        Err("当前平台不支持".into())
+    }
+}
+
+/// 后台更新检查线程：启动延迟 8s（避开启动期 SQLite/IO 高峰）先查一次；
+/// 之后每小时醒一次，距上次成功检查 ≥24h 才真正发请求（每天一次）。
+/// 失败在 fetch_latest 内部吞掉，线程永不打扰用户
+fn update_loop(app: AppHandle) {
+    std::thread::sleep(Duration::from_secs(8));
+    let _ = do_check(&app);
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+        let due = {
+            let state = app.state::<AppState>();
+            let u = state.update.lock().unwrap();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            now - u.last_check_ms >= 24 * 3600 * 1000
+        };
+        if due {
+            let _ = do_check(&app);
+        }
+    }
 }
 
 fn show_main(app: &AppHandle) {
@@ -827,6 +1134,7 @@ fn main() {
             round_was_inflight: Mutex::new(false),
             drift: Mutex::new(RoundDrift::new()),
             cal_saved: Mutex::new(Vec::new()),
+            update: Mutex::new(UpdateMem::default()),
         })
         .invoke_handler(tauri::generate_handler![
             snapshot,
@@ -835,7 +1143,11 @@ fn main() {
             set_float_size,
             quit_app,
             recalibrate,
-            tray_hint_once
+            tray_hint_once,
+            check_update,
+            install_update,
+            app_version,
+            open_url
         ])
         .setup(|app| {
             // mac：Accessory 模式——无 Dock 图标、不进 Cmd+Tab，常驻菜单栏托盘；
@@ -947,6 +1259,10 @@ fn main() {
             // ---- 启动轮询线程 ----
             let poll_handle = app.handle().clone();
             std::thread::spawn(move || poller(poll_handle));
+
+            // ---- 启动更新检查线程（启动+8s 一次、常驻期间每天一次，静默） ----
+            let update_handle = app.handle().clone();
+            std::thread::spawn(move || update_loop(update_handle));
             Ok(())
         })
         .build(tauri::generate_context!())
