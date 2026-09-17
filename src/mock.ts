@@ -18,6 +18,8 @@ export interface Snapshot {
   ramping: boolean;
   /** 近 10 分钟已完成调用的真实速度（落盘口径） */
   windowTps: number;
+  /** 最近一次已完成调用的真实速度（落盘口径），当前速度卡右上角小表用 */
+  lastCallTps: number;
   liveSource: string;
   lastActivityMs: number;
   nowMs: number;
@@ -90,7 +92,8 @@ function snapshot(now: number, pending: MockCall | null): Snapshot {
     dur = 0,
     wOut = 0,
     wDur = 0,
-    last = 0;
+    last = 0,
+    lastTps = 0;
   const sessions = new Set<string>();
   const buckets = new Array<number>(BUCKETS).fill(0);
   const bucketDur = new Array<number>(BUCKETS).fill(0);
@@ -101,7 +104,10 @@ function snapshot(now: number, pending: MockCall | null): Snapshot {
     input += c.input;
     cache += c.cache;
     dur += d;
-    last = Math.max(last, c.completed);
+    if (c.completed >= last) {
+      last = c.completed;
+      lastTps = c.output / (d / 1000); // 与后端一致：取完成时刻最晚一条的 eff ÷ 纯生成时长
+    }
     sessions.add(c.session);
     if (c.completed >= now - WINDOW) {
       wOut += c.output;
@@ -146,6 +152,7 @@ function snapshot(now: number, pending: MockCall | null): Snapshot {
     isStarting,
     ramping: isLive && ageSec < 30,
     windowTps: wDur > 0 ? wOut / (wDur / 1000) : 0,
+    lastCallTps: lastTps,
     liveSource: isStarting || isLive ? "io" : isEstimating ? "window" : "idle",
     lastActivityMs: last,
     nowMs: now,

@@ -41,6 +41,11 @@
         <section class="cards">
           <div class="card gauge-card">
             <canvas id="g-current"></canvas>
+            <canvas
+              id="g-last"
+              class="corner-gauge"
+              title="上一轮调用速度：最近一次已完成调用（输出+思考 ÷ 纯生成时长，落盘口径）"
+            ></canvas>
             <div class="sub" id="sub-current">等待数据…</div>
           </div>
           <div class="card gauge-card">
@@ -76,19 +81,31 @@
         <button id="float-pet-expand" class="float-expand ghost-btn" title="展开完整面板">⤢</button>
       </div>
 
-      <!-- 悬浮窗·仪表样式 -->
+      <!-- 悬浮窗·仪表样式：主环（实时）+ 右上角"上轮"小环（最近一轮已完成调用） -->
       <div id="float-gauge">
         <canvas id="mini-gauge"></canvas>
+        <canvas
+          id="mini-last"
+          class="float-badge"
+          title="上轮均速：最近一次已完成调用（输出+思考 ÷ 纯生成时长，落盘口径）"
+        ></canvas>
         <button id="float-gauge-expand" class="float-expand ghost-btn" title="展开完整面板">⤢</button>
       </div>
 
-      <!-- 悬浮窗·胶囊样式：整块可拖动，⤢ 展开 -->
+      <!-- 悬浮窗·胶囊样式：整块可拖动，⤢ 展开；第二行为上轮均速 -->
       <div id="float-pill">
         <span id="float-dot" class="dot idle"></span>
         <div id="float-val">
-          <span id="float-approx">≈</span>
-          <span id="float-tps">0.0</span>
-          <span class="float-unit">t/s</span>
+          <div class="float-val">
+            <span id="float-approx">≈</span>
+            <span id="float-tps">0.0</span>
+            <span class="float-unit">t/s</span>
+          </div>
+          <div class="float-sub">
+            <span class="float-sub-label">上轮均速</span>
+            <span id="float-last">--</span>
+            <span class="float-unit">t/s</span>
+          </div>
         </div>
         <button id="float-pill-expand" class="float-expand ghost-btn" title="展开完整面板">⤢</button>
       </div>

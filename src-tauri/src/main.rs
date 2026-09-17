@@ -160,7 +160,7 @@ impl DebugLog {
 }
 
 const FULL_SIZE: (f64, f64) = (1000.0, 700.0);
-const FLOAT_GAUGE_SIZE: (f64, f64) = (116.0, 116.0);
+const FLOAT_GAUGE_SIZE: (f64, f64) = (140.0, 116.0);
 const FLOAT_PILL_SIZE: (f64, f64) = (224.0, 78.0);
 /// 桌宠默认边长（逻辑像素），滚轮缩放范围 [100, 480]
 const FLOAT_PET_SIZE: f64 = 200.0;

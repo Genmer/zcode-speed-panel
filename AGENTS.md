@@ -7,7 +7,7 @@ ZCode 速度仪表盘：Tauri 2 + Rust 桌面工具（Windows 为主），实时
 ```bash
 npx tsc --noEmit                    # 前端类型检查（改 src/*.ts 后必跑）
 npm run build                       # tsc + vite build
-cd src-tauri && cargo test          # Rust 单元测试（13 个，含合成端到端）
+cd src-tauri && cargo test          # Rust 单元测试（14 个，含合成端到端）
 cd src-tauri && cargo check         # 后端编译检查
 npm run tauri dev                   # 开发运行（用户常驻一个 dev 实例，改码会热重启它）
 npm run tauri build                 # 正式版 + NSIS 安装包
@@ -37,7 +37,7 @@ public/pets/               宠物包资源；scripts/*.py 调试日志分析；.
 - 提交信息用中文，首行概括根因/行为。
 - 无系统标题栏：顶栏自绘（`#app-header` + `data-tauri-drag-region`，左侧为 `app-icon.png` 应用图标）；点 ✕ = 收起为悬浮窗，退出走托盘/右键菜单。
 - UI 下拉一律自绘（`.dropdown`），禁用原生 `<select>`——WebView2 弹层跟随系统浅色主题，深色界面里看不见字（key-rules #8）；顶栏新增交互组件须加入拖动/双击排除选择器。
-- 仪表配色：速度表分档色定义在 `src/gauges.ts` 顶部 `SPEED_TIERS`（0–30 绿 / 30–60 黄 / 60+ 红，整弧换色不分段，背景轨道恒灰），主表与迷你仪表共用。
+- 仪表配色：速度表分档色定义在 `src/gauges.ts` 顶部 `SPEED_TIERS`（0–30 绿 / 30–60 黄 / 60+ 红，整弧换色不分段，背景轨道恒灰），主表、迷你仪表、"上轮"角标小表（`BadgeGauge`）与胶囊/桌宠的上轮读数共用（`speedColor()` 统一取色）；浮动窗口尺寸改动须同步 `main.rs` 的 `FLOAT_*_SIZE`、`docs/features.md` 与 README。
 - CI 不随推送自动触发（省机时）：出包走 `v*` 标签（自动发 Release）或 Actions 页手动 Run workflow（Artifacts）；改动 workflow 触发逻辑须同步 README 与 `docs/features.md`。
 - 完整面板与悬浮窗位置各自独立记忆（`~/.zcode/speed-panel-mode.txt`）；悬浮窗尺寸用逻辑像素，物理换算走 `scale_factor()`，多屏定位必须 `clamp_to_screen`。
 

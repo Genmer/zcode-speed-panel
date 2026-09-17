@@ -1,6 +1,6 @@
 import "./style.css";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { ArcGauge, MiniGauge, SPEED_TIERS, drawSpark, fmtClock, fmtTokens, fmtTps } from "./gauges";
+import { ArcGauge, BadgeGauge, MiniGauge, SPEED_TIERS, drawSpark, fmtClock, fmtTokens, fmtTps, speedColor } from "./gauges";
 import { PetWidget } from "./pet";
 import { startMock, type Snapshot } from "./mock";
 
@@ -51,7 +51,12 @@ const gTotal = new ArcGauge($("g-total"), {
   kind: "tokens",
 });
 
+// 当前速度卡右上角小表：最近一轮已完成调用的速度（落盘口径，非实时）
+const gLast = new BadgeGauge($("g-last"), { tiers: SPEED_TIERS });
+
 const miniGauge = new MiniGauge($("mini-gauge"), { tiers: SPEED_TIERS });
+// 仪表悬浮窗右上角的上轮小环（与完整面板角标同款，只是尺寸更小）
+const miniLast = new BadgeGauge($("mini-last"), { tiers: SPEED_TIERS });
 // 存储键升级到 v2：让老用户也拿到一次新默认（鲸鱼女仆），之后的选择照常记住
 const PET_PACK_KEY = "petPack.v2";
 let currentPetPack = localStorage.getItem(PET_PACK_KEY) ?? "maid-deepseek-whale";
@@ -134,6 +139,7 @@ const stLast = $("st-last");
 const chartMax = $("chart-max");
 const floatTps = $("float-tps");
 const floatDot = $("float-dot");
+const floatLast = $("float-last");
 
 let lastSpark: number[] = [];
 let lastNowMs = 0;
@@ -161,8 +167,10 @@ const cacheHitRate = (s: Snapshot): string => {
 function onSnapshot(s: Snapshot) {
   gCurrent.setTarget(s.currentTps, s.isEstimating, s.isStarting);
   gAvg.setTarget(s.avgTps);
+  gLast.setTarget(s.lastCallTps);
   gTotal.setTarget(s.totalTokens);
   miniGauge.setTarget(s.currentTps, s.isEstimating, s.isStarting);
+  miniLast.setTarget(s.lastCallTps);
 
   subCurrent.textContent = s.isStarting
     ? "生成已启动 · 等待模型输出（统计中…）"
@@ -191,6 +199,10 @@ function onSnapshot(s: Snapshot) {
   floatTps.textContent = s.isStarting
     ? "…"
     : (s.isEstimating && s.liveSource !== "io" ? "≈" : "") + fmtTps(s.currentTps);
+  petWidget.setLast(s.lastCallTps);
+  // 胶囊第二行：上轮均速（落盘口径），按速度分档着色，无数据时显示 --
+  floatLast.textContent = s.lastCallTps > 0 ? fmtTps(s.lastCallTps) : "--";
+  floatLast.style.color = speedColor(s.lastCallTps, SPEED_TIERS);
 
   // 窗口标题同步实时速度，任务栏/Alt+Tab 可直接看到
   const title = `${s.isLive || s.isStarting ? "▶" : s.isEstimating ? "≈" : "⏸"} ${s.isStarting ? "…" : fmtTps(s.currentTps)} t/s · ${s.callsToday} 次 · ZCode 速度仪表盘`;

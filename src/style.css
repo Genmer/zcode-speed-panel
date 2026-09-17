@@ -155,6 +155,7 @@ main {
 }
 
 .gauge-card {
+  position: relative; /* 角标小表（#g-last）绝对定位到卡片右上角 */
   padding: 12px 10px 10px;
   display: flex;
   flex-direction: column;
@@ -166,6 +167,16 @@ main {
 .gauge-card canvas {
   width: 100%;
   height: 210px;
+}
+
+/* 当前速度卡右上角的"上一轮调用速度"小圆环：小而独立，不占主表布局；
+   尺寸受卡片顶角留白限制（窗口最小宽度 720 时主表弧线已贴近顶角） */
+.gauge-card canvas.corner-gauge {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  width: 56px;
+  height: 56px;
 }
 
 .sub {
@@ -390,9 +401,20 @@ body.float-mode.style-pill #float-pill {
   padding: 0 10px 0 18px;
 }
 
+/* 主环占左侧 100px，右侧留给"上轮"小环（窗口 140×116，见 main.rs FLOAT_GAUGE_SIZE）；
+   主环半径由画布尺寸推出，缩小画布宽度会同时缩小它，故宽度写死避免与小环争空间 */
 #mini-gauge {
-  width: 100%;
+  width: 100px;
   height: 100%;
+}
+
+/* 仪表悬浮窗右上角的上轮小环（与完整面板当前速度卡的角标同款，尺寸随窗口缩小） */
+.float-badge {
+  position: absolute;
+  top: 6px;
+  right: 4px;
+  width: 52px;
+  height: 52px;
 }
 
 #pet-canvas {
@@ -401,11 +423,38 @@ body.float-mode.style-pill #float-pill {
   display: block;
 }
 
+/* 胶囊数值区：第一行实时速度，第二行上轮均速（落盘口径） */
+#float-val {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+}
+
 .float-val {
   display: flex;
   align-items: baseline;
   gap: 6px;
   user-select: none;
+}
+
+.float-sub {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  user-select: none;
+}
+
+.float-sub-label {
+  color: var(--dim);
+  font-size: 10px;
+}
+
+#float-last {
+  font-size: 14px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--dim); /* 有数据时按速度分档着色（main.ts） */
 }
 
 #float-approx {

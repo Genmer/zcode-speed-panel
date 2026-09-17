@@ -56,6 +56,9 @@ pub struct Snapshot {
     /// 近 10 分钟已完成调用的真实速度（落盘口径，与速度曲线同源）。
     /// 部分调用期间 UI 管道无增量字节（IO 实测不可用），用它做回退显示
     pub window_tps: f64,
+    /// 最近一次已完成调用的真实速度（落盘口径：输出+思考 ÷ 纯生成时长）。
+    /// 今日无已完成调用时为 0；当前速度卡右上角的小表用它显示"上一轮"
+    pub last_call_tps: f64,
     /// 当前速度来源："io"=进程流实测 / "window"=窗口回退 / "idle"=待机
     pub live_source: String,
     pub last_activity_ms: i64,
@@ -148,6 +151,9 @@ impl Aggregator {
         let mut w_out = 0u64;
         let mut w_dur = 0i64;
         let mut last_completed = 0i64;
+        // 最近一次已完成调用的分子/分母，用于"上一轮调用速度"角标
+        let mut last_eff = 0u64;
+        let mut last_gen = 0i64;
         let mut sessions: HashSet<&str> = HashSet::new();
         // 桶对齐墙钟 10s 边界：桶序号 = 完成时刻所属槽 与 当前槽 的差
         let now_slot = now.div_euclid(SPARK_BUCKET_MS);
@@ -163,7 +169,11 @@ impl Aggregator {
             if !c.session.is_empty() {
                 sessions.insert(c.session.as_str());
             }
-            last_completed = last_completed.max(c.completed_ms);
+            if c.completed_ms >= last_completed {
+                last_completed = c.completed_ms;
+                last_eff = c.effective_out();
+                last_gen = c.gen_ms.max(MIN_DUR_MS);
+            }
             if c.completed_ms >= now - LIVE_WINDOW_MS {
                 w_out += c.effective_out();
                 w_dur += c.gen_ms.max(MIN_DUR_MS);
@@ -231,6 +241,11 @@ impl Aggregator {
         } else {
             0.0
         };
+        let last_call_tps = if last_gen > 0 {
+            last_eff as f64 / (last_gen as f64 / 1000.0)
+        } else {
+            0.0
+        };
 
         // 总量口径与 ZCode 官方统计一致：input + output + reasoning + cache_creation，
         // 缓存命中（cache_read）是提示复用、不是新增用量，单独展示不计入
@@ -250,6 +265,7 @@ impl Aggregator {
             ramping: false,
             is_starting: false,
             window_tps,
+            last_call_tps,
             live_source: if is_estimating {
                 "window".to_string()
             } else {
@@ -550,6 +566,22 @@ mod tests {
         assert_eq!(s.sessions_today, 1);
         assert_eq!(s.spark.len(), SPARK_BUCKETS);
         assert_eq!(s.live_source, "window"); // 无 IO 探测时 is_live=false → 窗口回退
+        // 上一轮调用速度 = 最近一次完成调用（now-1s）的 eff/gen = 300 / 8s
+        assert!((s.last_call_tps - 37.5).abs() < 1e-9);
+    }
+
+    /// "上一轮调用速度"取完成时刻最晚的那条，与 ingest 顺序无关（DB 查询排序可能变化）
+    #[test]
+    fn last_call_tps_uses_latest_completed() {
+        let now = now_ms();
+        let mut agg = Aggregator::new();
+        agg.ingest(call(now - 1_000, 4_000, 400, 0, 0, "a")); // 100 t/s
+        agg.ingest(call(now - 30_000, 2_000, 100, 0, 0, "b")); // 50 t/s，更早完成
+        agg.ingest(call(now - 20_000, 5_000, 250, 50, 0, "c")); // 60 t/s，仍早于 now-1s
+        let s = agg.snapshot();
+        assert!((s.last_call_tps - 100.0).abs() < 1e-9);
+        // 平均速度与"上一轮"是两个口径：总 eff 800 / 总 11s ≠ 100
+        assert!((s.avg_tps - 800.0 / 11.0).abs() < 1e-9);
     }
 
     #[test]
