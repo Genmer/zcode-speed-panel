@@ -133,6 +133,8 @@ abstract class BaseGauge {
   protected target = 0;
   protected max: number;
   protected est = false;
+  /** 启动期（门控已开、首字节未到）：呼吸脉冲弧 + "…" 数字提示统计中 */
+  protected starting = false;
 
   constructor(canvas: HTMLCanvasElement, opts: GaugeOptions) {
     this.canvas = canvas;
@@ -142,10 +144,16 @@ abstract class BaseGauge {
     startLoop();
   }
 
-  setTarget(v: number, est = false) {
+  setTarget(v: number, est = false, starting = false) {
     if (!isFinite(v) || v < 0) v = 0;
     this.target = v;
     this.est = est;
+    this.starting = starting;
+  }
+
+  /** 启动期呼吸相位（0~1，约 1.9s 一个周期） */
+  protected pulse(): number {
+    return 0.5 + 0.5 * Math.sin(performance.now() / 300);
   }
 
   frame(dt: number) {
@@ -208,7 +216,19 @@ export class ArcGauge extends BaseGauge {
     ctx.arc(cx, cy, r, A0, A0 + SWEEP);
     ctx.stroke();
 
-    if (this.opts.tiers && !this.est) {
+    if (this.starting) {
+      // 启动期：短弧呼吸脉冲（已连接、等待模型输出），不用分档色——还没有速度
+      const p = this.pulse();
+      ctx.save();
+      ctx.globalAlpha = 0.45 + 0.55 * p;
+      ctx.shadowColor = this.opts.color;
+      ctx.shadowBlur = 14;
+      ctx.strokeStyle = this.opts.color;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, A0, A0 + SWEEP * (0.05 + 0.06 * p));
+      ctx.stroke();
+      ctx.restore();
+    } else if (this.opts.tiers && !this.est) {
       // 整条进度弧随当前速度所在档位整体换色：0–30 绿 / 30–60 黄 / 60+ 红
       const tierColor = speedTier(this.value).color;
       ctx.save();
@@ -258,7 +278,11 @@ export class ArcGauge extends BaseGauge {
 
     ctx.textAlign = "center";
     ctx.textBaseline = "alphabetic";
-    const main = this.kind === "speed" ? (this.est ? "≈" + fmtTps(this.value) : fmtTps(this.value)) : fmtTokens(this.value);
+    const main = this.starting
+      ? "…"
+      : this.kind === "speed"
+        ? (this.est ? "≈" + fmtTps(this.value) : fmtTps(this.value))
+        : fmtTokens(this.value);
     let fs = Math.round(r * 0.44);
     ctx.font = `600 ${fs}px ${FONT}`;
     const maxW = (r - 24) * 2;
@@ -269,7 +293,9 @@ export class ArcGauge extends BaseGauge {
     // 数字随当前档位换色（估算态/未分档保持原白色），待机为 0 时仍是默认白
     ctx.fillStyle =
       this.value > 0 && this.opts.tiers && !this.est ? speedTier(this.value).color : "#e6e9f0";
+    if (this.starting) ctx.globalAlpha = 0.45 + 0.55 * this.pulse();
     ctx.fillText(main, cx, cy + 2);
+    ctx.globalAlpha = 1;
     ctx.fillStyle = "#8b93a7";
     ctx.font = `11px ${FONT}`;
     ctx.fillText(this.unit, cx, cy + r * 0.46);
@@ -299,7 +325,19 @@ export class MiniGauge extends BaseGauge {
     ctx.arc(cx, cy, r, A0, A0 + SWEEP);
     ctx.stroke();
 
-    if (this.opts.tiers && !this.est) {
+    if (this.starting) {
+      // 启动期：短弧呼吸脉冲（等待模型输出）
+      const p = this.pulse();
+      ctx.save();
+      ctx.globalAlpha = 0.45 + 0.55 * p;
+      ctx.shadowColor = this.opts.color;
+      ctx.shadowBlur = 9;
+      ctx.strokeStyle = this.opts.color;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, A0, A0 + SWEEP * (0.05 + 0.06 * p));
+      ctx.stroke();
+      ctx.restore();
+    } else if (this.opts.tiers && !this.est) {
       // 整条进度弧随当前速度所在档位整体换色
       const tierColor = speedTier(this.value).color;
       ctx.save();
@@ -332,7 +370,9 @@ export class MiniGauge extends BaseGauge {
           ? speedTier(this.value).color
           : "#e6e9f0";
     ctx.font = `600 ${Math.round(r * 0.5)}px ${FONT}`;
-    ctx.fillText((this.est ? "≈" : "") + fmtTps(this.value), cx, cy + r * 0.12);
+    if (this.starting) ctx.globalAlpha = 0.45 + 0.55 * this.pulse();
+    ctx.fillText(this.starting ? "…" : (this.est ? "≈" : "") + fmtTps(this.value), cx, cy + r * 0.12);
+    ctx.globalAlpha = 1;
     ctx.fillStyle = "#8b93a7";
     ctx.font = `9px ${FONT}`;
     ctx.fillText("t/s", cx, cy + r * 0.55);

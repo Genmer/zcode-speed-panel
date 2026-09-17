@@ -28,6 +28,10 @@ const REFRESH_EVERY: Duration = Duration::from_secs(30);
 const STREAMING_BPS: f64 = 4_000.0;
 /// 启停由调用门控决定；该短窗仅用于定位幅度锚点（首字节拍）
 const DETECT_MS: i64 = 2_500;
+/// 启动提示窗口：门控已开但尚未观测到流式字节（TTFT）的时长上限。
+/// 窗口内显示"统计中…"提示（不显示误导性的估算值）；超窗仍无字节则视为
+/// 管道静默调用，回退到近期真值估算（≈）
+const TTFT_HINT_MS: i64 = 20_000;
 /// 待机心跳底噪的粗略上界（B/s），叠加每进程自适应底噪（封顶后）过滤心跳
 const BASE_NOISE_BPS: f64 = 3_000.0;
 /// 每进程自适应心跳底的单拍封顶（字节/拍）。实测流式可到 ~75KB/s（52KB/拍），
@@ -53,6 +57,9 @@ pub struct LiveNow {
     pub streaming: bool,
     /// 流式已开始但 30s 滑窗尚未填满（读数来自已活跃区间，前端显示"统计中"）
     pub ramping: bool,
+    /// 调用已开始但尚未观测到首字节（TTFT，限制在提示窗口内）：
+    /// 前端显示"统计中…"提示而非估算值
+    pub awaiting: bool,
     pub tps: f64,
     /// 清洗后的管道字节率（B/s），调试日志/对账用
     pub pipe_bps: f64,
@@ -174,6 +181,19 @@ pub(crate) fn cal_sample(eff: u64, clean_bytes: f64, raw_bytes: f64) -> (bool, f
     let ratio = clean_bytes / eff as f64;
     let usable = clean_bytes / raw_bytes >= 0.2;
     (usable && ratio >= CAL_MIN && ratio <= CAL_MAX, ratio)
+}
+
+/// 启动提示判定（纯函数）：门控开启、尚无流式锚点（首字节未到）且距调用开始
+/// 仍在提示窗口内。窗口外保持无锚点 = 管道静默调用，由上层回退到估算显示
+pub(crate) fn awaiting_hint(
+    inflight_started: Option<i64>,
+    anchor: Option<i64>,
+    now_ms: i64,
+) -> bool {
+    match (inflight_started, anchor) {
+        (Some(started), None) => now_ms - started <= TTFT_HINT_MS,
+        _ => false,
+    }
 }
 
 struct ProcRing {
@@ -392,6 +412,8 @@ mod imp {
         active_pid: Option<u32>,
         /// 最近一次校准事件（供调试日志取用）
         pending_cal: Option<CalEvent>,
+        /// 本进程生命周期内是否发现过 CLI 进程（区分"从未可用"与"已退出"）
+        ever_saw_procs: bool,
     }
 
     impl LiveIo {
@@ -416,6 +438,7 @@ mod imp {
                 active_since: None,
                 active_pid: None,
                 pending_cal: None,
+                ever_saw_procs: false,
             }
         }
 
@@ -475,6 +498,12 @@ mod imp {
             self.bytes_per_token
         }
 
+        /// 是否曾发现过 CLI 进程。区分"从未可用"（IO 探测不可用环境，允许估算回退）
+        /// 与"发现过又全部退出"（CLI 已关闭，不应继续显示生成/估算）
+        pub fn ever_saw_procs(&self) -> bool {
+            self.ever_saw_procs
+        }
+
         /// 取走最近一次校准事件（如有）
         pub fn take_calibration(&mut self) -> Option<CalEvent> {
             self.pending_cal.take()
@@ -483,11 +512,15 @@ mod imp {
         /// 每个轮询周期调用一次。now_ms 为墙钟毫秒（与 Engine 快照同源）
         pub fn measure(&mut self, now_ms: i64) -> LiveNow {
             let now = Instant::now();
-            // 周期性刷新 CLI 进程集合
-            if self
+            // 周期性刷新 CLI 进程集合；未发现任何进程时缩短到 2s——
+            // 新启动的 CLI（新会话开聊）最长 2s 即可被观测到，而不是等满 30s
+            let refresh_due = self
                 .last_refresh
-                .map_or(true, |t| now.duration_since(t) > REFRESH_EVERY)
-            {
+                .map_or(true, |t| now.duration_since(t) > REFRESH_EVERY);
+            let quick_due = self
+                .last_refresh
+                .map_or(true, |t| now.duration_since(t) > Duration::from_secs(2));
+            if refresh_due || (self.procs.is_empty() && quick_due) {
                 self.last_refresh = Some(now);
                 let found = discover_cli_pids();
                 self.procs.retain(|pid, _| found.contains(pid));
@@ -497,6 +530,9 @@ mod imp {
                         samples: VecDeque::new(),
                         min_delta: f64::MAX,
                     });
+                }
+                if !self.procs.is_empty() {
+                    self.ever_saw_procs = true;
                 }
             }
 
@@ -608,12 +644,21 @@ mod imp {
                 self.pending.pop_front();
             }
 
-            // 只统计当前会话对应进程的写字节流，避免后台会话污染状态
+            // 只统计当前活跃会话对应进程的写字节流，避免后台会话污染状态。
+            // 优先取进行中调用（message 门控）的会话归属：新开对话首个调用尚无
+            // 完成行、无归属记录时退化为全进程求和；无进行中调用时退回最近
+            // 完成调用的会话（与归属维护同源）
             let live_pid = self
-                .current_session
+                .inflight
                 .as_ref()
-                .and_then(|s| self.session_pid.get(s))
-                .copied();
+                .and_then(|(s, _)| self.session_pid.get(s))
+                .copied()
+                .or_else(|| {
+                    self.current_session
+                        .as_ref()
+                        .and_then(|s| self.session_pid.get(s))
+                        .copied()
+                });
             // 会话进程变化时重置幅度锚点，避免跨会话残留
             if live_pid != self.active_pid {
                 self.active_pid = live_pid;
@@ -635,22 +680,25 @@ mod imp {
                 }
             };
 
-            // 启停判定（调用门控）：message 表的 assistant 行在调用开始瞬间提交、
-            // 完成行在调用结束落盘，"开始时间 > 完成时间"即调用进行中——
-            // 开始当拍生效（首 token 前即亮"统计中"），完成行落盘当拍归零。
-            // 工具执行/待机期间管道同样有 UI 状态突发，门控将其可靠排除。
-            // 门控不可用时（尚无任何已完成调用做基线）退化为纯字节判定。
-            let model_active = self
+            // 启停判定（调用门控）：message 表的 assistant 行在调用开始瞬间提交，
+            // 行内 data 的 time.completed 在结束（含取消/出错）瞬间补写——门控直接
+            // 信任该信号且不限会话（新开对话的首个调用当拍即亮，无需等首个完成行），
+            // 结束/取消当拍归零。工具执行/待机期间管道同样有 UI 状态突发，门控
+            // 将其可靠排除。进程守卫：已归属的会话进程退出（崩溃/关终端后
+            // completed 无人补写）时强制判停，不留僵尸"生成中"。
+            // 门控不可用时（尚无任何调用做基线）退化为纯字节判定。
+            let proc_gone = self
                 .inflight
                 .as_ref()
-                .map_or(false, |(s, _)| Some(s) == self.current_session.as_ref());
+                .and_then(|(s, _)| self.session_pid.get(s).copied())
+                .map_or(false, |pid| !self.procs.contains_key(&pid));
             let (det_b, det_s) = span(now_ms - DETECT_MS);
             let detect_bps = if det_s > 0.0 { det_b / det_s } else { 0.0 };
-            let gate_on = if self.inflight.is_some() {
-                model_active
-            } else {
-                self.current_session.is_none() && detect_bps > STREAMING_BPS
-            };
+            let gate_on = !proc_gone
+                && match &self.inflight {
+                    Some(_) => true,
+                    None => self.current_session.is_none() && detect_bps > STREAMING_BPS,
+                };
             if gate_on {
                 // 幅度锚点：本段调用内首个清洗流速达到流式阈值的时刻
                 if self.active_since.is_none() && detect_bps > STREAMING_BPS {
@@ -685,11 +733,16 @@ mod imp {
                     || self
                         .active_since
                         .map_or(false, |a| now_ms - a < WINDOW_MS));
+            // 启动提示：门控已开但首字节未到（TTFT），限制在提示窗口内——
+            // 窗口内显示"统计中…"，超窗仍无字节则由上层回退到估算（管道静默调用）
+            let awaiting =
+                streaming && awaiting_hint(self.inflight.as_ref().map(|(_, t)| *t), self.active_since, now_ms);
 
             let result = LiveNow {
                 available: !self.procs.is_empty(),
                 streaming,
                 ramping,
+                awaiting,
                 tps: if streaming {
                     pipe_bps / self.bytes_per_token
                 } else {
@@ -722,6 +775,9 @@ impl LiveIo {
     pub fn set_inflight(&mut self, _inflight: Option<(String, i64)>) {}
     pub fn bytes_per_token(&self) -> f64 {
         DEFAULT_BPT
+    }
+    pub fn ever_saw_procs(&self) -> bool {
+        false
     }
     pub fn take_calibration(&mut self) -> Option<CalEvent> {
         None
@@ -829,6 +885,20 @@ mod tests {
         // 两个真实样本开始推动中位数（[179, 552, 600] → 552）
         let b2 = median_bpt(&mut s, 552.0, 5);
         assert!((b2 - 552.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn awaiting_hint_window() {
+        // 门控开启、首字节未到：提示窗口（20s）内为 true
+        assert!(awaiting_hint(Some(1_000), None, 5_000));
+        assert!(awaiting_hint(Some(1_000), None, 21_000));
+        // 超窗 → 不再提示（上层回退估算：管道静默调用）
+        assert!(!awaiting_hint(Some(1_000), None, 21_001));
+        // 已有首字节锚点 → 不是启动期
+        assert!(!awaiting_hint(Some(1_000), Some(2_000), 5_000));
+        // 无进行中调用 → 不提示
+        assert!(!awaiting_hint(None, None, 5_000));
+        assert!(!awaiting_hint(None, Some(1_000), 5_000));
     }
 
     /// 样本准入用例取自真实调试日志（2026-09-17 现场）：

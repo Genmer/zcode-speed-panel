@@ -330,7 +330,7 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
         engine_calls = engine.calls().to_vec();
         inflight = engine.call_in_flight();
     }
-    // 实时实测：进程 IO 写字节流（真实值），只统计当前会话对应的 CLI 进程
+    // 实时实测：进程 IO 写字节流（真实值），只统计当前活跃会话对应的 CLI 进程
     let now_ms = snapshot.now_ms;
     let cal_event;
     let bpt_now;
@@ -341,20 +341,26 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
             live.ingest_history(engine_calls.as_slice());
         }
         live.observe(&new_calls);
-        live.set_inflight(inflight);
+        live.set_inflight(inflight.clone());
         let live_now = live.measure(now_ms);
         cal_event = live.take_calibration();
         bpt_now = live.bytes_per_token();
         pipe_bps = live_now.pipe_bps;
+        let ever_saw = live.ever_saw_procs();
         if live_now.available {
             if live_now.streaming {
                 snapshot.is_live = true;
                 snapshot.is_estimating = false;
                 snapshot.ramping = live_now.ramping;
+                snapshot.is_starting = live_now.awaiting;
                 snapshot.live_source = "io".into();
-                // 部分调用期间 UI 管道无增量字节（IO 实测为 0）：回退到近期
-                // 已完成调用的真实速度（与速度曲线同口径），标记 ≈ 估算
-                if live_now.tps < 1.0 && snapshot.window_tps > 0.0 {
+                if live_now.awaiting {
+                    // 启动期（门控已开、首字节未到）：显示"统计中…"提示，
+                    // 不显示误导性的估算值
+                    snapshot.current_tps = 0.0;
+                } else if live_now.tps < 1.0 && snapshot.window_tps > 0.0 {
+                    // 部分调用期间 UI 管道无增量字节（IO 实测为 0）：回退到近期
+                    // 已完成调用的真实速度（与速度曲线同口径），标记 ≈ 估算
                     snapshot.current_tps = snapshot.window_tps;
                     snapshot.is_estimating = true;
                     snapshot.live_source = "window".into();
@@ -365,7 +371,32 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
                     *last = snapshot.current_tps;
                 }
             } else {
-            // IO 可用但当前会话无流式输出 → 如实待机（真实值优先，不用估算掩盖）
+                // IO 可用但门控判定无调用 → 如实待机（真实值优先，不用估算掩盖）
+                snapshot.is_estimating = false;
+                snapshot.ramping = false;
+                snapshot.current_tps = 0.0;
+                snapshot.live_source = "idle".into();
+                if let Some(last) = snapshot.spark.last_mut() {
+                    *last = 0.0;
+                }
+            }
+        } else if inflight.is_some() && !ever_saw {
+            // IO 从未可用（IO 探测环境不可用 / 面板刚启动进程未发现）：
+            // 按 message 门控决定，而不是按调用间隔盲估——有调用进行中才显示
+            // （近期有真值则估算 ≈，否则"统计中…"提示），门控已停立即归零。
+            // 旧口径按间隔中位数推断，调用结束后还会空转"估算中"最长 240s
+            if !(snapshot.is_estimating && snapshot.current_tps > 0.0) {
+                snapshot.is_estimating = false;
+                snapshot.is_starting = true;
+                snapshot.current_tps = 0.0;
+                snapshot.live_source = "window".into();
+                if let Some(last) = snapshot.spark.last_mut() {
+                    *last = 0.0;
+                }
+            }
+        } else {
+            // 发现过进程但当前不可用（CLI 已全部退出），或门控已停 → 如实待机
+            snapshot.is_live = false;
             snapshot.is_estimating = false;
             snapshot.ramping = false;
             snapshot.current_tps = 0.0;
@@ -374,7 +405,6 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
                 *last = 0.0;
             }
         }
-    }
 
     // ---- 调试日志：实时显示值 / 统计值 / 每轮完成后的真值 ----
     {
@@ -415,7 +445,7 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
                 "skipped": cal.cal_skipped,
             }));
         }
-        let active = snapshot.is_live || snapshot.is_estimating;
+        let active = snapshot.is_live || snapshot.is_estimating || snapshot.is_starting;
         let heartbeat = log.last_heartbeat.elapsed() > std::time::Duration::from_secs(30);
         if active || heartbeat {
             log.last_heartbeat = std::time::Instant::now();
@@ -435,6 +465,7 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
                 "pipe": (pipe_bps / 10.0).round() * 10.0,
                 "stream": snapshot.is_live,
                 "ramp": snapshot.ramping,
+                "start": snapshot.is_starting,
                 "est": snapshot.is_estimating,
                 "bpt": (bpt_now * 10.0).round() / 10.0,
                 "avg": (snapshot.avg_tps * 10.0).round() / 10.0,

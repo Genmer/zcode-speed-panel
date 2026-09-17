@@ -1,7 +1,7 @@
 use chrono::{Datelike, Local, NaiveTime, Utc};
 use rusqlite::OpenFlags;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 /// 一次已完成的模型调用（来自 ZCode usage 数据库 model_usage 表）
@@ -50,6 +50,9 @@ pub struct Snapshot {
     pub is_estimating: bool,
     /// 实测流式已开始但 30s 滑窗未填满（读数来自已活跃区间，前端显示"统计中"）
     pub ramping: bool,
+    /// 调用已开始但尚未输出首字节（TTFT/管道未观测到增量）：显示"统计中…"提示
+    /// 而不是误导性的估算值，前端表盘/桌宠显示 …
+    pub is_starting: bool,
     /// 近 10 分钟已完成调用的真实速度（落盘口径，与速度曲线同源）。
     /// 部分调用期间 UI 管道无增量字节（IO 实测不可用），用它做回退显示
     pub window_tps: f64,
@@ -245,6 +248,7 @@ impl Aggregator {
             is_live: false,
             is_estimating,
             ramping: false,
+            is_starting: false,
             window_tps,
             live_source: if is_estimating {
                 "window".to_string()
@@ -399,47 +403,118 @@ impl Engine {
         &self.agg.calls()
     }
 
-    /// 当前会话最新 assistant 消息的创建时刻。message 行在调用开始瞬间即提交
-    /// （实测 ≤200ms 可读），可与已完成调用的 completed_at 比较判断"调用进行中"。
-    pub fn latest_assistant_created(&self, session: &str) -> Option<i64> {
+    /// 是否有调用正在进行：看最近活跃会话的最新 assistant 消息行。
+    /// message 行在调用开始瞬间即提交（≤200ms 可读），行内 data 的 time 对象在
+    /// 调用结束（含取消/出错）时补写 completed 字段——比 model_usage 完成行更快、
+    /// 且覆盖 status='cancelled'/'error'（这两种调用永远没有 completed 状态行，
+    /// 旧口径下会卡"生成中"直到 10 分钟兜底）。
+    /// 返回 (会话, 调用开始时刻)。10 分钟上限兜底崩溃后无人补写 completed 的行。
+    pub fn call_in_flight(&self) -> Option<(String, i64)> {
         let conn = self.conn.as_ref()?;
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT time_created, substr(data,1,80) FROM message \
-                 WHERE session_id = ?1 ORDER BY time_created DESC LIMIT 6",
-            )
-            .ok()?;
-        let rows = stmt
-            .query_map([session], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
-            .ok()?;
-        for row in rows.flatten() {
-            if row.1.contains("\"assistant\"") {
-                return Some(row.0);
+        // 最近活跃会话（session 表 ~1k 行，按 time_updated 倒序小表扫描可接受）；
+        // message 表缺 time_created 单列索引，不能全局 ORDER BY（实测 ~200ms/次）
+        let mut stmt = match conn.prepare_cached(
+            "SELECT id FROM session ORDER BY time_updated DESC LIMIT 6",
+        ) {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+        let sessions: Vec<String> = match stmt.query_map([], |r| r.get::<_, String>(0)) {
+            Ok(rows) => rows.flatten().collect(),
+            Err(_) => return None,
+        };
+        drop(stmt);
+
+        let mut cands: Vec<(String, i64, bool)> = Vec::new();
+        for sess in &sessions {
+            // 每会话只看最新一条 assistant 行（走 (session_id, time_created) 复合索引）
+            let Ok(mut stmt) = conn.prepare_cached(
+                "SELECT time_created, substr(data,1,120) FROM message \
+                 WHERE session_id = ?1 ORDER BY time_created DESC LIMIT 8",
+            ) else {
+                continue;
+            };
+            let Ok(rows) = stmt.query_map([sess], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            }) else {
+                continue;
+            };
+            for (created, prefix) in rows.flatten() {
+                if !prefix.contains("\"assistant\"") {
+                    continue;
+                }
+                let done = prefix.contains("\"completed\"");
+                cands.push((sess.clone(), created, done));
+                break;
             }
         }
-        None
+        inflight_from_rows(&cands, Utc::now().timestamp_millis())
     }
+}
 
-    /// 是否有调用正在进行：最新 assistant 消息创建时间 > 最新已完成调用的完成时间
-    /// （同一调用完成时 completed_at 必然晚于其消息创建时刻，行落盘即视为结束）。
-    /// 返回 (会话, 调用开始时刻)。10 分钟上限兜底异常调用（崩溃后无完成行）。
-    pub fn call_in_flight(&self) -> Option<(String, i64)> {
-        let latest = self.agg.calls.iter().max_by_key(|c| c.completed_ms)?;
-        let created = self.latest_assistant_created(&latest.session)?;
-        if created > latest.completed_ms
-            && created > Utc::now().timestamp_millis() - 600_000
-        {
-            Some((latest.session.clone(), created))
-        } else {
-            None
+/// message 门控纯判定：候选 (会话, assistant 行创建时刻, 是否已带 completed)。
+/// 每会话只认最新一条 assistant 行（更老的未完成行是崩溃残留，已被更新行覆盖），
+/// 其中任一会话的最新行未完成且新鲜 → 有调用进行中，取创建时刻最新的一条
+pub(crate) fn inflight_from_rows(
+    cands: &[(String, i64, bool)],
+    now_ms: i64,
+) -> Option<(String, i64)> {
+    let mut newest: HashMap<&str, &(String, i64, bool)> = HashMap::new();
+    for row in cands {
+        match newest.get(row.0.as_str()) {
+            Some(prev) if prev.1 >= row.1 => {}
+            _ => {
+                newest.insert(row.0.as_str(), row);
+            }
         }
     }
+    newest
+        .values()
+        .filter(|(_, created, done)| !done && now_ms - *created <= 600_000)
+        .max_by_key(|(_, created, _)| *created)
+        .map(|(s, c, _)| (s.clone(), *c))
 }
 
 // ============ 测试 ============
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// message 门控：未带 completed 的最新 assistant 行 → 进行中；
+    /// 已完成的行、超龄的僵尸行（崩溃兜底）、以及"同会话更新的已完成行"都不算
+    #[test]
+    fn inflight_from_rows_gating() {
+        let now = 1_000_000i64;
+        // 新会话首条调用：行未完成 → 进行中
+        let r = inflight_from_rows(&[("new".into(), now - 3_000, false)], now);
+        assert_eq!(r, Some(("new".to_string(), now - 3_000)));
+        // 同会话有更新的已完成 assistant 行（旧僵尸行在上）→ 不算
+        assert_eq!(
+            inflight_from_rows(
+                &[
+                    ("a".into(), now - 60_000, false),      // 崩溃残留
+                    ("a".into(), now - 30_000, true),       // 会话 a 最新 assistant 行
+                ],
+                now
+            ),
+            None
+        );
+        // 多会话并发：取最新未完成行（子 agent 会话 b 晚于主会话 a 开始）
+        let r = inflight_from_rows(
+            &[
+                ("a".into(), now - 40_000, true),
+                ("b".into(), now - 5_000, false),
+            ],
+            now,
+        );
+        assert_eq!(r, Some(("b".to_string(), now - 5_000)));
+        // 未完成但超过 10 分钟兜底 → 判停
+        assert_eq!(
+            inflight_from_rows(&[("z".into(), now - 601_000, false)], now),
+            None
+        );
+        assert_eq!(inflight_from_rows(&[], now), None);
+    }
 
     fn call(completed: i64, gen_ms: i64, out: u64, reason: u64, input: u64, session: &str) -> Call {
         Call {

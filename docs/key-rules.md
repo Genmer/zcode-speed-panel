@@ -35,7 +35,7 @@
 ## 6. 调试日志是排查的第一手数据
 
 `~/.zcode/speed-panel-debug.jsonl`（JSONL 追加，8MB 轮转保留一代 `.jsonl.1`，轮转旧文件超 7 天启动时自动清理）记录三类事件：
-- `tick`：显示值 `tps`、来源 `src`（io/window/idle）、清洗管道字节率 `pipe`、生效系数 `bpt`、曲线尾桶；
+- `tick`：显示值 `tps`、来源 `src`（io/window/idle）、启动期 `start`、清洗管道字节率 `pipe`、生效系数 `bpt`、曲线尾桶；
 - `call`：调用完成真值（`eff`/`gen_ms`/`true_tps`）；
 - `cal`：校准对账（`true_tps` vs `pred_tps`、`raw_kb`/`clean_kb`、`bpt_sample`/`bpt_now`、`skipped`）。
 
@@ -50,3 +50,10 @@
 原生 select 的**下拉弹层**由 WebView2 按系统主题渲染：系统浅色时弹层白底，option 又继承了页面里的灰字样式，深色界面下几乎看不见；实测 `:root { color-scheme: dark }` 与 option 显式着色在 WebView2 弹层里均不生效。
 - 事故案例：悬浮窗样式下拉"看不见字"（已修：整个替换为自绘 `.dropdown`/`.dropdown-list`，与右键菜单同风格深色弹层）。
 - 规则：本项目 UI 需要下拉一律自绘，不再新增原生 `<select>`；新增顶栏交互组件时，同步把它加入 enableDrag 拖动与双击最大化的排除选择器（`button, select, input, .dropdown`），否则会误触窗口拖动/最大化。
+
+## 9. 启停门控必须用 message 行的 `completed` 字段，不能用 model_usage 完成行
+
+调用启停判定以 usage 库 message 表 assistant 消息行为准：**行在调用开始瞬间提交（≤200ms），行内 data 的 `time.completed` 在结束瞬间补写（取消/出错也会补）**。`model_usage` 行只记 `status='completed'`——cancelled/error 的调用（实测库中 97+119 条）**永远没有完成行**，用完成行判停会卡"生成中"直到 10 分钟兜底；且它不区分会话，新开对话首个调用要等首个完成行落盘才可见（长调用可达数分钟）。
+- 事故案例：旧口径"最新 assistant 创建时间 > 最新完成调用的 completed_at 且限最新完成调用的会话"——用户取消生成后面板持续显示"生成中 + 估算值"最长 10 分钟；新会话开聊全程无反应。
+- 查询约束：message 表**没有 time_created 单列索引**（全局 `ORDER BY time_created DESC` 实测 ~200ms/次，700ms 轮询不可承受）——必须先取 `session.time_updated` 倒序前几个会话，再走 `(session_id, time_created)` 复合索引按会话查最新 assistant 行。
+- 守护：`inflight_from_rows`（metrics.rs）为门控纯函数单测（僵尸行/多会话/超龄）；`awaiting_hint`（liveio.rs）守护启动期提示窗口。改门控相关代码时这两个测试必须保持通过。

@@ -100,12 +100,13 @@ export class PetWidget {
     };
   }
 
-  setLive(tps: number, state: "idle" | "running" | "estimating") {
-    this.tps = state === "estimating" ? "≈" + tps.toFixed(1) : tps.toFixed(1);
+  setLive(tps: number, state: "idle" | "running" | "estimating" | "starting") {
+    // 启动等待（首字节未到）显示 "…"，与表盘的统计中提示一致
+    this.tps = state === "starting" ? "…" : state === "estimating" ? "≈" + tps.toFixed(1) : tps.toFixed(1);
     this.est = state === "estimating";
-    this.running = state === "running";
-    // 只有 IO 实测到流式输出才播放跑步动画；估算回退时保持站立
-    this.anim = state === "running" ? "running" : "idle";
+    this.running = state === "running" || state === "starting";
+    // 只有实测到流式输出（或刚启动等待中）才播放跑步动画；估算回退时保持站立
+    this.anim = this.running ? "running" : "idle";
   }
 
   get packId(): string {

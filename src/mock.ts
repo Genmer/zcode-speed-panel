@@ -12,6 +12,8 @@ export interface Snapshot {
   sessionsToday: number;
   isLive: boolean;
   isEstimating: boolean;
+  /** 调用已开始但首字节未到（TTFT）：显示"统计中…"提示而非估算值 */
+  isStarting: boolean;
   /** 实测流式已开始但 30s 滑窗未填满（显示"统计中"） */
   ramping: boolean;
   /** 近 10 分钟已完成调用的真实速度（落盘口径） */
@@ -30,11 +32,12 @@ interface MockCall {
   input: number;
   cache: number;
   session: string;
+  /** 管道静默调用：整段无增量字节，走 ≈ 估算显示 */
+  silent: boolean;
 }
 
 const MIN_DUR = 50;
 const WINDOW = 10 * 60 * 1000;
-const CUTOFF = 90 * 1000;
 const BUCKETS = 90;
 const BUCKET = 10_000;
 
@@ -55,6 +58,7 @@ function newCall(now: number): MockCall {
     input: Math.round(rnd(15000, 60000)),
     cache: Math.round(rnd(10000, 250000)),
     session: `mock-sess-${sessionNo}`,
+    silent: Math.random() < 0.22,
   };
 }
 
@@ -77,7 +81,7 @@ function seedHistory(now: number) {
   sessionNo = Math.max(sessionNo, 6);
 }
 
-function snapshot(now: number): Snapshot {
+function snapshot(now: number, pending: MockCall | null): Snapshot {
   let out = 0,
     input = 0,
     cache = 0,
@@ -107,21 +111,20 @@ function snapshot(now: number): Snapshot {
       bucketDur[BUCKETS - 1 - slot] += d;
     }
   }
-  const comps = [...new Set(calls.map((c) => c.completed))].sort((a, b) => a - b);
-  const gaps: number[] = [];
-  for (let i = 1; i < comps.length; i++) {
-    const g = comps[i] - comps[i - 1];
-    if (g > 0 && g < 600000) gaps.push(g);
-  }
-  let grace = 60000;
-  if (gaps.length >= 3) {
-    const tail = gaps.slice(Math.max(0, gaps.length - 10)).sort((a, b) => a - b);
-    grace = Math.min(240000, Math.max(20000, tail[Math.floor(tail.length / 2)]));
-  }
-  const since = now - last;
-  const isLive = last > 0 && since <= CUTOFF;
-  const isEstimating = !isLive && last > 0 && since <= grace && wDur > 0;
-  const currentTps = isLive || isEstimating ? (wDur > 0 ? wOut / (wDur / 1000) : 0) : 0;
+  // 门控模型与后端一致：以进行中的调用（pending）为准。
+  // 模拟 TTFT ~2.5s：启动期显示"统计中…"；约 1/5 的调用为管道静默（整段 ≈ 估算）
+  const pendingStart = pending ? pending.completed - pending.duration : 0;
+  const ageSec = pending ? (now - pendingStart) / 1000 : Infinity;
+  const isStarting = !!pending && ageSec < 2.5 && !pending.silent;
+  const isLive = !!pending && ageSec >= 2.5 && !pending.silent;
+  const isEstimating = !!pending && pending.silent && wDur > 0;
+  const currentTps = isStarting
+    ? 0
+    : isLive || isEstimating
+      ? wDur > 0
+        ? wOut / (wDur / 1000)
+        : 0
+      : 0;
   const spark = buckets.map((o, i) => (bucketDur[i] > 0 ? o / (bucketDur[i] / 1000) : 0));
   if (isEstimating && spark[BUCKETS - 1] <= 0) {
     spark[BUCKETS - 1] = currentTps;
@@ -138,9 +141,10 @@ function snapshot(now: number): Snapshot {
     sessionsToday: sessions.size,
     isLive,
     isEstimating,
-    ramping: isLive && since < 30_000,
+    isStarting,
+    ramping: isLive && ageSec < 30,
     windowTps: wDur > 0 ? wOut / (wDur / 1000) : 0,
-    liveSource: isLive ? "io" : isEstimating ? "window" : "idle",
+    liveSource: isStarting || isLive ? "io" : isEstimating ? "window" : "idle",
     lastActivityMs: last,
     nowMs: now,
     rolloutDir: "（浏览器预览 · 模拟数据）",
@@ -167,7 +171,7 @@ export function startMock(onData: (s: Snapshot) => void) {
     if (!pending && t >= nextStart) {
       pending = newCall(t);
     }
-    onData(snapshot(t));
+    onData(snapshot(t, pending));
   };
 
   tick();

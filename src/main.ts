@@ -144,7 +144,7 @@ function redrawSpark() {
 }
 
 function statusClass(s: Snapshot): string {
-  if (s.isLive) return "dot live";
+  if (s.isLive || s.isStarting) return "dot live";
   if (s.isEstimating) return "dot est";
   return "dot idle";
 }
@@ -157,13 +157,14 @@ const cacheHitRate = (s: Snapshot): string => {
 };
 
 function onSnapshot(s: Snapshot) {
-  gCurrent.setTarget(s.currentTps, s.isEstimating);
+  gCurrent.setTarget(s.currentTps, s.isEstimating, s.isStarting);
   gAvg.setTarget(s.avgTps);
   gTotal.setTarget(s.totalTokens);
-  miniGauge.setTarget(s.currentTps, s.isEstimating);
+  miniGauge.setTarget(s.currentTps, s.isEstimating, s.isStarting);
 
-  subCurrent.textContent =
-    s.liveSource === "io"
+  subCurrent.textContent = s.isStarting
+    ? "生成已启动 · 等待模型输出（统计中…）"
+    : s.liveSource === "io"
       ? s.ramping
         ? "实时实测 · 统计中…（30s 滑窗建立中）"
         : "实时实测 · 进程流式输出（30s 滑窗实测）"
@@ -173,21 +174,24 @@ function onSnapshot(s: Snapshot) {
   subAvg.textContent = `Σ输出 ÷ Σ生成时长 · 今日 ${s.callsToday} 次调用`;
   subTotal.textContent = `输出 ${fmtTokens(s.outputTokens)} · 输入 ${fmtTokens(s.inputTokens)} · 缓存命中率 ${cacheHitRate(s)}`;
 
-  document.body.classList.toggle("live", s.isLive);
+  document.body.classList.toggle("live", s.isLive || s.isStarting);
   document.body.classList.toggle("est", s.isEstimating);
-  const petState: "idle" | "running" | "estimating" = s.liveSource === "io"
-    ? "running"
-    : "idle";
+  const petState: "idle" | "running" | "estimating" | "starting" = s.isStarting
+    ? "starting"
+    : s.liveSource === "io"
+      ? "running"
+      : "idle";
   petWidget.setLive(s.currentTps, petState);
   liveDot.className = statusClass(s);
-  liveText.textContent = s.isLive ? "生成中" : s.isEstimating ? "估算中" : "待机";
+  liveText.textContent = s.isLive || s.isStarting ? "生成中" : s.isEstimating ? "估算中" : "待机";
   updatedAt.textContent = `更新于 ${fmtClock(s.nowMs)}`;
   floatDot.className = statusClass(s);
-  floatTps.textContent =
-    (s.isEstimating && s.liveSource !== "io" ? "≈" : "") + fmtTps(s.currentTps);
+  floatTps.textContent = s.isStarting
+    ? "…"
+    : (s.isEstimating && s.liveSource !== "io" ? "≈" : "") + fmtTps(s.currentTps);
 
   // 窗口标题同步实时速度，任务栏/Alt+Tab 可直接看到
-  const title = `${s.liveSource === "io" ? "▶" : s.isEstimating ? "≈" : "⏸"} ${fmtTps(s.currentTps)} t/s · ${s.callsToday} 次 · ZCode 速度仪表盘`;
+  const title = `${s.isLive || s.isStarting ? "▶" : s.isEstimating ? "≈" : "⏸"} ${s.isStarting ? "…" : fmtTps(s.currentTps)} t/s · ${s.callsToday} 次 · ZCode 速度仪表盘`;
   document.title = title;
   try {
     getCurrentWindow().setTitle(title).catch(() => {});
