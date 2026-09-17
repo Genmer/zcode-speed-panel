@@ -456,6 +456,12 @@ updateLink.addEventListener("click", (e) => {
   const url = updateLink.dataset.url;
   if (url) tauriInvoke("open_url", { url }).catch(() => {});
 });
+// 手动下载：应用内安装之外的自助路径（安装失败/不想自动装时直达 Release 页）
+const RELEASES_URL = "https://github.com/Masterchiefm/zcode-speed-panel/releases";
+$("update-manual").addEventListener("click", () => {
+  const url = updateLink.dataset.url || RELEASES_URL;
+  tauriInvoke("open_url", { url }).catch(() => {});
+});
 
 $("float-style-btn").addEventListener("click", () => {
   setStyleDropdownOpen(!styleDropdown.classList.contains("open"));

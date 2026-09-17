@@ -738,6 +738,7 @@ body.float-mode #tray-hint {
 .update-actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap; /* 错误信息较长时允许折行，不挤爆按钮 */
   gap: 10px;
   margin-top: 10px;
 }
