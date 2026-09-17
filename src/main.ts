@@ -149,9 +149,11 @@ function statusClass(s: Snapshot): string {
   return "dot idle";
 }
 
-/** 缓存命中率 = cache_read ÷ 全部提示 token（input + cache_creation + cache_read） */
+/** 缓存命中率 = cache_read ÷ input（usage 库的 input 本身就是全部提示 token，
+ *  缓存命中的部分已含其中，分母再加 cache_read 会重复计数；cache_creation 全库
+ *  恒为 0，防御性保留在分母以兼容将来单列它的 provider） */
 const cacheHitRate = (s: Snapshot): string => {
-  const prompt = s.inputTokens + s.cacheCreationTokens + s.cacheReadTokens;
+  const prompt = s.inputTokens + s.cacheCreationTokens;
   if (prompt <= 0) return "0%";
   return ((s.cacheReadTokens / prompt) * 100).toFixed(1) + "%";
 };

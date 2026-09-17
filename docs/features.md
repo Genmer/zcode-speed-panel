@@ -4,7 +4,7 @@
 
 ## 数据与统计口径
 
-- **今日总量** = `input + output + reasoning + cache_creation`（与 ZCode 官方统计同口径）；**缓存命中 cache_read 是提示复用，不计入总量**，以命中率展示：`cache_read ÷ (input + cache_creation + cache_read)`。
+- **今日总量** = `input + output + reasoning + cache_creation`（与 ZCode 官方统计同口径）；**缓存命中 cache_read 是提示复用，不计入总量**，以命中率展示：`cache_read ÷ (input + cache_creation)`。注意 usage 库的 `input` 本身就是全部提示 token、已含缓存命中的部分（`raw_usage_json` 中 `totalTokens = inputTokens + outputTokens`，全库 `cache_read ≤ input`、`cache_creation = 0` 可证），分母不能再加 cache_read，否则重复计数、命中率被摊薄约一半（曾把 98% 显示成 49%）。
 - **平均速度 avg_tps** = Σ(output+reasoning) ÷ Σ纯生成时长；分母用 `completed_at - first_token_at`（排除首 token 等待/排队），`first_token_at` 缺失退化为 `duration_ms`，下限 50ms。
 - 今日归属按调用完成时刻，跨天自动清零（rollover）。
 - 数据源：`~/.zcode/cli/db/db.sqlite` 的 `model_usage` 表，只读打开（WAL 不影响运行中的 CLI）。

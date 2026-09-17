@@ -51,12 +51,14 @@ function newCall(now: number): MockCall {
   const duration = Math.exp(rnd(Math.log(12000), Math.log(180000)));
   const tps = rnd(18, 70);
   const output = Math.max(60, Math.round((duration / 1000) * tps));
+  // usage 库语义:cache_read 是 input 的子集,命中率常态 90%+
+  const input = Math.round(rnd(15000, 60000));
   return {
     completed: now + duration,
     duration,
     output,
-    input: Math.round(rnd(15000, 60000)),
-    cache: Math.round(rnd(10000, 250000)),
+    input,
+    cache: Math.round(input * rnd(0.8, 0.99)),
     session: `mock-sess-${sessionNo}`,
     silent: Math.random() < 0.22,
   };
