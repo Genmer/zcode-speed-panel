@@ -89,6 +89,8 @@ fn main() {
                 "true_tps": (cal.true_tps * 10.0).round() / 10.0,
                 "raw_kb": (cal.raw_bytes / 1024.0 * 10.0).round() / 10.0,
                 "clean_kb": (cal.clean_bytes / 1024.0 * 10.0).round() / 10.0,
+                "attr_pid": cal.attr_pid,
+                "top_pid": cal.top_pid,
                 "bpt_sample": (cal.bpt_sample * 10.0).round() / 10.0,
                 "bpt_now": (cal.bpt_now * 10.0).round() / 10.0,
                 "pred_tps": (pred_tps * 10.0).round() / 10.0,

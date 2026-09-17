@@ -22,6 +22,9 @@
 //!   校准分子与显示分子同源，任何系统性扣除（噪声底/落盘/错位）都会被系数抵消，
 //!   显示值收敛到真实 t/s。历史教训：校准用未清洗的总字节流、显示用清洗后的流，
 //!   两条链路口径不一致曾导致系数被抬高 2~3 倍、读数系统性偏低。
+//!   mac 的磁盘写字节为页缓存异步落盘计数（滞后 write() 数秒~数十秒），校准
+//!   窗口延长到 completed + cal_grace_ms（延迟落盘宽限，Windows=0 当拍处理），
+//!   并对偏离生效系数超倍的样本做离群拒绝（Windows 禁用）。
 
 use crate::metrics::Call;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -60,10 +63,11 @@ const CAL_MAX: f64 = 6_000.0;
 const CAL_MIN_TOKENS: u64 = 300;
 
 /// 清洗/校准参数（平台参数化）。Windows 列为长期实测调优值（上方原常量，
-/// 禁改）；macOS 列基于 120s 探针实测：流式期 ri_diskio_byteswritten
-/// ≈195KB/s（≈3900 B/token），idle 严格 0 字节，单拍增量突发式
-/// 0,0,0,+225KB~1.5MB，rollout 目录 du 净变化为负（清理轮转）。
-/// mac 列为初值，须实测复核（尤其 burst 禁用与 detect 窗口）
+/// 禁改）；macOS 列基于 120s 探针 + 2026-09-17 真值对账（6 条 cal 事件，
+/// 归因正确时 pred_tps 与 true_tps 完全一致）修正：流式期
+/// ri_diskio_byteswritten ≈195KB/s、idle 严格 0 字节、单拍增量突发式
+/// 0,0,0,+225KB~1.5MB、B/token 真值 ≈650（探针期的 ≈3900 为误判）、
+/// 磁盘计数为页缓存异步落盘（滞后 write() 数秒~数十秒）。
 #[derive(Clone, Copy)]
 pub struct CleanParams {
     /// 单拍原始增量剔除阈值（Windows：请求体上传 ~190KB/拍，与真实流式
@@ -80,10 +84,21 @@ pub struct CleanParams {
     pub cal_max: f64,
     /// 校准样本的调用规模下限（平台无关）
     pub cal_min_tokens: u64,
-    /// 初始字节/token 系数先验（mac 实测 ≈3900 B/token，取 2000 偏保守）
+    /// 初始字节/token 系数先验。Windows 长期 600；mac 真值对账（2026-09-17，
+    /// 6 条 cal 事件）实测接受样本 614/724，取 700——旧值 2000 源自 120s 探针
+    /// 的 ≈3900 误判，冷启动读数 3 倍低估
     pub default_bpt: f64,
     /// 幅度锚点探测短窗（首字节拍）。首版两平台一致，mac 若状态抖动再调
     pub detect_ms: i64,
+    /// 校准延迟落盘宽限（ms）：调用完成后 pending 等满该时长再积分，校准积分
+    /// 与 raw 统计窗口上限同步延长到 completed + grace。mac 的
+    /// ri_diskio_byteswritten 是页缓存异步落盘计数，滞后 write() 数秒~数十秒
+    ///（实测 117s 长调用 96% 字节落在 completed 之后，用户盯着 0.7 t/s 两分钟
+    /// 而真值 65.3）；Windows 的 WriteTransferCount 为同步计数，取 0 = 当拍处理
+    pub cal_grace_ms: i64,
+    /// 校准样本离群拒绝倍数：样本 B/token 与当前生效系数偏差超该倍数即拒收
+    ///（延迟落盘的半截样本 / 归因异常样本不进中位数）。0 = 禁用（Windows）
+    pub cal_outlier_ratio: f64,
 }
 
 impl CleanParams {
@@ -99,11 +114,15 @@ impl CleanParams {
             cal_min_tokens: CAL_MIN_TOKENS,
             default_bpt: DEFAULT_BPT,
             detect_ms: DETECT_MS,
+            // 延迟落盘宽限与离群拒绝在 Windows 禁用：WriteTransferCount 同步计数，
+            // 当拍处理、无离群过滤，行为与历史版本逐字节等价
+            cal_grace_ms: 0,
+            cal_outlier_ratio: 0.0,
         }
     }
 
-    /// macOS 初值（须实测复核）：burst 即信号须禁用剔除、无静态底噪、
-    /// 系数先验与校准区间按 ≈3900 B/token 放宽
+    /// macOS 实测值：burst 即信号须禁用剔除、无静态底噪、系数先验按真值对账
+    /// 取 700、延迟落盘宽限 15s（页缓存异步落盘滞后）、样本离群 3 倍拒绝
     #[cfg(target_os = "macos")]
     pub fn macos() -> Self {
         Self {
@@ -113,8 +132,10 @@ impl CleanParams {
             cal_min: CAL_MIN,
             cal_max: 12_000.0,
             cal_min_tokens: CAL_MIN_TOKENS,
-            default_bpt: 2_000.0,
+            default_bpt: 700.0,
             detect_ms: DETECT_MS,
+            cal_grace_ms: 15_000,
+            cal_outlier_ratio: 3.0,
         }
     }
 
@@ -163,8 +184,13 @@ pub struct CalEvent {
     pub bpt_sample: f64,
     /// 事件后生效的系数
     pub bpt_now: f64,
-    /// 未入校准（调用过短 / 无有效字节）
+    /// 未入校准（调用过短 / 无有效字节 / 离群拒收）
     pub cal_skipped: bool,
+    /// clean 积分实际使用的进程（归属进程积分分支；全进程求和分支为 None）
+    pub attr_pid: Option<u32>,
+    /// raw_by_pid 中原始字节最大的进程（归因异常定位：attr 与 top 不一致
+    /// 且 clean 远小于 raw 即归属错了进程）
+    pub top_pid: Option<u32>,
 }
 
 // ============ 纯计算部分（跨平台，可单测）：拍清洗 / 区间积分 / 中位数 ============
@@ -255,11 +281,15 @@ pub(crate) fn median_bpt(samples: &mut VecDeque<f64>, sample: f64, cap: usize) -
 /// 校准样本准入：管道积分须有实质贡献（≥原始字节的 20%），且 B/token 未钳位
 /// 就落在合理区间。管道静默调用（字节全在完成瞬间落盘，实测样本可低至
 /// ~7 B/token）与异常比例样本整条拒绝，防止中位数系数被污染。
+/// 在此基础上，样本与当前生效系数 bpt_now 偏差超 cal_outlier_ratio 倍时
+/// 拒收（mac：延迟落盘只积分到一半字节/归因错进程的半截样本不进中位数；
+/// Windows ratio=0 显式禁用，行为与历史版本一致）。
 /// 返回 (是否入样, 样本值)
 pub(crate) fn cal_sample(
     eff: u64,
     clean_bytes: f64,
     raw_bytes: f64,
+    bpt_now: f64,
     p: &CleanParams,
 ) -> (bool, f64) {
     if eff < p.cal_min_tokens || clean_bytes <= 0.0 || raw_bytes <= 0.0 {
@@ -267,7 +297,17 @@ pub(crate) fn cal_sample(
     }
     let ratio = clean_bytes / eff as f64;
     let usable = clean_bytes / raw_bytes >= 0.2;
-    (usable && ratio >= p.cal_min && ratio <= p.cal_max, ratio)
+    let in_range = usable && ratio >= p.cal_min && ratio <= p.cal_max;
+    // 离群拒绝：outlier_ratio=0（Windows）显式禁用，避免 0 作除数/0 乘误判；
+    // 拒收样本值记 0（与调用侧 cal_skipped 时 bpt_sample=0 的口径一致）
+    if in_range
+        && p.cal_outlier_ratio > 0.0
+        && bpt_now > 0.0
+        && (ratio < bpt_now / p.cal_outlier_ratio || ratio > bpt_now * p.cal_outlier_ratio)
+    {
+        return (false, 0.0);
+    }
+    (in_range, ratio)
 }
 
 /// 启动提示判定（纯函数）：门控开启、尚无流式锚点（首字节未到）且距调用开始
@@ -926,44 +966,59 @@ impl LiveIo {
                 self.pending.pop_front();
                 continue;
             }
+            // 延迟落盘宽限（mac）：磁盘写字节是页缓存异步落盘计数，completed 后
+            // 等满 grace 再积分，让脏页进入计数。grace 期间留在队首；超 120s 的
+            // 丢弃判定在前，保证不积压。Windows=0 时跳过本分支，当拍处理不变
+            if self.params.cal_grace_ms > 0 && now_ms - call.completed_ms < self.params.cal_grace_ms
+            {
+                break;
+            }
             let stream_start_ms = (call.completed_ms - call.gen_ms.min(300_000)).max(0);
+            // 积分/统计窗口上限延长到 completed + grace：mac 的脏页滞后落盘，
+            // 分子（clean）与分母口径（raw）同步放宽，pred 口径仍用真实 gen_ms
+            let window_end_ms = call.completed_ms + self.params.cal_grace_ms;
             let mut raw_by_pid: HashMap<u32, u64> = HashMap::new();
             for (pid, ring) in self.procs.iter() {
                 let mut acc = 0u64;
                 for (a, b) in ring.samples.iter().zip(ring.samples.iter().skip(1)) {
-                    if b.0 >= stream_start_ms && a.0 <= call.completed_ms {
+                    if b.0 >= stream_start_ms && a.0 <= window_end_ms {
                         acc += b.1.saturating_sub(a.1);
                     }
                 }
                 raw_by_pid.insert(*pid, acc);
             }
             let raw_total = raw_by_pid.values().sum::<u64>() as f64;
+            let top_pid = raw_by_pid
+                .iter()
+                .max_by(|a, b| a.1.cmp(b.1))
+                .map(|(pid, _)| *pid);
             if !self.attributed.contains(&call.id) {
                 self.attributed.insert(call.id.clone());
                 if self.attributed.len() > 4_000 {
                     self.attributed.clear();
                 }
                 if raw_total > 20_000.0 {
-                    if let Some((pid, _)) =
-                        raw_by_pid.iter().max_by(|a, b| a.1.cmp(b.1))
-                    {
-                        self.session_pid.insert(call.session.clone(), *pid);
+                    if let Some(pid) = top_pid {
+                        self.session_pid.insert(call.session.clone(), pid);
                     }
                 }
             }
             // 清洗积分：优先归属进程（与显示路径一致），未归属时退化为全进程求和
+            let mut attr_pid = None;
             let clean_bytes = match self.session_pid.get(&call.session) {
                 Some(pid) if rows_by_pid.contains_key(pid) => {
-                    integrate(&rows_by_pid[pid], stream_start_ms, call.completed_ms).0
+                    attr_pid = Some(*pid);
+                    integrate(&rows_by_pid[pid], stream_start_ms, window_end_ms).0
                 }
                 _ => rows_by_pid
                     .values()
-                    .map(|r| integrate(r, stream_start_ms, call.completed_ms).0)
+                    .map(|r| integrate(r, stream_start_ms, window_end_ms).0)
                     .sum::<f64>(),
             };
             let eff = call.effective_out();
             let true_tps = eff as f64 / (call.gen_ms.max(50) as f64 / 1000.0);
-            let (in_cal, bpt_sample) = cal_sample(eff, clean_bytes, raw_total, &self.params);
+            let (in_cal, bpt_sample) =
+                cal_sample(eff, clean_bytes, raw_total, self.bytes_per_token, &self.params);
             if in_cal {
                 self.bytes_per_token = median_bpt(&mut self.cal, bpt_sample, 5);
             }
@@ -979,6 +1034,8 @@ impl LiveIo {
                 bpt_sample: if in_cal { bpt_sample } else { 0.0 },
                 bpt_now: self.bytes_per_token,
                 cal_skipped: !in_cal,
+                attr_pid,
+                top_pid,
             });
             self.pending.pop_front();
         }
@@ -1212,21 +1269,120 @@ mod tests {
     /// 管道静默调用会产生 ~7 B/token 的垃圾样本，必须整条拒绝而不是钳位后入队
     #[test]
     fn cal_sample_rejects_silent_pipe_calls() {
+        // bpt_now 传 Windows 先验（离群拒绝在该平台禁用，取值不影响结果）
         // 静默调用：887 token，管道积分仅 5.9KB，原始字节 ~1MB → 拒绝
-        let (ok, _) = cal_sample(887, 5_939.0, 1_048_576.0, &CleanParams::windows());
+        let (ok, _) = cal_sample(887, 5_939.0, 1_048_576.0, DEFAULT_BPT, &CleanParams::windows());
         assert!(!ok);
         // 正常调用：1028 token，清洗 526.5KB / 原始 ~900KB → 接受，样本 ≈524
-        let (ok, v) = cal_sample(1028, 526.5 * 1024.0, 900.0 * 1024.0, &CleanParams::windows());
+        let (ok, v) = cal_sample(
+            1028,
+            526.5 * 1024.0,
+            900.0 * 1024.0,
+            DEFAULT_BPT,
+            &CleanParams::windows(),
+        );
         assert!(ok);
         assert!((v - 524.0).abs() < 15.0);
         // 小调用：64 token → 拒绝
-        assert!(!cal_sample(64, 50_000.0, 80_000.0, &CleanParams::windows()).0);
+        assert!(!cal_sample(64, 50_000.0, 80_000.0, DEFAULT_BPT, &CleanParams::windows()).0);
         // 偏瘦但真实：449 token，清洗 67.5KB（比例 ~150 B/token，占原始 52%）→ 接受
-        let (ok, v) = cal_sample(449, 67.5 * 1024.0, 130.0 * 1024.0, &CleanParams::windows());
+        let (ok, v) = cal_sample(
+            449,
+            67.5 * 1024.0,
+            130.0 * 1024.0,
+            DEFAULT_BPT,
+            &CleanParams::windows(),
+        );
         assert!(ok);
         assert!((v - 150.0).abs() < 5.0);
         // 超界比例（>6000）→ 拒绝
-        assert!(!cal_sample(500, 500.0 * 6000.0 * 1.1, 500.0 * 6000.0 * 1.2, &CleanParams::windows()).0);
+        assert!(!cal_sample(
+            500,
+            500.0 * 6000.0 * 1.1,
+            500.0 * 6000.0 * 1.2,
+            DEFAULT_BPT,
+            &CleanParams::windows()
+        )
+        .0);
+    }
+
+    /// mac 参数字面量（与 `CleanParams::macos()` 保持同值；字面量构造保证
+    /// Windows 上测试也能编译运行）
+    fn mac_params() -> CleanParams {
+        CleanParams {
+            burst_tick_bytes: u64::MAX as f64,
+            base_noise_bps: 0.0,
+            floor_cap_bytes: FLOOR_CAP_BYTES,
+            cal_min: CAL_MIN,
+            cal_max: 12_000.0,
+            cal_min_tokens: CAL_MIN_TOKENS,
+            default_bpt: 700.0,
+            detect_ms: DETECT_MS,
+            cal_grace_ms: 15_000,
+            cal_outlier_ratio: 3.0,
+        }
+    }
+
+    /// mac 离群拒绝（2026-09-17 对账实测）：延迟落盘的半截样本（34s 调用只
+    /// 积分到一半字节 → 186 B/token）与生效系数 700 偏差超 3 倍边界即拒收，
+    /// 不进中位数；正常样本（真值 614/724 一带）照常接受
+    #[test]
+    fn mac_outlier_sample_rejected() {
+        let mac = mac_params();
+        // 正常样本 ≈650 B/token，落在 [700/3, 700×3] → 接受
+        let (ok, v) = cal_sample(1_000, 650_000.0, 900_000.0, 700.0, &mac);
+        assert!(ok);
+        assert!((v - 650.0).abs() < 1e-6);
+        // 半截样本 186（>cal_min=100、clean/raw=62%，既有检查全过）：
+        // 186 < 700/3≈233 → 离群拒收，样本记 0
+        let (ok, v) = cal_sample(1_000, 186_000.0, 300_000.0, 700.0, &mac);
+        assert!(!ok);
+        assert_eq!(v, 0.0);
+        // 偏高离群：2500 > 700×3=2100（仍在 cal_max=12000 内）→ 拒收
+        assert!(!cal_sample(1_000, 2_500_000.0, 3_000_000.0, 700.0, &mac).0);
+        // 同样的半截样本在 Windows（ratio=0 禁用）不拒收，与既有行为等价
+        assert!(cal_sample(1_000, 186_000.0, 300_000.0, DEFAULT_BPT, &CleanParams::windows()).0);
+    }
+
+    /// mac 延迟落盘宽限：磁盘写字节是页缓存异步落盘计数，write() 后数秒~
+    /// 数十秒才计入（实测 117s 长调用 96% 字节落在 completed 之后，用户盯着
+    /// 0.7 t/s 两分钟而真值 65.3）。grace=15s 把校准积分窗口延长到
+    /// completed+15s，滞后字节进入分子、样本恢复真值；Windows 口径的
+    /// [.., completed] 窗口几乎全丢
+    #[test]
+    fn mac_grace_window_captures_delayed_disk_writes() {
+        const TRUE_TPS: f64 = 50.0;
+        const BPT_TRUE: f64 = 3_900.0; // mac 流式管道字节密度
+        let gen_ms = 30_000i64;
+        let n = (gen_ms / TICK) as usize; // 43 拍
+        let total = TRUE_TPS * BPT_TRUE * (gen_ms as f64 / 1000.0); // 5.85MB
+        let t0 = 1_000_000i64;
+        // 调用期间磁盘计数几乎不动；脏页在 completed 后 ~7~9.8s 分 4 拍集中落盘
+        let mut deltas = vec![0.0; n];
+        deltas.extend(std::iter::repeat(0.0).take(10)); // 完成后静默 ~7s
+        let chunk = total / 4.0;
+        deltas.extend(std::iter::repeat(chunk).take(4));
+        let samples = series(t0, &deltas);
+        // mac 不做 files 扣除（tracked_files_total 恒 0）
+        let files = samples.iter().map(|(t, _)| (*t, 0u64)).collect::<Vec<_>>();
+        let rows = build_rows(&samples, &files, 0.0, &mac_params());
+        let call_end = t0 + (n as i64) * TICK;
+        let stream_start = call_end - gen_ms;
+        let eff = (TRUE_TPS * (gen_ms as f64 / 1000.0)) as u64; // 1500 tok
+
+        // Windows 口径 [.., completed]：字节都还没落盘，几乎全丢
+        let (no_grace, _) = integrate(&rows, stream_start, call_end);
+        assert!(
+            no_grace < total * 0.5,
+            "无宽限窗口不应看到大部分字节: {no_grace}"
+        );
+        // grace 窗口 [.., completed+15s]：滞后落盘字节全部计入，样本恢复真值
+        let (clean, _) = integrate(&rows, stream_start, call_end + mac_params().cal_grace_ms);
+        let bpt = clean / eff as f64;
+        assert!(
+            (bpt - BPT_TRUE).abs() / BPT_TRUE < 0.05,
+            "宽限窗口样本 {bpt:.0} 应接近真值 {BPT_TRUE:.0}"
+        );
     }
 
     /// 合成端到端：按 measure() 的口径驱动清洗/积分/校准，

@@ -19,21 +19,24 @@
 - **CleanParams 平台参数表**（清洗/校准参数化，`CleanParams::platform()` 启动时锁定；Windows 列为长期实测原值禁改，mac 列为 120s 探针实测初值**须实测复核**）：
 
   | 参数 | Windows | macOS | 原因 |
-  |---|---|---|---|
+|---|---|---|---|
   | burst_tick_bytes（突发剔除） | 100_000 | u64::MAX（禁用） | mac 流式即单拍突发（225KB~1.5MB 常态），100KB 阈值会丢弃全部信号 |
   | base_noise_bps（静态底噪） | 3_000 | 0 | mac idle 实测 17s 严格 0 字节 |
   | floor_cap_bytes（自适应底噪封顶） | 2_000 | 2_000 | 封顶只防毒化；mac idle 恒 0 时自适应自行降 0 |
-  | default_bpt（系数先验） | 600 | 2_000 | mac 实测 ≈3900 B/token，取偏保守值 |
-  | cal_min / cal_max（样本区间） | 100 / 6_000 | 100 / 12_000 | 覆盖 3900 留余量 |
+  | default_bpt（系数先验） | 600 | 700 | mac 真值对账（2026-09-17，6 条 cal 事件）接受样本 614/724；旧值 2000 源自探针误判，冷启动 3 倍低估 |
+  | cal_min / cal_max（样本区间） | 100 / 6_000 | 100 / 12_000 | mac 覆盖对账实测 ~650 留余量 |
   | cal_min_tokens（样本门槛） | 300 | 300 | 平台无关 |
   | detect_ms（锚点探测窗） | 2_500 | 2_500 | 首版不动；mac 若状态抖动再调 5_000 |
+  | cal_grace_ms（延迟落盘宽限） | 0（当拍处理） | 15_000 | mac 的 ri_diskio_byteswritten 是页缓存异步落盘计数，滞后 write() 数秒~数十秒（实测 117s 调用 96% 字节落在 completed 后）；调用完成后等满宽限再积分，校准积分与 raw 统计窗口上限同步延长到 completed+grace，分子分母同口径 |
+  | cal_outlier_ratio（样本离群拒绝） | 0（禁用） | 3.0 | 样本 B/token 与当前生效系数偏差超 3 倍即拒收：延迟落盘的半截样本（实测 186 偏低入队污染中位数）与归因异常样本不进中位数 |
 
 - **启停门控**：usage 库 message 表的 assistant 消息行——调用开始瞬间提交（≤200ms 可读），行内 `time.completed` 在结束（**含取消/出错**）瞬间补写。扫描最近活跃会话（`session.time_updated` 倒序前 6 个，各自走 `(session_id, time_created)` 复合索引取最新 assistant 行）的最新 assistant 行：未带 `completed` 且 10 分钟内 → 进行中（**不限会话**，新开对话首个调用当拍即亮）；带 `completed` → 当拍归零。已归属会话的 CLI 进程退出时强制判停（崩溃后无人补写 `completed` 的僵尸行兜底）。
 - **启动提示（is_starting）**：门控已开但首字节未到（TTFT，20s 窗口内）→ 表盘/迷你仪表/胶囊/桌宠气泡显示 **"…"**（青色呼吸脉冲弧），不显示估算值；超窗仍无字节 → 视为管道静默调用，回退 ≈ 估算。
 - 状态来源 `live_source`：`io`（实测流式）→ `window`（门控判定生成中但管道静默，显示近期已完成调用的真实速度，前端加 ≈ 标记）→ `idle`（归零）。
 - **IO 不可用时**（进程从未发现：探测环境不可用/刚启动）按门控显示估算或"统计中"，而不是按调用间隔盲估；**CLI 全部退出后**立即归零（旧行为按间隔中位数可空转"估算中"最长 240s）。
 - 首字节后读数当拍可用（此前为 TTFT "…" 提示）；进程发现：常驻 30s 刷新，无任何进程时缩短到 2s（新开 CLI 快速可见）。
-- 系数冷启动为 600 先验，完成 1~2 个 ≥300 token 的调用后收敛；管道静默调用不入样（见 key-rules #5）。
+- 系数冷启动为 600（mac 700）先验，完成 1~2 个 ≥300 token 的调用后收敛；管道静默调用不入样（见 key-rules #5）。
+- **延迟落盘宽限与离群拒绝（mac）**：调用完成后 pending 校准事件等满 15s 再处理（`cal_grace_ms`，Windows=0 当拍处理），校准积分与 raw 统计窗口上限同步延长到 `completed + 15s`（`stream_start` 下限不变，仍为 completed − min(gen_ms, 300s)；pred_tps 口径不变，分母仍用真实 gen_ms）；样本 B/token 与当前生效系数偏差超 3 倍即拒收（`cal_outlier_ratio`，Windows=0 禁用），防延迟落盘半截样本与归因异常样本污染中位数。cal 日志新增 `attr_pid`（clean 积分实际用的进程，全进程求和分支为 null）与 `top_pid`（raw 最大进程）供归因异常定位。
 - 精度：达标调用 `pred/true` 应在 0.8~1.25（实测 1.00~1.05）；对账命令 `python scripts/live_vs_true.py`。
 
 ## 仪表与曲线（gauges.ts）
@@ -87,4 +90,4 @@
 - 多调用并发（子 agent）时实时优先统计**进行中调用的会话**对应进程（尚无归属时为全进程求和，无进行中调用时退回最近完成调用的会话）。
 - 冷启动后系数需 1~2 个达标调用收敛，此前读数可能有偏差。
 - 硬崩溃（CLI 进程被杀、assistant 行无人补写 `completed`）最多残留 10 分钟门控（兜底上限）；已归属会话的进程退出会被进程守卫立即判停，未归属的新会话只能等兜底。
-- mac 的 CleanParams（burst 禁用/无静态底噪/系数先验 2000）为探针实测初值，未经过 Windows 侧同等长度的真值对账回归；读数异常时先跑 `python scripts/live_vs_true.py` 对账再调参（key-rules #10）。
+- mac 的 CleanParams（burst 禁用/无静态底噪/系数先验 700/延迟落盘宽限 15s/离群拒绝 3 倍）中，先验与宽限已按 2026-09-17 的 6 条 cal 事件真值对账修正（归因正确时 pred/true 完全一致 62.1=62.1），尚未做 Windows 侧同等长度的对账回归；读数异常时先跑 `python scripts/live_vs_true.py` 对账、看 cal 事件 `attr_pid`/`top_pid` 归因再调参（key-rules #10）。

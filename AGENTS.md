@@ -7,7 +7,7 @@ ZCode 速度仪表盘：Tauri 2 + Rust 桌面工具（Windows / macOS 双平台�
 ```bash
 npx tsc --noEmit                    # 前端类型检查（改 src/*.ts 后必跑）
 npm run build                       # tsc + vite build
-cd src-tauri && cargo test          # Rust 单元测试（13 个，含合成端到端）
+cd src-tauri && cargo test          # Rust 单元测试（15 个，含合成端到端）
 cd src-tauri && cargo check         # 后端编译检查
 npm run tauri dev                   # 开发运行（用户常驻一个 dev 实例，改码会热重启它）
 npm run tauri build                 # 正式版（Windows NSIS / macOS dmg，按宿主平台）
@@ -33,7 +33,7 @@ public/pets/               宠物包资源；scripts/*.py 调试日志分析；.
 
 ## 规则与踩坑（全在 docs，AGENTS 不留副本）
 
-全部关键规则与踩坑案例集中在 **[docs/key-rules.md](docs/key-rules.md)**，改代码前必读。速览：`$()` 启动崩溃、Tauri 权限白名单、一致性校准口径、负拍对消、校准样本准入、调试日志排查法、examples 编译耦合、原生 select 弹层不可读、启停门控用 message 行 completed 字段（禁用 model_usage 完成行）、mac 平台差异（burst 即信号/files 扣除反噬/进程识别口径/FFI 偏移断言/退出兜底）——共 10 条，每条含事故案例与守护措施。
+全部关键规则与踩坑案例集中在 **[docs/key-rules.md](docs/key-rules.md)**，改代码前必读。速览：`$()` 启动崩溃、Tauri 权限白名单、一致性校准口径、负拍对消、校准样本准入、调试日志排查法、examples 编译耦合、原生 select 弹层不可读、启停门控用 message 行 completed 字段（禁用 model_usage 完成行）、mac 平台差异（burst 即信号/files 扣除反噬/进程识别口径/FFI 偏移断言/退出兜底/延迟落盘宽限）——共 10 条，每条含事故案例与守护措施。
 
 ## 约定
 

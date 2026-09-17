@@ -37,7 +37,7 @@
 `~/.zcode/speed-panel-debug.jsonl`（JSONL 追加，8MB 轮转保留一代 `.jsonl.1`，轮转旧文件超 7 天启动时自动清理）记录三类事件：
 - `tick`：显示值 `tps`、来源 `src`（io/window/idle）、启动期 `start`、清洗管道字节率 `pipe`、生效系数 `bpt`、曲线尾桶；
 - `call`：调用完成真值（`eff`/`gen_ms`/`true_tps`）；
-- `cal`：校准对账（`true_tps` vs `pred_tps`、`raw_kb`/`clean_kb`、`bpt_sample`/`bpt_now`、`skipped`）。
+- `cal`：校准对账（`true_tps` vs `pred_tps`、`raw_kb`/`clean_kb`、`bpt_sample`/`bpt_now`、`skipped`、归因诊断 `attr_pid`/`top_pid`）。
 
 实时准确性评估口径：`pred_tps / true_tps` → 1.00 为准。用 `python scripts/live_vs_true.py` 一键对账（≥300 token 且入校准的调用为达标样本）。诊断实时读数问题先看这里，不要靠猜。
 
@@ -66,4 +66,5 @@
 - **files 扣除在 mac 是方向性反噬**：Windows 的落盘扣除（tracked 文件增量从写字节中减去）在 mac 必须关闭——CLI 会清理轮转旧 rollout，实测 120s 探针里 rollout 目录 du **净变化为负**，负的文件增量会把清洗流反向抬高（而不是扣除）。mac 的 `tracked_files_total` 恒 0。
 - **mac 进程识别不能用 proc_pidpath**：CLI 进程由 Electron Helper fork 而来，`proc_pidpath` 返回的是 `.../ZCode Helper`（与其他 Helper 进程同一路径，无法区分）；`ps` 显示的 "zcode-cli" 是 p_comm。正确口径：`KERN_PROCARGS2` 打包区里扫描独立的 NUL 结尾字符串精确匹配 `zcode-cli`（注意 argv[0] 之后有**对齐 NUL 填充**，不能按 nargs 连续解析，否则读到一堆空串）。曾经按 basename 匹配实现过一版，dump 冒烟 `live可用=false`。
 - **FFI 偏移错位用 offset_of! 编译期断言防**：`proc_pid_rusage` 的 `rusage_info_v4` 结构镜像必须逐字段对照 SDK `sys/resource.h`，且用 `offset_of!` 断言 `ri_proc_start_abstime`=80、`ri_diskio_byteswritten`=152（新内核布局在 start_abstime 后多了 `ri_proc_exit_abstime`，老布局记忆是 144——就是这个坑）。断言不过必须修结构排布，**禁止删断言**；另 `#[link(name = "proc")]`（库文件是 libproc.dylib，链接名不带 lib 前缀，写 "libproc" 会 `ld: library not found for -llibproc`）。
+- **mac 的磁盘写字节是页缓存异步落盘计数，校准必须延迟宽限**：`ri_diskio_byteswritten` 统计的是脏页实际写盘的字节，滞后 `write()` 数秒~数十秒。2026-09-17 真值对账（6 条 cal 事件，归因正确时 pred_tps 与 true_tps 完全一致 62.1=62.1）的三条证据：① 34s 调用 [start, completed] 窗口只积分到一半字节，样本 186 偏低入队污染中位数；② 1s 小调用里凭空多出 750KB——上一条调用的脏页这时才落盘；③ 117s 长调用 96% 字节没落进窗口，用户盯着 0.7 t/s 两分钟而真值 65.3。守护：`CleanParams.cal_grace_ms`（mac 15s / Windows 0 当拍处理）——pending 校准等满宽限再积分，校准积分与 raw 统计窗口上限延长到 completed+grace（分子分母同口径，pred 分母仍用真实 gen_ms）；`cal_outlier_ratio`（mac 3 倍 / Windows 0 禁用）拒收与生效系数偏差超倍的半截样本；CalEvent 记录 `attr_pid`/`top_pid` 供归因异常定位（多进程并发下偶发 clean≪raw 时看两者是否错位）。同源教训：mac 系数先验曾按 120s 探针取 2000（误判 ≈3900 B/token），真值对账实为 ~650（接受样本 614/724），冷启动 3 倍低估——现为 700。
 - **Dock/Cmd+Tab 与退出的上游限制**：Tauri/macOS 上无边框窗口应用保留 Dock 图标，`hide()` 也无法把 Accessory 应用完全"藏起来"；本项目采用 **Accessory 模式**（`set_activation_policy`，setup 内尽早调用）+ 自定义菜单拦截 `Cmd+Q`（菜单不含任何 `PredefinedMenuItem::quit`）+ `RunEvent::ExitRequested { code: None }` 兜底 `prevent_exit`。三条防线合起来才保证"真退出只有托盘退出与悬浮窗右键退出两条路"——只做其中一两条，用户仍可能从系统菜单/快捷键把应用退掉，之后菜单栏入口消失、体验等于"应用丢了"。
