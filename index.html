@@ -28,6 +28,12 @@
               <button type="button" role="option" data-value="pill">胶囊悬浮窗</button>
             </div>
           </div>
+          <button
+            id="pet-last-toggle"
+            class="ghost-btn pet-last-toggle"
+            type="button"
+            title="桌宠气泡常驻显示两行（实时速度 / 上轮均速），待机时也显示，无需鼠标悬停；与桌宠右键菜单里的勾选是同一开关"
+          ><span class="pet-chk" aria-hidden="true"></span>常显上轮均速</button>
           <button id="btn-float" class="ghost-btn accent-btn" title="收起为悬浮窗（置顶、可拖动；点窗口关闭按钮效果相同）">⧉ 收起为悬浮窗</button>
           <span id="win-controls" title="拖动顶栏移动窗口；双击顶栏最大化/还原">
             <button id="wc-min" title="最小化">—</button>
@@ -71,6 +77,17 @@
             <canvas id="g-total"></canvas>
             <div class="sub" id="sub-total">等待数据…</div>
           </div>
+        </section>
+
+        <!-- 并发任务明细：≥2 个任务时出现（单任务时不占位）。
+             一个 CLI 进程 = 一行；同进程内并行的多个会话/子代理在字节层不可拆分，
+             计为一行合计（标注会话数），按会话数计入任务总数 -->
+        <section class="card task-card" id="task-card" hidden>
+          <div class="chart-head">
+            <span>并发任务（按 CLI 进程实测）</span>
+            <span class="dim">各行合计 = 当前速度表 · 同进程多会话计为一行</span>
+          </div>
+          <div id="task-list"></div>
         </section>
 
         <section class="card chart-card">
@@ -126,8 +143,12 @@
         <button id="float-pill-expand" class="float-expand ghost-btn" title="展开完整面板">⤢</button>
       </div>
 
-      <!-- 悬浮窗右键菜单：恢复窗体 / 退出 -->
+      <!-- 悬浮窗右键菜单：恢复窗体 / 退出；桌宠样式下多一项"常显上轮均速"勾选（CSS 按样式门控） -->
       <div id="float-menu">
+        <button
+          id="float-menu-pet-last"
+          title="勾选后气泡常驻显示两行（实时速度 / 上轮均速），待机时也显示，无需鼠标悬停"
+        ><span class="pet-chk" aria-hidden="true"></span>常显上轮均速</button>
         <button id="float-menu-restore">⤢ 恢复窗体</button>
         <button id="float-menu-quit">✕ 退出程序</button>
       </div>

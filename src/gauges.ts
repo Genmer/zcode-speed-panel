@@ -62,6 +62,11 @@ function speedTier(v: number): SpeedTier {
   return SPEED_TIERS.find((t) => v <= t.upTo) ?? SPEED_TIERS[SPEED_TIERS.length - 1];
 }
 
+/** 速度 → 档位序号 0..5（与 SPEED_TIERS 同序，0–40 为第 0 档）；供桌宠按档位切换动画 */
+export function speedTierIndex(v: number, tiers: readonly SpeedTier[] = SPEED_TIERS): number {
+  return Math.max(0, tiers.findIndex((t) => v <= t.upTo));
+}
+
 /** 速度 → 分档颜色；0（无数据/待机）或未配置分档时返回暗灰。
  *  供表盘与 HTML 文本（胶囊悬浮窗的上轮读数）共用同一套配色 */
 const NO_SPEED_COLOR = "#8b93a7";

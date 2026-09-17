@@ -17,8 +17,20 @@ fn main() {
         li.set_inflight(e.call_in_flight());
         let live = li.measure(e.snapshot().now_ms);
         let s = e.snapshot();
+        let tasks: Vec<String> = live
+            .tasks
+            .iter()
+            .map(|t| {
+                format!(
+                    "{}:{:.0}{}",
+                    t.pid,
+                    t.tps,
+                    t.session.as_deref().unwrap_or("?")
+                )
+            })
+            .collect();
         println!(
-            "[轮 {}] 当前 {:.1} t/s | 今日均值 {:.1} t/s | 今日总 {} tok (出 {}/入 {}/缓存写 {}/缓存读 {}) | 调用 {} 次 / {} 会话 | live可用={} streaming={} tps={:.1}",
+            "[轮 {}] 当前 {:.1} t/s | 今日均值 {:.1} t/s | 今日总 {} tok (出 {}/入 {}/缓存写 {}/缓存读 {}) | 调用 {} 次 / {} 会话 | live可用={} streaming={} tps={:.1} npids={} tasks=[{}]",
             i,
             s.current_tps,
             s.avg_tps,
@@ -32,6 +44,8 @@ fn main() {
             live.available,
             live.streaming,
             live.tps,
+            live.n_pids,
+            tasks.join(" "),
         );
         std::thread::sleep(std::time::Duration::from_millis(600));
     }

@@ -11,3 +11,6 @@ cal_samples.json
 title_trace.log
 
 Self-evolution/
+
+# ZCode CLI 本地会话数据
+.zcode/

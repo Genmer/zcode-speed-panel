@@ -258,6 +258,43 @@ main {
   min-height: 0;
 }
 
+/* 并发任务明细卡：多任务并发时出现在仪表行与曲线之间，单任务时隐藏 */
+.task-card {
+  padding: 10px 16px 8px;
+}
+
+#task-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.task-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.task-row .dot {
+  flex: none;
+}
+
+.task-sess {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dim);
+}
+
+.task-tps {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
 footer {
   display: flex;
   gap: 18px;
@@ -388,6 +425,60 @@ footer span {
 
 #float-menu-quit:hover {
   background: rgba(248, 113, 113, 0.18);
+}
+
+/* "常显上轮均速"勾选小方框：桌宠右键菜单项与主窗口顶栏开关共用（.pet-last-on = 勾选态）。
+   原生 checkbox 与 select 一样由 WebView2 按浅色系统主题渲染，深色界面里不可读，须自绘 */
+.pet-chk {
+  flex: none;
+  box-sizing: border-box;
+  position: relative;
+  width: 12px;
+  height: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 3px;
+}
+
+.pet-last-on .pet-chk {
+  border-color: #22d3ee;
+  background: rgba(34, 211, 238, 0.22);
+}
+
+.pet-last-on .pet-chk::after {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 1px;
+  width: 4px;
+  height: 7px;
+  border: solid #22d3ee;
+  border-width: 0 2px 2px 0;
+  transform: rotate(40deg);
+}
+
+/* 菜单项横向排列。须用双 ID 压过 `#float-menu button` 的 all:unset + display:block
+   （单 ID 选择器特异性 (1,0,0) 打不过 (1,0,1)，flex 失效 → .pet-chk 退化行内零尺寸、勾选框错位）；
+   仅桌宠样式显示，隐藏规则同理要压过双 ID flex */
+#float-menu #float-menu-pet-last {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+body.float-mode:not(.style-pet) #float-menu #float-menu-pet-last {
+  display: none;
+}
+
+/* 主窗口顶栏开关：仅完整面板 + 悬浮窗样式为桌宠时出现（悬浮窗走右键菜单勾选）。
+   <button> 元素天然落在顶栏拖动/双击的排除选择器（button, select, input, .dropdown）里 */
+#pet-last-toggle {
+  display: none;
+  align-items: center;
+  gap: 6px;
+}
+
+body.style-pet:not(.float-mode) #pet-last-toggle {
+  display: inline-flex;
 }
 
 .dot.est {

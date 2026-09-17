@@ -97,14 +97,19 @@ struct AppState {
     /// mac 启动引导提示是否待领取（一次性）：setup 在事件循环前执行，
     /// 此时 emit 必然早于页面加载被丢弃，改为前端就绪后 invoke 领取
     tray_hint_pending: Mutex<bool>,
-    /// 当前轮（门控"进行中"连续段）显示速度累计：(Σtps, 实测拍数)
-    round_tps: Mutex<(f64, u32)>,
-    /// 上一拍是否有进行中调用（Some→None 沿 = 一轮结束，结算均值喂漂移检测）
+    /// 当前轮（门控"进行中"连续段）显示速度累计：(Σtps, 实测拍数, 是否见过多进程聚合拍)
+    round_tps: Mutex<(f64, u32, bool)>,
+    /// 上一拍是否有进行中调用（true→false 沿 = 一轮结束，结算均值喂漂移检测）
     round_was_inflight: Mutex<bool>,
     /// 轮均速漂移检测：上轮均值 vs 之前连续 5 轮均值 ≥3 倍（双向）→ 自动重校准
     drift: Mutex<RoundDrift>,
     /// 上次已落盘的系数样本队列（变化才写 speed-panel-cal.json）
     cal_saved: Mutex<Vec<f64>>,
+    /// 桌宠多任务加高的防抖计数（≥2 任务 +1 / <2 任务 -1，3 拍确认）
+    pet_task_streak: Mutex<u32>,
+    /// 桌宠窗口当前应有的多任务加高（0 或 PET_TASK_EXTRA；与实际窗口尺寸
+    /// 的差值由 poller 每拍对比修正，模式/样式切换后也能自动补齐）
+    pet_task_extra: Mutex<f64>,
     /// 应用内更新（updater.rs）：最新 Release、预下载产物与并发门旗。
     /// 网络操作全在后台线程；自动检查路径失败一律静默（见 updater.rs 模块注释）
     update: Mutex<UpdateMem>,
@@ -202,6 +207,15 @@ const FLOAT_PILL_SIZE: (f64, f64) = (172.0, 72.0);
 const FLOAT_PET_SIZE: f64 = 200.0;
 const PET_SIZE_MIN: f64 = 100.0;
 const PET_SIZE_MAX: f64 = 480.0;
+/// 桌宠窗口顶部气泡预留高度（逻辑像素）：两行气泡最大 ~51px（fs=15 时
+/// 10 + 18×2 + 3）+ 余量。窗口 = 边长 ×（边长 + 预留），气泡底边锚在精灵
+/// 头顶附近、向上生长，精灵不再为气泡让位缩小（pet.ts 按底部正方形区排版，
+/// 改此值须同步两处 set_size 与 pet.ts 排版逻辑）
+const PET_BUBBLE_RESERVE: f64 = 56.0;
+/// 桌宠多任务加高（逻辑像素）：≥2 个进行中任务（连续 3 拍防抖）时窗口向上
+/// 加高这么多给气泡的分任务行让位（底边不动：加高多少上移多少）。96px 在
+/// 默认 200 尺寸下可容纳 6 行气泡（实时 + 6 任务 + 上轮）。回落同样防抖
+const PET_TASK_EXTRA: f64 = 96.0;
 
 fn mode_file() -> Option<PathBuf> {
     home_dir().map(|h| h.join(".zcode").join("speed-panel-mode.txt"))
@@ -305,7 +319,7 @@ fn clamp_to_screen(window: &tauri::WebviewWindow, x: i32, y: i32, w: u32, h: u32
     (x.clamp(mp.x, max_x), y.clamp(mp.y, max_y))
 }
 
-fn apply_mode(window: &tauri::WebviewWindow, mode: Mode, style: FloatStyle, p: &Persisted) {
+fn apply_mode(window: &tauri::WebviewWindow, mode: Mode, style: FloatStyle, p: &Persisted, pet_extra: f64) {
     let scale = window.scale_factor().unwrap_or(1.0);
     match mode {
         Mode::Full => {
@@ -335,7 +349,9 @@ fn apply_mode(window: &tauri::WebviewWindow, mode: Mode, style: FloatStyle, p: &
                 FloatStyle::Pill => FLOAT_PILL_SIZE,
                 FloatStyle::Pet => {
                     let s = p.pet_size.unwrap_or(FLOAT_PET_SIZE).clamp(PET_SIZE_MIN, PET_SIZE_MAX);
-                    (s, s)
+                    // 顶部预留带给两行气泡：精灵不缩小，气泡向上生长；
+                    // 多任务加高（pet_task_extra）让分任务行也有处可长
+                    (s, s + PET_BUBBLE_RESERVE + pet_extra)
                 }
             };
             let _ = window.set_min_size(None::<LogicalSize<f64>>);
@@ -381,8 +397,9 @@ fn switch_mode(app: &AppHandle, mode: Mode) {
     // 先更新模式再应用新尺寸/位置：应用过程触发的 Moved 事件按新模式回写
     *state.mode.lock().unwrap() = mode;
     let p = state.persist.lock().unwrap().clone();
+    let pet_extra = *state.pet_task_extra.lock().unwrap();
     if let Some(window) = app.get_webview_window("main") {
-        apply_mode(&window, mode, style, &p);
+        apply_mode(&window, mode, style, &p, pet_extra);
     }
     save_all(app);
     let _ = app.emit("mode", mode.as_str());
@@ -415,7 +432,7 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
     let rollout_dir;
     let new_calls;
     let engine_calls: Vec<metrics::Call>;
-    let inflight: Option<(String, i64)>;
+    let inflight: Vec<(String, i64)>;
     let mut snapshot;
     {
         let mut engine = state.engine.lock().unwrap();
@@ -425,11 +442,15 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
         engine_calls = engine.calls().to_vec();
         inflight = engine.call_in_flight();
     }
-    // 实时实测：进程 IO 写字节流（真实值），只统计当前活跃会话对应的 CLI 进程
+    // 实时实测：进程 IO 写字节流（真实值）。多任务并发（多窗口/子代理）时
+    // 按进行中会话的归属进程并集聚合，当前速度 = 真实总吞吐
     let now_ms = snapshot.now_ms;
     let cal_event;
     let bpt_now;
     let pipe_bps;
+    let npids;
+    let mut proc_bps_log: Vec<(u32, f64)>;
+    let mut infl_attr_log: Vec<(String, u32)>;
     {
         let mut live = state.live.lock().unwrap();
         if !live.history_done() {
@@ -441,6 +462,20 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
         cal_event = live.take_calibration();
         bpt_now = live.bytes_per_token();
         pipe_bps = live_now.pipe_bps;
+        npids = live_now.n_pids;
+        proc_bps_log = live_now.proc_bps.clone();
+        infl_attr_log = live.inflight_attr();
+        snapshot.tasks = live_now
+            .tasks
+            .iter()
+            .map(|t| metrics::TaskStat {
+                pid: t.pid,
+                session: t.session.clone().unwrap_or_default(),
+                n_sessions: t.n_sessions as u32,
+                tps: t.tps,
+                streaming: t.streaming,
+            })
+            .collect();
         // 系数样本队列变化（新样本入样/手动或漂移重校准）即落盘，重启热启动
         {
             let q = live.cal_state();
@@ -464,10 +499,12 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
                     snapshot.current_tps = 0.0;
                 } else if live_now.tps < 1.0 && snapshot.window_tps > 0.0 {
                     // 部分调用期间 UI 管道无增量字节（IO 实测为 0）：回退到近期
-                    // 已完成调用的真实速度（与速度曲线同口径），标记 ≈ 估算
+                    // 已完成调用的真实速度（与速度曲线同口径），标记 ≈ 估算。
+                    // ≈ 是落盘口径的全局值，没有可拆的分任务实测，明细清空
                     snapshot.current_tps = snapshot.window_tps;
                     snapshot.is_estimating = true;
                     snapshot.live_source = "window".into();
+                    snapshot.tasks.clear();
                 } else {
                     snapshot.current_tps = live_now.tps;
                 }
@@ -484,7 +521,7 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
                     *last = 0.0;
                 }
             }
-        } else if inflight.is_some() && !ever_saw {
+        } else if !inflight.is_empty() && !ever_saw {
             // IO 从未可用（IO 探测环境不可用 / 面板刚启动进程未发现）：
             // 按 message 门控决定，而不是按调用间隔盲估——有调用进行中才显示
             // （近期有真值则估算 ≈，否则"统计中…"提示），门控已停立即归零。
@@ -545,6 +582,7 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
                 "clean_kb": (cal.clean_bytes / 1024.0 * 10.0).round() / 10.0,
                 "attr_pid": cal.attr_pid,
                 "top_pid": cal.top_pid,
+                "others_kb": (cal.others_bytes / 1024.0 * 10.0).round() / 10.0,
                 "bpt_sample": (cal.bpt_sample * 10.0).round() / 10.0,
                 "bpt_now": (cal.bpt_now * 10.0).round() / 10.0,
                 "pred_tps": (pred_tps * 10.0).round() / 10.0,
@@ -563,6 +601,15 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
                 .rev()
                 .map(|v| (v * 10.0).round() / 10.0)
                 .collect();
+            // 多任务排查三件套：被跟踪进程的探测窗速率 / 进行中会话数 / 会话归属映射
+            let pids_json: serde_json::Map<String, serde_json::Value> = proc_bps_log
+                .iter()
+                .map(|(pid, kbps)| (pid.to_string(), serde_json::json!(kbps)))
+                .collect();
+            let attr_json: Vec<String> = infl_attr_log
+                .iter()
+                .map(|(s, pid)| format!("{}…{}", &s[s.len().saturating_sub(4)..], pid))
+                .collect();
             log.write(serde_json::json!({
                 "kind": "tick",
                 "t": now_ms,
@@ -577,6 +624,10 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
                 "avg": (snapshot.avg_tps * 10.0).round() / 10.0,
                 "spark_tail": tail,
                 "calls": snapshot.calls_today,
+                "npids": npids,
+                "infl": inflight.len(),
+                "pids": pids_json,
+                "attr": attr_json,
             }));
         }
     }
@@ -585,10 +636,11 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
 
     // ---- 轮均速漂移自动重校准：一轮 = 门控"进行中"连续的一段，轮内显示速度
     //      （io 实测拍）取均值；上轮均值 vs 之前连续 5 轮均值 ≥3 倍（双向）
-    //      判定量级突变（换模型/分词器，旧系数过期）→ 丢弃系数样本回先验 ----
+    //      判定量级突变（换模型/分词器，旧系数过期）→ 丢弃系数样本回先验。
+    //      多进程聚合轮（多任务并发）不参与：任务数变化带来的吞吐差不是系数漂移 ----
     {
         let state = app.state::<AppState>();
-        let now_inflight = inflight.is_some();
+        let now_inflight = !inflight.is_empty();
         let was_inflight = {
             let mut flag = state.round_was_inflight.lock().unwrap();
             std::mem::replace(&mut *flag, now_inflight)
@@ -597,14 +649,17 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
             let mut acc = state.round_tps.lock().unwrap();
             acc.0 += snapshot.current_tps;
             acc.1 += 1;
+            if npids != 1 {
+                acc.2 = true;
+            }
         }
         if was_inflight && !now_inflight {
-            // 一轮结束：结算均值。静默/估算轮（无实测拍）不参与漂移检测
-            let (sum, n) = {
+            // 一轮结束：结算均值。静默/估算轮（无实测拍）与多进程聚合轮不参与漂移检测
+            let (sum, n, saw_multi) = {
                 let mut acc = state.round_tps.lock().unwrap();
                 std::mem::take(&mut *acc)
             };
-            if n > 0 {
+            if n > 0 && !saw_multi {
                 let avg = sum / n as f64;
                 let mut drift = state.drift.lock().unwrap();
                 if let Some(base) = drift.observe(avg) {
@@ -622,6 +677,9 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
                         "bpt_old": (bpt_old * 10.0).round() / 10.0,
                         "bpt_new": (bpt_new * 10.0).round() / 10.0,
                     }));
+                    // 与手动触发同款反馈（⟳ 按钮闪 ✓）：自动触发伴随系数大幅
+                    // 偏离，用户恰恰需要这个提示
+                    let _ = app.emit("recalibrated", ());
                 }
             }
         }
@@ -655,12 +713,13 @@ fn set_float_style(app: AppHandle, style: String) {
         let state = app.state::<AppState>();
         *state.style.lock().unwrap() = st;
         let mode = *state.mode.lock().unwrap();
-        if mode == Mode::Float {
-            if let Some(window) = app.get_webview_window("main") {
-                let p = state.persist.lock().unwrap().clone();
-                apply_mode(&window, mode, st, &p);
-            }
+    if mode == Mode::Float {
+        if let Some(window) = app.get_webview_window("main") {
+            let p = state.persist.lock().unwrap().clone();
+            let pet_extra = *state.pet_task_extra.lock().unwrap();
+            apply_mode(&window, mode, st, &p, pet_extra);
         }
+    }
     }
     save_all(&app);
     let _ = app.emit("float-style", st.as_str());
@@ -677,11 +736,69 @@ fn set_float_size(app: AppHandle, size: f64) {
         let style = *state.style.lock().unwrap();
         if mode == Mode::Float && style == FloatStyle::Pet {
             if let Some(window) = app.get_webview_window("main") {
-                let _ = window.set_size(LogicalSize::new(size, size));
+                // 高度含顶部气泡预留带与多任务加高（与 apply_mode 同口径）
+                let extra = *state.pet_task_extra.lock().unwrap();
+                let _ = window.set_size(LogicalSize::new(size, size + PET_BUBBLE_RESERVE + extra));
             }
         }
     }
     save_all(&app);
+}
+
+/// 桌宠多任务加高的防抖与差值应用：≥2 个进行中任务连续 3 拍 → 加高
+/// PET_TASK_EXTRA，回落连续 3 拍 → 收回（与完整面板任务卡同款 3 拍防抖）。
+/// want 与已应用值一致时直接返回，不 churn 窗口尺寸
+fn update_pet_task_extra(app: &AppHandle, multi_now: bool) {
+    let state = app.state::<AppState>();
+    let streak = {
+        let mut s = state.pet_task_streak.lock().unwrap();
+        *s = if multi_now {
+            (*s + 1).min(3)
+        } else {
+            s.saturating_sub(1)
+        };
+        *s
+    };
+    let want = if streak >= 3 { PET_TASK_EXTRA } else { 0.0 };
+    let cur = *state.pet_task_extra.lock().unwrap();
+    if (want - cur).abs() < f64::EPSILON {
+        return;
+    }
+    *state.pet_task_extra.lock().unwrap() = want;
+    apply_pet_size(app);
+}
+
+/// 按当前桌宠边长 + 气泡预留带 + 多任务加高设置窗口尺寸，并按高度差整体
+/// 上移/下移保持底边（精灵脚部）在屏幕上不动；仅桌宠悬浮窗模式下生效，
+/// 其他模式/样式只更新状态值，切回来时由 apply_mode / 本函数补齐
+fn apply_pet_size(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let mode = *state.mode.lock().unwrap();
+    let style = *state.style.lock().unwrap();
+    if mode != Mode::Float || style != FloatStyle::Pet {
+        return;
+    }
+    let extra = *state.pet_task_extra.lock().unwrap();
+    let size = state
+        .persist
+        .lock()
+        .unwrap()
+        .pet_size
+        .unwrap_or(FLOAT_PET_SIZE)
+        .clamp(PET_SIZE_MIN, PET_SIZE_MAX);
+    let Some(w) = app.get_webview_window("main") else {
+        return;
+    };
+    let scale = w.scale_factor().unwrap_or(1.0);
+    let Ok(outer) = w.outer_size() else {
+        return;
+    };
+    let new_h = size + PET_BUBBLE_RESERVE + extra;
+    let dy = ((new_h - outer.height as f64 / scale) * scale).round() as i32;
+    let pos = w.outer_position().unwrap_or_default();
+    let (nx, ny) = clamp_to_screen(&w, pos.x, pos.y - dy, outer.width, (new_h * scale) as u32);
+    let _ = w.set_size(LogicalSize::new(size, new_h));
+    let _ = w.set_position(PhysicalPosition::new(nx, ny));
 }
 
 /// 悬浮窗右键菜单"退出"：保存状态后退出应用
@@ -1108,6 +1225,8 @@ fn poller(app: AppHandle) {
     loop {
         let payload = build_payload(&app);
         update_tray_status(&app, &payload.snapshot);
+        // 多任务（≥2 进程）防抖后为桌宠窗口加高/收回分任务行空间
+        update_pet_task_extra(&app, payload.snapshot.tasks.len() >= 2);
         let _ = app.emit("metrics", &payload);
         std::thread::sleep(Duration::from_millis(700));
     }
@@ -1130,10 +1249,12 @@ fn main() {
             tray_status: Mutex::new(None),
             tray_status_last: Mutex::new(String::new()),
             tray_hint_pending: Mutex::new(cfg!(target_os = "macos")),
-            round_tps: Mutex::new((0.0, 0)),
+            round_tps: Mutex::new((0.0, 0, false)),
             round_was_inflight: Mutex::new(false),
             drift: Mutex::new(RoundDrift::new()),
             cal_saved: Mutex::new(Vec::new()),
+            pet_task_streak: Mutex::new(0),
+            pet_task_extra: Mutex::new(0.0),
             update: Mutex::new(UpdateMem::default()),
         })
         .invoke_handler(tauri::generate_handler![
@@ -1251,7 +1372,8 @@ fn main() {
             }
             let window = app.get_webview_window("main").unwrap();
             let p = app.state::<AppState>().persist.lock().unwrap().clone();
-            apply_mode(&window, mode, style, &p);
+            let pet_extra = *app.state::<AppState>().pet_task_extra.lock().unwrap();
+            apply_mode(&window, mode, style, &p, pet_extra);
             let _ = window.show();
             // mac 启动引导提示不在此 emit：setup 早于事件循环/WKWebView 加载，
             // 发即被弃——改为前端就绪后 invoke `tray_hint_once` 领取（一次性）

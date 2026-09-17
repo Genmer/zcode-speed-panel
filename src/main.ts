@@ -125,6 +125,26 @@ $("float-menu-quit").addEventListener("click", () => {
   tauriInvoke("quit_app");
 });
 
+// ---- 桌宠"常显上轮均速"：桌宠右键菜单勾选项 + 完整面板顶栏开关（同一状态）----
+// 勾选后气泡恒两行（生成中随实时速度一起展开显示，无需悬停）；显隐仍随生成状态，
+// 待机不显示。菜单点击后不收起，让勾选状态可见，点菜单外任意处照常关闭。
+// 顶栏开关仅桌宠样式时由 CSS 显示
+const PET_LAST_KEY = "petLastAlways.v1";
+let petLastAlways = localStorage.getItem(PET_LAST_KEY) === "1";
+const petLastControls = [$("float-menu-pet-last"), $("pet-last-toggle")];
+const applyPetLast = () => {
+  for (const el of petLastControls) el.classList.toggle("pet-last-on", petLastAlways);
+  petWidget.setAlwaysLast(petLastAlways);
+};
+applyPetLast();
+for (const el of petLastControls) {
+  el.addEventListener("click", () => {
+    petLastAlways = !petLastAlways;
+    localStorage.setItem(PET_LAST_KEY, petLastAlways ? "1" : "0");
+    applyPetLast();
+  });
+}
+
 const sparkCanvas = $<HTMLCanvasElement>("spark");
 const liveDot = $("live-dot");
 const liveText = $("live-text");
@@ -137,6 +157,8 @@ const stCalls = $("st-calls");
 const stSessions = $("st-sessions");
 const stLast = $("st-last");
 const chartMax = $("chart-max");
+const taskCard = $("task-card");
+const taskList = $("task-list");
 const floatTps = $("float-tps");
 const floatDot = $("float-dot");
 const floatLast = $("float-last");
@@ -144,6 +166,9 @@ const floatLast = $("float-last");
 let lastSpark: number[] = [];
 let lastNowMs = 0;
 let sparkColor = "#22d3ee";
+// 任务卡隐藏迟滞：任务数在 1↔2 边界抖动（子代理起止、流式阈值边缘）时，
+// 连续 3 拍（~2s）不足 2 行才隐藏，避免下方曲线卡整块上下跳
+let taskHideStreak = 3;
 
 function redrawSpark() {
   if (lastSpark.length) drawSpark(sparkCanvas, lastSpark, sparkColor, lastNowMs);
@@ -172,18 +197,52 @@ function onSnapshot(s: Snapshot) {
   miniGauge.setTarget(s.currentTps, s.isEstimating, s.isStarting);
   miniLast.setTarget(s.lastCallTps);
 
+  // 并发任务明细：≥2 个任务时显示（单任务时隐藏，不占版面）。
+  // 一个 CLI 进程 = 一行，行值合计 = 当前速度表（文件增长按字节占比分摊）；
+  // 同一进程承载多个会话（同一 ZCode 窗口新开任务会复用 app-server 进程，
+  // 字节层不可拆分）计为一行合计，按 n_sessions 计入任务总数
+  const tasks = s.tasks ?? [];
+  const taskCount = tasks.reduce((n, t) => n + Math.max(1, t.nSessions || 0), 0);
+  if (taskCount >= 2) {
+    taskHideStreak = 0;
+    taskCard.hidden = false;
+    taskList.textContent = "";
+    for (const t of tasks) {
+      const row = document.createElement("div");
+      row.className = "task-row";
+      const dot = document.createElement("span");
+      dot.className = t.streaming ? "dot live" : "dot idle";
+      const label = document.createElement("span");
+      label.className = "task-sess";
+      label.textContent =
+        t.nSessions >= 2
+          ? `${t.nSessions} 会话（同进程合计） · 进程 ${t.pid}`
+          : t.session
+            ? `会话 …${t.session.slice(-6)} · 进程 ${t.pid}`
+            : `未归属进程 ${t.pid}`;
+      const tps = document.createElement("span");
+      tps.className = "task-tps";
+      tps.textContent = t.streaming ? `${fmtTps(t.tps)} t/s` : "待机";
+      if (t.streaming) tps.style.color = speedColor(t.tps, SPEED_TIERS);
+      row.append(dot, label, tps);
+      taskList.append(row);
+    }
+  } else if (taskHideStreak < 3) {
+    taskHideStreak++;
+    if (taskHideStreak >= 3) taskCard.hidden = true;
+  }
+
   subCurrent.textContent = s.isStarting
     ? "生成已启动 · 等待模型输出（统计中…）"
     : s.liveSource === "io"
       ? s.ramping
         ? "实时实测 · 统计中…（30s 滑窗建立中）"
-        : "实时实测 · 进程流式输出（30s 滑窗实测）"
+        : `实时实测 · 进程流式输出（30s 滑窗实测${taskCount >= 2 ? ` · ${taskCount} 任务聚合` : ""}）`
       : s.isEstimating
         ? "生成中 · 此段无增量字节，按近期真实速度估算 ≈"
         : "待机 · 已无生成任务";
   subAvg.textContent = `Σ输出 ÷ Σ生成时长 · 今日 ${s.callsToday} 次调用`;
   subTotal.textContent = `输出 ${fmtTokens(s.outputTokens)} · 输入 ${fmtTokens(s.inputTokens)} · 缓存命中率 ${cacheHitRate(s)}`;
-
   document.body.classList.toggle("live", s.isLive || s.isStarting);
   document.body.classList.toggle("est", s.isEstimating);
   const petState: "idle" | "running" | "estimating" | "starting" = s.isStarting
@@ -192,6 +251,22 @@ function onSnapshot(s: Snapshot) {
       ? "running"
       : "idle";
   petWidget.setLive(s.currentTps, petState);
+  // 多任务分进程明细：桌宠气泡 ≥2 任务时展开分任务行（与完整面板任务卡同口径；
+  // 单任务/回退/启动期传空，气泡只显示聚合值）
+  petWidget.setTasks(
+    taskCount >= 2
+      ? tasks.map((t) => ({
+          label:
+            t.nSessions >= 2
+              ? `${t.nSessions}会话·${t.pid}`
+              : t.session
+                ? `…${t.session.slice(-6)}`
+                : `进程 ${t.pid}`,
+          tps: t.tps,
+          streaming: t.streaming,
+        }))
+      : []
+  );
   liveDot.className = statusClass(s);
   liveText.textContent = s.isLive || s.isStarting ? "生成中" : s.isEstimating ? "估算中" : "待机";
   updatedAt.textContent = `更新于 ${fmtClock(s.nowMs)}`;
@@ -221,7 +296,7 @@ function onSnapshot(s: Snapshot) {
   lastSpark = s.spark;
   lastNowMs = s.nowMs;
   sparkColor = s.isLive ? "#22d3ee" : s.isEstimating ? "#fbbf24" : "#64748b";
-  const peak = Math.max(10, ...s.spark);
+  const peak = Math.max(10, ...s.spark, s.currentTps);
   chartMax.textContent = `峰值 ${fmtTps(peak)} t/s`;
   redrawSpark();
 }

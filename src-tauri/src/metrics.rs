@@ -31,6 +31,21 @@ impl Call {
     }
 }
 
+/// 分任务实时明细（多任务并发时才有多个）：一个 CLI 进程 = 一个任务行。
+/// 同进程内并行的多个子代理在字节层不可拆分，如实显示为该进程合计
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskStat {
+    pub pid: u32,
+    /// 归属的进行中会话 id（空 = 尚未归属的流式进程）
+    pub session: String,
+    /// 该进程承载的进行中会话数（≥2 = 同进程多任务，速度为合计）
+    pub n_sessions: u32,
+    pub tps: f64,
+    /// 该进程当前是否处于流式状态（探测窗速率超阈值）
+    pub streaming: bool,
+}
+
 /// 推送给前端的指标快照
 #[derive(Serialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
@@ -65,6 +80,8 @@ pub struct Snapshot {
     pub now_ms: i64,
     pub rollout_dir: String,
     pub spark: Vec<f64>,
+    /// 并发任务分进程明细（实时链路填充；≥2 个时前端显示任务列表）
+    pub tasks: Vec<TaskStat>,
 }
 
 /// 当前速度统计窗口
@@ -275,6 +292,7 @@ impl Aggregator {
             now_ms: now,
             rollout_dir: String::new(),
             spark,
+            tasks: Vec::new(),
         }
     }
 }
@@ -431,20 +449,25 @@ impl Engine {
     /// 调用结束（含取消/出错）时补写 completed 字段——比 model_usage 完成行更快、
     /// 且覆盖 status='cancelled'/'error'（这两种调用永远没有 completed 状态行，
     /// 旧口径下会卡"生成中"直到 10 分钟兜底）。
-    /// 返回 (会话, 调用开始时刻)。10 分钟上限兜底崩溃后无人补写 completed 的行。
-    pub fn call_in_flight(&self) -> Option<(String, i64)> {
-        let conn = self.conn.as_ref()?;
-        // 最近活跃会话（session 表 ~1k 行，按 time_updated 倒序小表扫描可接受）；
+    /// 返回全部进行中的 (会话, 调用开始时刻)，按开始时刻降序——多任务并发
+    /// （多窗口 / 子代理会话）时实时速度按进程集合聚合，不再单选最新一条。
+    /// 10 分钟上限兜底崩溃后无人补写 completed 的行。
+    pub fn call_in_flight(&self) -> Vec<(String, i64)> {
+        let Some(conn) = self.conn.as_ref() else {
+            return Vec::new();
+        };
+        // 最近活跃会话（session 表 ~1k 行，按 time_updated 倒序小表扫描可接受；
+        // 上限 16：多任务聚合要覆盖全部进行中会话，>6 个并发子代理不能漏计）；
         // message 表缺 time_created 单列索引，不能全局 ORDER BY（实测 ~200ms/次）
         let mut stmt = match conn.prepare_cached(
-            "SELECT id FROM session ORDER BY time_updated DESC LIMIT 6",
+            "SELECT id FROM session ORDER BY time_updated DESC LIMIT 16",
         ) {
             Ok(s) => s,
-            Err(_) => return None,
+            Err(_) => return Vec::new(),
         };
         let sessions: Vec<String> = match stmt.query_map([], |r| r.get::<_, String>(0)) {
             Ok(rows) => rows.flatten().collect(),
-            Err(_) => return None,
+            Err(_) => return Vec::new(),
         };
         drop(stmt);
 
@@ -477,11 +500,12 @@ impl Engine {
 
 /// message 门控纯判定：候选 (会话, assistant 行创建时刻, 是否已带 completed)。
 /// 每会话只认最新一条 assistant 行（更老的未完成行是崩溃残留，已被更新行覆盖），
-/// 其中任一会话的最新行未完成且新鲜 → 有调用进行中，取创建时刻最新的一条
+/// 其中最新行未完成且新鲜的会话**全部**视为进行中（多任务并发各自计入，
+/// 供实时链路按进程集合聚合），按创建时刻降序返回
 pub(crate) fn inflight_from_rows(
     cands: &[(String, i64, bool)],
     now_ms: i64,
-) -> Option<(String, i64)> {
+) -> Vec<(String, i64)> {
     let mut newest: HashMap<&str, &(String, i64, bool)> = HashMap::new();
     for row in cands {
         match newest.get(row.0.as_str()) {
@@ -491,11 +515,13 @@ pub(crate) fn inflight_from_rows(
             }
         }
     }
-    newest
+    let mut out: Vec<(String, i64)> = newest
         .values()
         .filter(|(_, created, done)| !done && now_ms - *created <= 600_000)
-        .max_by_key(|(_, created, _)| *created)
         .map(|(s, c, _)| (s.clone(), *c))
+        .collect();
+    out.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    out
 }
 
 // ============ 测试 ============
@@ -504,13 +530,14 @@ mod tests {
     use super::*;
 
     /// message 门控：未带 completed 的最新 assistant 行 → 进行中；
-    /// 已完成的行、超龄的僵尸行（崩溃兜底）、以及"同会话更新的已完成行"都不算
+    /// 已完成的行、超龄的僵尸行（崩溃兜底）、以及"同会话更新的已完成行"都不算；
+    /// 多会话并发（多窗口/子代理）全部返回
     #[test]
     fn inflight_from_rows_gating() {
         let now = 1_000_000i64;
         // 新会话首条调用：行未完成 → 进行中
         let r = inflight_from_rows(&[("new".into(), now - 3_000, false)], now);
-        assert_eq!(r, Some(("new".to_string(), now - 3_000)));
+        assert_eq!(r, vec![("new".to_string(), now - 3_000)]);
         // 同会话有更新的已完成 assistant 行（旧僵尸行在上）→ 不算
         assert_eq!(
             inflight_from_rows(
@@ -520,23 +547,31 @@ mod tests {
                 ],
                 now
             ),
-            None
+            Vec::new()
         );
-        // 多会话并发：取最新未完成行（子 agent 会话 b 晚于主会话 a 开始）
+        // 多会话并发：全部进行中会话都返回，按开始时刻降序
+        // （子 agent 会话 b/c 晚于主会话 a 开始，a 的当轮已完成）
         let r = inflight_from_rows(
             &[
                 ("a".into(), now - 40_000, true),
                 ("b".into(), now - 5_000, false),
+                ("c".into(), now - 20_000, false),
             ],
             now,
         );
-        assert_eq!(r, Some(("b".to_string(), now - 5_000)));
+        assert_eq!(
+            r,
+            vec![
+                ("b".to_string(), now - 5_000),
+                ("c".to_string(), now - 20_000),
+            ]
+        );
         // 未完成但超过 10 分钟兜底 → 判停
         assert_eq!(
             inflight_from_rows(&[("z".into(), now - 601_000, false)], now),
-            None
+            Vec::new()
         );
-        assert_eq!(inflight_from_rows(&[], now), None);
+        assert_eq!(inflight_from_rows(&[], now), Vec::new());
     }
 
     fn call(completed: i64, gen_ms: i64, out: u64, reason: u64, input: u64, session: &str) -> Call {
