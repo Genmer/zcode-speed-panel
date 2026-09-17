@@ -47,7 +47,7 @@ jobs:
           releaseName: "zcode-speed-panel __VERSION__"
           releaseDraft: false
           prerelease: false
-          releaseBody: "Windows 安装包（NSIS）。下载 `zcode-speed-panel_x.y.z_x64-setup.exe` 安装即可。"
+          releaseBody: "Windows 安装包（NSIS）与 macOS dmg（双架构独立包）。Windows 下载 `zcode-speed-panel_x.y.z_x64-setup.exe` 安装；macOS 按机型下载 `zcode-speed-panel_x.y.z_x64.dmg`（Intel）或 `_aarch64.dmg`（Apple Silicon，需 macOS 11+），拖入 Applications。mac 包未签名公证，首次打开需绕过 Gatekeeper：右键打开，或 `xattr -cr /Applications/zcode-speed-panel.app`（详见 README）。"
           args: --target x86_64-pc-windows-msvc
 
       # 免安装版：直接复制主程序 exe 并按版本号命名（与安装版 _x64-setup.exe 区分）
@@ -74,4 +74,58 @@ jobs:
           path: |
             src-tauri/target/**/bundle/nsis/*.exe
             ${{ env.PORTABLE }}
+          if-no-files-found: error
+
+  # mac 双架构独立 dmg（不做 universal）：x64 = Intel（最低 10.15）、
+  # aarch64 = Apple Silicon（天然 11.0+）。不签名不公证，README 写绕过指引
+  build-macos:
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            deployment_target: "10.15"
+          - target: aarch64-apple-darwin
+            deployment_target: "11.0"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # 与 Windows 同一套 Release 流程：v* 标签自动发 Release，手动触发只出产物。
+      # plist 的 LSMinimumSystemVersion 只认 config（缺省恒 10.13，不读环境变量），
+      # 故按架构用 --config inline JSON 注入；环境变量只管二进制的 LC_BUILD_VERSION
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+        with:
+          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          releaseName: "zcode-speed-panel __VERSION__"
+          releaseDraft: false
+          prerelease: false
+          releaseBody: "Windows 安装包（NSIS）与 macOS dmg（双架构独立包）。Windows 下载 `zcode-speed-panel_x.y.z_x64-setup.exe` 安装；macOS 按机型下载 `zcode-speed-panel_x.y.z_x64.dmg`（Intel）或 `_aarch64.dmg`（Apple Silicon，需 macOS 11+），拖入 Applications。mac 包未签名公证，首次打开需绕过 Gatekeeper：右键打开，或 `xattr -cr /Applications/zcode-speed-panel.app`（详见 README）。"
+          args: --target ${{ matrix.target }} --bundles dmg --config '{"bundle":{"macOS":{"minimumSystemVersion":"${{ matrix.deployment_target }}"}}}'
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.target }}
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
           if-no-files-found: error

@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Build](https://github.com/Masterchiefm/zcode-speed-panel/actions/workflows/build.yml/badge.svg)](https://github.com/Masterchiefm/zcode-speed-panel/actions/workflows/build.yml)
 
-一个 Tauri 2 + Rust 的桌面常驻小工具：实时展示 ZCode CLI 的模型输出速度与今日 Token 用量，支持桌宠、迷你仪表盘与速度胶囊三种悬浮窗形态，可最小化到系统托盘。
+一个 Tauri 2 + Rust 的桌面常驻小工具（Windows / macOS 双平台）：实时展示 ZCode CLI 的模型输出速度与今日 Token 用量，支持桌宠、迷你仪表盘与速度胶囊三种悬浮窗形态，可最小化到系统托盘（mac 上为菜单栏）。
 
 <p><img src="app-icon.png" width="96" alt="应用图标" /></p>
 
@@ -23,19 +23,29 @@
 
 ## 下载与安装
 
-**推荐：直接使用 Release 里打包好的文件**（每个版本两个文件，按需下载其一）
+**推荐：直接使用 Release 里打包好的文件**（Windows 每个版本两个文件按需下载其一；macOS 按机型二选一 dmg）
 
-1. 打开 [最新 Release](https://github.com/Masterchiefm/zcode-speed-panel/releases/latest)，在 Assets 里二选一：
+1. 打开 [最新 Release](https://github.com/Masterchiefm/zcode-speed-panel/releases/latest)，按系统在 Assets 里选择：
+
+   **Windows 10/11 x64**（需 WebView2 运行时，Win11 自带）：
    - `zcode-speed-panel_x.y.z_x64-setup.exe` —— **安装版**（推荐）：双击按向导安装，开始菜单启动，旧版本覆盖升级；
    - `zcode-speed-panel_x.y.z_x64-portable.exe` —— **免安装版**：下载后放到任意目录直接双击运行，不写注册表、不建开始菜单，删掉文件即卸载。
-2. 两个版本功能完全一致，数据都存放在 `~/.zcode/` 下，可共存。
+
+   **macOS 10.15+**（双架构独立包，不做 universal）：
+   - `zcode-speed-panel_x.y.z_x64.dmg` —— Intel 芯片的 Mac；
+   - `zcode-speed-panel_x.y.z_aarch64.dmg` —— Apple Silicon（M 系列，需 macOS 11+）。
+   - 安装：打开 dmg，把 `zcode-speed-panel.app` 拖入「应用程序」。**首次打开需绕过 Gatekeeper**（应用未签名公证）：在「应用程序」里**右键 → 打开 → 再点"打开"**；或终端执行 `xattr -cr /Applications/zcode-speed-panel.app` 后正常双击。
+
+2. 同一系统的各版本功能完全一致，数据都存放在 `~/.zcode/` 下，可共存。
+
+**macOS 退出方式说明**：应用以**菜单栏常驻**方式运行（不占 Dock、不进 Cmd+Tab）。点窗口 ✕ 或按 `Cmd+Q` 都是**折叠为悬浮窗**而不是退出——真退出只有两条路：**菜单栏图标右键 → 退出**，或**悬浮窗右键 → 退出程序**。找不到窗口时，点屏幕右上角菜单栏的应用图标即可唤起面板。
 
 其他方式：
 
-- **下载某次提交的构建产物**：到 [Actions](https://github.com/Masterchiefm/zcode-speed-panel/actions) 页选一次成功的 Build 运行，在 Artifacts 下载 `windows`（含安装版与免安装版两个 exe，适用于体验尚未发版的最新改动）；
+- **下载某次提交的构建产物**：到 [Actions](https://github.com/Masterchiefm/zcode-speed-panel/actions) 页选一次成功的 Build 运行，在 Artifacts 下载 `windows`（含安装版与免安装版两个 exe）、`macos-x86_64-apple-darwin` / `macos-aarch64-apple-darwin`（各含一个 dmg，适用于体验尚未发版的最新改动）；
 - **从源码构建**：见下方[开发与构建](#开发与构建)。
 
-> 运行环境：Windows 10/11 x64，需 WebView2 运行时（Win11 自带）。所有数据仅从本地文件与进程读取，不上传任何内容。
+> 运行环境：Windows 10/11 x64（WebView2，Win11 自带）或 macOS 10.15+（Intel）/ 11+（Apple Silicon）。所有数据仅从本地文件与进程读取，不上传任何内容。
 
 ## 🙏 诚征桌宠素材：质谱娘
 
@@ -50,7 +60,7 @@
   - 模式、样式、两种位置与桌宠尺寸都会记住，下次启动直接恢复
 - **近 15 分钟速度曲线**（10 秒一档；横轴标注**真实墙钟时刻**，每 5 分钟一条刻度，整条曲线随时间连续左移，可直接对表验证）
 - **速度分档配色**：当前速度表的弧线与读数随速度整体变色——0–30 t/s 绿、30–60 t/s 黄、60+ t/s 红，一瞥即知快慢；背景轨道恒为灰色，悬浮窗迷你仪表同规则
-- **无边框窗口 + 自绘顶栏**：顶栏与应用同风格，按住拖动移动、双击最大化/还原，右侧 **— 最小化 / ▢ 最大化 / ✕ 收起为悬浮窗**；窗口标题实时显示当前速度（任务栏/Alt+Tab 可见）；托盘左键单击显示/隐藏；右键菜单（显示面板 / 隐藏到托盘 / 悬浮窗切换 / 退出）；重复启动自动唤起已有窗口
+- **无边框窗口 + 自绘顶栏**：顶栏与应用同风格，按住拖动移动、双击最大化/还原，右侧 **— 最小化 / ▢ 最大化 / ✕ 收起为悬浮窗**；窗口标题实时显示当前速度（任务栏/Alt+Tab 可见）；托盘（mac 为菜单栏）左键单击显示/隐藏，右键菜单顶部有**实时状态行**（生成中 x.x t/s / 估算中 / 待机），菜单项（显示面板 / 隐藏到托盘 / 悬浮窗切换 / 退出）；重复启动自动唤起已有窗口。**mac**：应用不占 Dock 与 Cmd+Tab（菜单栏常驻），`Cmd+Q` 与点 ✕ 均折叠为悬浮窗，窗口每次显示时会提示"应用常驻菜单栏"（6 秒自动消失）；WebView 的 Cmd+C/V/X/A 由自定义"编辑"菜单保留
 - 状态栏：数据源（usage 数据库）、今日调用次数、会话数、最近活动时间
 
 ## 数据源
@@ -63,7 +73,7 @@
 
 **要解决的问题**：ZCode 只在调用完成时才把 token 数落盘（`model_usage` 表），流式过程中数据库里没有任何增量数据——这是所有"完成后统计"类工具的共同盲区：长回答生成期间，速度只能显示 0 或上一次的旧值。
 
-**关键观测**：CLI 进程在模型流式输出时，会持续把渲染增量写入通往桌面 UI 的管道。对进程写字节速率的实测显示：
+**关键观测**：CLI 进程在模型流式输出时，会持续把渲染增量写入通往桌面 UI 的管道。对进程写字节速率的实测显示（Windows）：
 
 | 状态 | 写速率（每 ~700ms 拍） |
 |---|---|
@@ -72,6 +82,8 @@
 | 调用完成瞬间 | 数百 KB 尖峰（落盘写入） |
 
 这个计数器由 Windows 内核维护（`GetProcessIoCounters` 的 `WriteTransferCount`），权威、实时、读取零开销。
+
+**macOS 口径差异**（同一条清洗/校准管道，平台参数不同）：进程发现用 `proc_listallpids` + `KERN_PROCARGS2` 识别（CLI 由 Electron Helper fork 而来，须按命令行参数 `zcode-cli` 精确匹配）；写字节计数器换成 `proc_pid_rusage` 的 `ri_diskio_byteswritten`（内核维护的进程累计磁盘写字节）。mac 上流式字节是**单拍突发形态**（0,0,0,+225KB~1.5MB，≈3900 B/token），与 Windows 的连续细流不同，因此**禁用突发剔除**、不设静态底噪（idle 实测严格 0 字节）、初始系数与校准区间按实测放宽；rollout 目录的落盘扣除在 mac 上关闭（目录净变化常为负——清理轮转会反噬清洗流，见 `docs/features.md` 的 CleanParams 平台表）。
 
 **测量循环（随主轮询 ~700ms 一拍）**：
 
@@ -112,18 +124,27 @@ python scripts/live_vs_true.py            # 实时 vs 真值 对账（旧格式�
 
 ## 开发与构建
 
-环境要求：Node.js ≥ 20、Rust stable（Windows 下需 MSVC 工具链）、WebView2 运行时（Win11 自带）。
+环境要求：Node.js ≥ 20、Rust stable（Windows 下需 MSVC 工具链；macOS 下需 Xcode Command Line Tools）、WebView2 运行时（Win11 自带）。
 
 ```bash
 npm install
 npm run tauri dev      # 开发调试（debug 版连接 vite dev server）
-npm run tauri build    # 正式版（内嵌前端 + NSIS 安装包）
+npm run tauri build    # 正式版（内嵌前端 + 安装包：Windows NSIS / macOS dmg）
+```
+
+> mac 本地构建如需精确声明最低系统版本（CI 的做法，与本节命令一致）：Intel 包加 `--config '{"bundle":{"macOS":{"minimumSystemVersion":"10.15"}}}'` 并前缀环境变量 `MACOSX_DEPLOYMENT_TARGET=10.15`（前者写 Info.plist 的 LSMinimumSystemVersion，后者决定二进制的最低版本；不指定时 tauri 默认 plist 写 10.13）。
+
+macOS 交叉构建 Apple Silicon 包（在 Intel Mac 上即可）：
+
+```bash
+rustup target add aarch64-apple-darwin
+MACOSX_DEPLOYMENT_TARGET=11.0 npm run tauri build -- --target aarch64-apple-darwin --bundles dmg --config '{"bundle":{"macOS":{"minimumSystemVersion":"11.0"}}}'
 ```
 
 产物位置：
 
-- 可执行文件：`src-tauri/target/release/zcode-speed-panel.exe`
-- 安装包：`src-tauri/target/release/bundle/nsis/*.exe`
+- Windows：可执行文件 `src-tauri/target/release/zcode-speed-panel.exe`，安装包 `src-tauri/target/release/bundle/nsis/*.exe`
+- macOS：`src-tauri/target/release/bundle/macos/zcode-speed-panel.app` 与 `src-tauri/target/release/bundle/dmg/*.dmg`（交叉构建时在 `src-tauri/target/aarch64-apple-darwin/release/bundle/` 下）
 
 调试工具（不走 UI，直接打印引擎对真实数据的计算结果，含 IO 实测可用性）：
 
@@ -146,7 +167,7 @@ cd src-tauri && cargo test
 
 ### 自动构建与发布（GitHub Actions）
 
-普通推送**不会**触发构建。两种出包方式：打 `v*` 标签（如 `git tag v0.2.0 && git push --tags`）会自动创建 [Release](https://github.com/Masterchiefm/zcode-speed-panel/releases)，Assets 附**安装版**（`_x64-setup.exe`）与**免安装版**（`_x64-portable.exe`）两个文件；或在 [Actions](https://github.com/Masterchiefm/zcode-speed-panel/actions) 页选择 Build → **Run workflow**（选 `main` 分支）手动触发，产物在本次运行的 Artifacts（`windows`，含两个 exe）。配置见 [`.github/workflows/build.yml`](.github/workflows/build.yml)。
+普通推送**不会**触发构建。两种出包方式：打 `v*` 标签（如 `git tag v0.2.0 && git push --tags`）会自动创建 [Release](https://github.com/Masterchiefm/zcode-speed-panel/releases)，Assets 附 **Windows 安装版**（`_x64-setup.exe`）、**免安装版**（`_x64-portable.exe`）与 **macOS 双架构 dmg**（`_x64.dmg` = Intel、`_aarch64.dmg` = Apple Silicon，未签名公证，首次打开见上方绕过指引）；或在 [Actions](https://github.com/Masterchiefm/zcode-speed-panel/actions) 页选择 Build → **Run workflow**（选 `main` 分支）手动触发，产物在本次运行的 Artifacts（`windows` 含两个 exe；`macos-x86_64-apple-darwin` / `macos-aarch64-apple-darwin` 各含一个 dmg）。mac 包最低系统版本：x64 = 10.15、aarch64 = 11.0。配置见 [`.github/workflows/build.yml`](.github/workflows/build.yml)。
 
 ## 浏览器预览
 

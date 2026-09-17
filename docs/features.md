@@ -12,6 +12,22 @@
 ## 实时速度（liveio.rs）
 
 - 30s 滑窗 ∩ 活跃段的清洗管道字节率 ÷ 自校准系数（字节→token）。
+- **平台原语**（`liveio::platform`，按 cfg 三份实现：win / mac / stub，examples 复用同一路径）：
+  - **Windows**：Toolhelp32 枚举 + `zcode.exe` 命令行含 `zcode.cjs` 过滤；`GetProcessIoCounters` 的 `WriteTransferCount` 累计写字节；tracked 文件（rollout/日志/WAL）总量扫描供落盘扣除。
+  - **macOS**：`proc_listallpids` 枚举 + `KERN_PROCARGS2` 命令行参数精确匹配 `zcode-cli`（CLI 由 Electron Helper fork 而来，可执行路径与其他 Helper 相同，proc_pidpath 无法区分，实测 CLI 进程参数区有独立的 `zcode-cli` 串）；`proc_pid_rusage(RUSAGE_INFO_V4)` 的 `ri_diskio_byteswritten` 累计磁盘写字节，句柄持有打开时抓取的 `ri_proc_start_abstime` 防 pid 复用（不一致视为进程退出剔除）；**不做 tracked 文件扣除**——实测 rollout 目录 du 净变化可为负（CLI 清理轮转），负增量会反噬清洗流，且恒 0 免去每拍目录扫描。rusage_info_v4 为逐字段 `#[repr(C)]` 镜像，关键字段偏移（start_abstime=80、diskio_byteswritten=152）用 `offset_of!` 编译期断言钉死，SDK 布局变化直接编译失败。
+  - **其他平台**：stub（空列表/None），面板回退窗口/估算显示。
+- **CleanParams 平台参数表**（清洗/校准参数化，`CleanParams::platform()` 启动时锁定；Windows 列为长期实测原值禁改，mac 列为 120s 探针实测初值**须实测复核**）：
+
+  | 参数 | Windows | macOS | 原因 |
+  |---|---|---|---|
+  | burst_tick_bytes（突发剔除） | 100_000 | u64::MAX（禁用） | mac 流式即单拍突发（225KB~1.5MB 常态），100KB 阈值会丢弃全部信号 |
+  | base_noise_bps（静态底噪） | 3_000 | 0 | mac idle 实测 17s 严格 0 字节 |
+  | floor_cap_bytes（自适应底噪封顶） | 2_000 | 2_000 | 封顶只防毒化；mac idle 恒 0 时自适应自行降 0 |
+  | default_bpt（系数先验） | 600 | 2_000 | mac 实测 ≈3900 B/token，取偏保守值 |
+  | cal_min / cal_max（样本区间） | 100 / 6_000 | 100 / 12_000 | 覆盖 3900 留余量 |
+  | cal_min_tokens（样本门槛） | 300 | 300 | 平台无关 |
+  | detect_ms（锚点探测窗） | 2_500 | 2_500 | 首版不动；mac 若状态抖动再调 5_000 |
+
 - **启停门控**：usage 库 message 表的 assistant 消息行——调用开始瞬间提交（≤200ms 可读），行内 `time.completed` 在结束（**含取消/出错**）瞬间补写。扫描最近活跃会话（`session.time_updated` 倒序前 6 个，各自走 `(session_id, time_created)` 复合索引取最新 assistant 行）的最新 assistant 行：未带 `completed` 且 10 分钟内 → 进行中（**不限会话**，新开对话首个调用当拍即亮）；带 `completed` → 当拍归零。已归属会话的 CLI 进程退出时强制判停（崩溃后无人补写 `completed` 的僵尸行兜底）。
 - **启动提示（is_starting）**：门控已开但首字节未到（TTFT，20s 窗口内）→ 表盘/迷你仪表/胶囊/桌宠气泡显示 **"…"**（青色呼吸脉冲弧），不显示估算值；超窗仍无字节 → 视为管道静默调用，回退 ≈ 估算。
 - 状态来源 `live_source`：`io`（实测流式）→ `window`（门控判定生成中但管道静默，显示近期已完成调用的真实速度，前端加 ≈ 标记）→ `idle`（归零）。
@@ -37,10 +53,15 @@
 
 ## 窗口与托盘
 
-- **无边框窗口**（`decorations:false`）+ 自绘顶栏（左侧为应用图标 `app-icon.png`）：`#app-header` 带原生 `data-tauri-drag-region`，空白处拖动由内核处理，子元素经 enableDrag 冒泡拖动（二者互斥，按钮/输入/`.dropdown` 不参与）；双击顶栏最大化/还原。
+- **无边框窗口**（`decorations:false`，透明窗口在 mac 走 `macos-private-api` + `macOSPrivateApi`）+ 自绘顶栏（左侧为应用图标 `app-icon.png`）：`#app-header` 带原生 `data-tauri-drag-region`，空白处拖动由内核处理，子元素经 enableDrag 冒泡拖动（二者互斥，按钮/输入/`.dropdown` 不参与）；双击顶栏最大化/还原。
 - 顶栏控制：**— 最小化**（`core:window:allow-minimize`）、**▢ 最大化/还原**（`allow-toggle-maximize`）、**✕ = 收起为悬浮窗**（不是退出；完全退出走托盘菜单或悬浮窗右键菜单）。
-- 托盘：左键单击显示/隐藏；右键菜单（显示面板 / 隐藏到托盘 / 悬浮窗切换 / 退出）。重复启动唤起已有窗口（single-instance 插件）。
+- 托盘：左键单击显示/隐藏；右键菜单**顶部为实时状态行**（disabled 不可点，poller 每拍按快照更新：生成中 `x.x t/s` / 估算中 `≈x.x t/s` / 待机；文本变化才写入，托盘 tooltip 同步为 `ZCode 速度仪表盘 · 状态`），其后是菜单项（显示面板 / 隐藏到托盘 / 悬浮窗切换 / 退出）。重复启动唤起已有窗口（single-instance 插件）。
 - 窗口标题实时同步当前速度（任务栏/Alt+Tab 可见）。
+- **mac 差异**：
+  - 应用为 **Accessory 模式**（`set_activation_policy`，setup 内尽早调用）：无 Dock 图标、不进 Cmd+Tab，常驻菜单栏托盘。
+  - 自定义应用菜单：`Cmd+Q` 被拦截为"隐藏为悬浮窗"（菜单中**不含任何系统退出项**，保证退出只走托盘与悬浮窗右键）；附"编辑" submenu（cut/copy/paste/select_all）保住 WebView 的 Cmd+C/V/X/A。
+  - 退出兜底：`RunEvent::ExitRequested { code: None }` 一律 `prevent_exit` + 保存 + 折叠为悬浮窗（真退出 `app.exit(0)` 时 code=Some 放行，`RunEvent::Exit` 再保存一次）。**真退出只有托盘菜单"退出"与悬浮窗右键"退出程序"两条路**。
+  - **引导提示**：前端右上角显示"应用常驻菜单栏 ↗ 点菜单栏图标可显示面板 / 退出"（深色半透明、顶部小箭头指向菜单栏），6 秒自动淡出、点击立即关闭；**仅完整面板模式显示**（悬浮窗/桌宠窗口过小会被裁剪，CSS 按 `body.float-mode` 门控）。触发时机两条：① 启动——setup 阶段早于 WKWebView 加载、emit 发即被弃，改为前端初始化完成后 `invoke("tray_hint_once")` 领取一次性标志（AppState 的 `tray_hint_pending`，mac 初始 true、领取即清零，非 mac 恒 false）；② 托盘"显示面板"/左键 toggle 唤起隐藏窗口（`show_main`，页面已就绪，直接 emit `tray-hint`）。Windows 两条路径都不触发，前端永不显示。
 
 ## 日志系统（main.rs DebugLog）
 
@@ -56,8 +77,9 @@
 
 ## CI 与发布
 
-- `.github/workflows/build.yml`：**不随普通推送自动触发**；`v*` 标签 → 自动创建 GitHub Release，Assets 附安装版（`_x64-setup.exe`）与免安装版（`_x64-portable.exe`，主程序 exe 直接改名）两个文件；`workflow_dispatch` → Actions 页手动触发，产物在本次运行的 Artifacts（`windows`，含两个 exe）。
-- 本地正式版：`npm run tauri build` → `src-tauri/target/release/bundle/nsis/*.exe`。
+- `.github/workflows/build.yml`：**不随普通推送自动触发**；`v*` 标签 → 自动创建 GitHub Release，Assets 附 Windows 安装版（`_x64-setup.exe`）、免安装版（`_x64-portable.exe`，主程序 exe 直接改名）与 macOS 双架构 dmg（`_x64.dmg` = Intel 10.15+、`_aarch64.dmg` = Apple Silicon 11+，独立包不做 universal，未签名公证见 README 绕过指引）；`workflow_dispatch` → Actions 页手动触发，产物在本次运行的 Artifacts（`windows` 含两个 exe；`macos-x86_64-apple-darwin` / `macos-aarch64-apple-darwin` 各含一个 dmg）。
+- **build-macos job**：`runs-on: macos-15`，matrix 双目标（`x86_64-apple-darwin` + `MACOSX_DEPLOYMENT_TARGET=10.15`、`aarch64-apple-darwin` + `11.0`），tauri-action `--bundles dmg`；最低系统版本双重注入——环境变量决定二进制 `LC_BUILD_VERSION`，`--config '{"bundle":{"macOS":{"minimumSystemVersion":"…"}}}'` 决定 Info.plist 的 `LSMinimumSystemVersion`（plist 只认 config，缺省恒 10.13，不读环境变量）。产物名 `zcode-speed-panel_版本_x64.dmg` / `_aarch64.dmg` 由 tauri 默认命名，恰好满足双独立包要求。
+- 本地正式版：`npm run tauri build` → Windows `src-tauri/target/release/bundle/nsis/*.exe`；macOS `bundle/dmg/*.dmg`（交叉构建 aarch64 见 README 开发章节）。
 
 ## 已知边界情况
 
@@ -65,3 +87,4 @@
 - 多调用并发（子 agent）时实时优先统计**进行中调用的会话**对应进程（尚无归属时为全进程求和，无进行中调用时退回最近完成调用的会话）。
 - 冷启动后系数需 1~2 个达标调用收敛，此前读数可能有偏差。
 - 硬崩溃（CLI 进程被杀、assistant 行无人补写 `completed`）最多残留 10 分钟门控（兜底上限）；已归属会话的进程退出会被进程守卫立即判停，未归属的新会话只能等兜底。
+- mac 的 CleanParams（burst 禁用/无静态底噪/系数先验 2000）为探针实测初值，未经过 Windows 侧同等长度的真值对账回归；读数异常时先跑 `python scripts/live_vs_true.py` 对账再调参（key-rules #10）。
