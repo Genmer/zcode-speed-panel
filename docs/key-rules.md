@@ -68,3 +68,9 @@
 - **FFI 偏移错位用 offset_of! 编译期断言防**：`proc_pid_rusage` 的 `rusage_info_v4` 结构镜像必须逐字段对照 SDK `sys/resource.h`，且用 `offset_of!` 断言 `ri_proc_start_abstime`=80、`ri_diskio_byteswritten`=152（新内核布局在 start_abstime 后多了 `ri_proc_exit_abstime`，老布局记忆是 144——就是这个坑）。断言不过必须修结构排布，**禁止删断言**；另 `#[link(name = "proc")]`（库文件是 libproc.dylib，链接名不带 lib 前缀，写 "libproc" 会 `ld: library not found for -llibproc`）。
 - **mac 的磁盘写字节是页缓存异步落盘计数，校准必须延迟宽限**：`ri_diskio_byteswritten` 统计的是脏页实际写盘的字节，滞后 `write()` 数秒~数十秒。2026-09-17 真值对账（6 条 cal 事件，归因正确时 pred_tps 与 true_tps 完全一致 62.1=62.1）的三条证据：① 34s 调用 [start, completed] 窗口只积分到一半字节，样本 186 偏低入队污染中位数；② 1s 小调用里凭空多出 750KB——上一条调用的脏页这时才落盘；③ 117s 长调用 96% 字节没落进窗口，用户盯着 0.7 t/s 两分钟而真值 65.3。守护：`CleanParams.cal_grace_ms`（mac 15s / Windows 0 当拍处理）——pending 校准等满宽限再积分，校准积分与 raw 统计窗口上限延长到 completed+grace（分子分母同口径，pred 分母仍用真实 gen_ms）；`cal_outlier_ratio`（mac 3 倍 / Windows 0 禁用）拒收与生效系数偏差超倍的半截样本；CalEvent 记录 `attr_pid`/`top_pid` 供归因异常定位（多进程并发下偶发 clean≪raw 时看两者是否错位）。同源教训：mac 系数先验曾按 120s 探针取 2000（误判 ≈3900 B/token），真值对账实为 ~650（接受样本 614/724），冷启动 3 倍低估——现为 700。
 - **Dock/Cmd+Tab 与退出的上游限制**：Tauri/macOS 上无边框窗口应用保留 Dock 图标，`hide()` 也无法把 Accessory 应用完全"藏起来"；本项目采用 **Accessory 模式**（`set_activation_policy`，setup 内尽早调用）+ 自定义菜单拦截 `Cmd+Q`（菜单不含任何 `PredefinedMenuItem::quit`）+ `RunEvent::ExitRequested { code: None }` 兜底 `prevent_exit`。三条防线合起来才保证"真退出只有托盘退出与悬浮窗右键退出两条路"——只做其中一两条，用户仍可能从系统菜单/快捷键把应用退掉，之后菜单栏入口消失、体验等于"应用丢了"。
+
+## 11. SQLite WAL 锁与长期运行防抖设计
+
+- **busy_timeout 与只读优化**：Engine 打开 `db.sqlite` 必须开启 `OpenFlags::SQLITE_OPEN_NO_MUTEX`，且连接初始化时必须设置 `busy_timeout(3000ms)` 并开启 `PRAGMA query_only = ON;`。否则当 ZCode CLI 高频写事务或 checkpoint 时，读连接会立即报 `database is locked (SQLITE_BUSY)` 丢当拍。
+- **进程扫描 buffer 零分配**：macOS 的 `KERN_PROCARGS2` 必须复用 scratch buffer（64KB），禁止在 PID 循环中分配，避免每轮刷新引发 64MB 堆分配毛刺。
+- **session_pid 随进程存活淘汰**：liveio 维护的会话-PID 映射在进程轮询检测退出时必须调用 `session_pid.retain` 清理，防止多会话长时间运行累积脏数据与 PID 复用误归因。

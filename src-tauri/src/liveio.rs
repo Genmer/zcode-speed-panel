@@ -681,8 +681,9 @@ pub mod platform {
                 if m <= 0 {
                     return pids;
                 }
+                let mut scratch = vec![0u8; 64 * 1024];
                 for pid in &buf[..m as usize] {
-                    if *pid > 0 && argv_has_cli_marker(*pid as u32) {
+                    if *pid > 0 && argv_has_cli_marker(*pid as u32, &mut scratch) {
                         pids.push(*pid as u32);
                     }
                 }
@@ -697,9 +698,8 @@ pub mod platform {
         /// "zcode-cli" 串；envp 串均为 KEY=VALUE 形式不会撞名；与 Windows
         /// 侧"命令行含 zcode.cjs"同宽口径）。64KB 覆盖常规进程；
         /// 解析失败/权限不足一律视为不匹配（不 panic）
-        fn argv_has_cli_marker(pid: u32) -> bool {
+        fn argv_has_cli_marker(pid: u32, buf: &mut [u8]) -> bool {
             let mib = [CTL_KERN, KERN_PROCARGS2, pid as c_int];
-            let mut buf = vec![0u8; 64 * 1024];
             let mut len = buf.len();
             let ok = unsafe {
                 sysctl(
@@ -928,6 +928,12 @@ impl LiveIo {
                 None => false, // 进程已退出
             }
         });
+        // 同步清理失效 PID 对应的 session 映射，防止内存泄漏和 PID 复用脏归因
+        let active_pids: HashSet<u32> = self.procs.keys().copied().collect();
+        self.session_pid.retain(|_, pid| active_pids.contains(pid));
+        if self.session_pid.len() > 200 {
+            self.session_pid.clear();
+        }
         let ft = platform::tracked_files_total();
         self.files_hist.push_back((now_ms, ft));
         while self.files_hist.len() > RING_CAP {
