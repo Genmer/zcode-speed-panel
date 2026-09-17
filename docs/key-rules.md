@@ -74,3 +74,8 @@
 - **busy_timeout 与只读优化**：Engine 打开 `db.sqlite` 必须开启 `OpenFlags::SQLITE_OPEN_NO_MUTEX`，且连接初始化时必须设置 `busy_timeout(3000ms)` 并开启 `PRAGMA query_only = ON;`。否则当 ZCode CLI 高频写事务或 checkpoint 时，读连接会立即报 `database is locked (SQLITE_BUSY)` 丢当拍。
 - **进程扫描 buffer 零分配**：macOS 的 `KERN_PROCARGS2` 必须复用 scratch buffer（64KB），禁止在 PID 循环中分配，避免每轮刷新引发 64MB 堆分配毛刺。
 - **session_pid 随进程存活淘汰**：liveio 维护的会话-PID 映射在进程轮询检测退出时必须调用 `session_pid.retain` 清理，防止多会话长时间运行累积脏数据与 PID 复用误归因。
+
+## 12. 窗口控制平台原生化与多屏安全最大化（macOS 副屏防跳屏）
+
+- **外观原生化**：macOS 标志性的红黄绿交通灯位于顶栏最左侧（左起：红 `#ff5f56` 折叠悬浮窗、黄 `#ffbd2e` 最小化、绿 `#27c93f` 最大化），悬停显现微小符号（`✕`、`—`、`▢`）；Windows 环境保持右侧 `— ▢ ✕` 自绘按钮不变。前端通过 `navigator.userAgent.includes("Mac")` 为 `body` 注入 `platform-mac` class。
+- **副屏最大化防跳屏（`toggle_maximize_safe`）**：无边框窗口（`decorations:false`）在 macOS 下直接调用系统 `toggleMaximize()` 会因为系统 `zoom:` 动作强行跳回主屏。解决方式为 Rust 端 `toggle_maximize_safe`：取窗口中心点所在显示器（`monitor_from_point`），按该显示器物理尺寸铺满（预留顶部系统菜单栏 28pt 避让高度 `(28.0 * scale) as i32`），并在 `AppState.saved_max_rect` 暂存最大化前的物理矩形；再次触发或双击顶栏时还原；在切换到悬浮窗（`switch_mode(Mode::Float)`）时清空暂存，保证状态干净。

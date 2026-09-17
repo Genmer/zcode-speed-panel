@@ -56,8 +56,12 @@
 
 ## 窗口与托盘
 
-- **无边框窗口**（`decorations:false`，透明窗口在 mac 走 `macos-private-api` + `macOSPrivateApi`）+ 自绘顶栏（左侧为应用图标 `app-icon.png`）：`#app-header` 带原生 `data-tauri-drag-region`，空白处拖动由内核处理，子元素经 enableDrag 冒泡拖动（二者互斥，按钮/输入/`.dropdown` 不参与）；双击顶栏最大化/还原。
-- 顶栏控制：**— 最小化**（`core:window:allow-minimize`）、**▢ 最大化/还原**（`allow-toggle-maximize`）、**✕ = 收起为悬浮窗**（不是退出；完全退出走托盘菜单或悬浮窗右键菜单）。
+- **无边框窗口**（`decorations:false`，透明窗口在 mac 走 `macos-private-api` + `macOSPrivateApi`）+ 自绘顶栏（应用图标 `app-icon.png`）：`#app-header` 带原生 `data-tauri-drag-region`，空白处拖动由内核处理，子元素经 enableDrag 冒泡拖动（二者互斥，按钮/输入/`.dropdown` 不参与）；双击顶栏安全最大化/还原。
+- 顶栏控制平台原生化：
+  - **macOS**：控制按钮移至顶栏最左侧，为原生交通灯圆点（左起依次为：红 `#ff5f56` 收起为悬浮窗、黄 `#ffbd2e` 最小化、绿 `#27c93f` 安全最大化），平时半透明纯色圆点，鼠标悬停控制区时显现微小符号（`✕`、`—`、`▢`）；
+  - **Windows**：保持顶栏最右侧自绘 `— 最小化`、`▢ 最大化`、`✕ 收起为悬浮窗` 风格不变。
+  - 完全退出走托盘菜单或悬浮窗右键菜单。
+- **多屏安全最大化（`toggle_maximize_safe`）**：macOS 无边框窗口调用系统 `toggleMaximize()` 会触发系统 `zoom:` 回退到主屏跳屏。后端通过 `toggle_maximize_safe` 计算窗口中心点所在显示器（`monitor_from_point`）铺满（避让顶部菜单栏 28pt），并记忆还原物理矩形；再次调用或双击顶栏安全还原至原副屏位置和尺寸；折叠为悬浮窗时清理暂存。
 - 托盘：左键单击显示/隐藏；右键菜单**顶部为实时状态行**（disabled 不可点，poller 每拍按快照更新：生成中 `x.x t/s` / 估算中 `≈x.x t/s` / 待机；文本变化才写入，托盘 tooltip 同步为 `ZCode 速度仪表盘 · 状态`），其后是菜单项（显示面板 / 隐藏到托盘 / 悬浮窗切换 / 退出）。重复启动唤起已有窗口（single-instance 插件）。
 - 窗口标题实时同步当前速度（任务栏/Alt+Tab 可见）。
 - **mac 差异**：

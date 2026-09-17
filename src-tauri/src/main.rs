@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, WindowEvent};
+use tauri::{AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, PhysicalSize, WindowEvent};
 
 /// 窗口显示模式：完整面板 / 悬浮窗
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -95,6 +95,8 @@ struct AppState {
     /// mac 启动引导提示是否待领取（一次性）：setup 在事件循环前执行，
     /// 此时 emit 必然早于页面加载被丢弃，改为前端就绪后 invoke 领取
     tray_hint_pending: Mutex<bool>,
+    /// macOS 无边框多屏安全最大化记忆：(还原物理坐标, 还原物理尺寸)
+    saved_max_rect: Mutex<Option<(PhysicalPosition<i32>, PhysicalSize<u32>)>>,
 }
 
 /// 调试日志：记录实时显示值、统计值与每轮调用完成后的真值，
@@ -291,6 +293,9 @@ fn switch_mode(app: &AppHandle, mode: Mode) {
     let state = app.state::<AppState>();
     let style = *state.style.lock().unwrap();
     let prev = *state.mode.lock().unwrap();
+    if mode == Mode::Float {
+        *state.saved_max_rect.lock().unwrap() = None;
+    }
     // 记住旧模式下窗口的位置（两种模式各自独立记忆）
     if let Some(win) = app.get_webview_window("main") {
         if let Ok(pos) = win.outer_position() {
@@ -572,6 +577,68 @@ fn tray_hint_once(app: AppHandle) -> bool {
     pending
 }
 
+fn toggle_window_maximize(window: &tauri::WebviewWindow) {
+    if window.is_maximized().unwrap_or(false) {
+        let _ = window.unmaximize();
+    } else {
+        let _ = window.maximize();
+    }
+}
+
+/// 多屏安全最大化/还原：macOS 无边框窗口原生 toggle_maximize 会跳回主屏，
+/// 此处按窗口中心点所在显示器铺满（避让菜单栏）；Windows 直接调用系统最大化
+#[tauri::command]
+fn toggle_maximize_safe(window: tauri::WebviewWindow, state: tauri::State<'_, AppState>) {
+    #[cfg(windows)]
+    {
+        toggle_window_maximize(&window);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut saved = state.saved_max_rect.lock().unwrap();
+        if let Some((pos, size)) = saved.take() {
+            // 已最大化，执行还原
+            let _ = window.set_size(size);
+            let _ = window.set_position(pos);
+        } else {
+            // 未最大化，执行安全最大化
+            let cur_pos = window.outer_position().unwrap_or_default();
+            let cur_size = window.outer_size().unwrap_or_default();
+            *saved = Some((cur_pos, cur_size));
+
+            let cx = cur_pos.x + cur_size.width as i32 / 2;
+            let cy = cur_pos.y + cur_size.height as i32 / 2;
+            let monitor = window
+                .monitor_from_point(cx as f64, cy as f64)
+                .ok()
+                .flatten()
+                .or_else(|| window.current_monitor().ok().flatten())
+                .or_else(|| window.primary_monitor().ok().flatten());
+
+            if let Some(m) = monitor {
+                let scale = m.scale_factor();
+                let mp = m.position();
+                let ms = m.size();
+                // 避让 macOS 顶部菜单栏高度约 28pt
+                let top_margin = (28.0 * scale) as i32;
+                let target_x = mp.x;
+                let target_y = mp.y + top_margin;
+                let target_w = ms.width;
+                let target_h = ms.height.saturating_sub(top_margin as u32);
+
+                let _ = window.set_position(PhysicalPosition::new(target_x, target_y));
+                let _ = window.set_size(PhysicalSize::new(target_w, target_h));
+            } else {
+                toggle_window_maximize(&window);
+            }
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        toggle_window_maximize(&window);
+    }
+}
+
 fn show_main(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         // mac：窗口从隐藏→显示时提示"应用常驻菜单栏"（无 Dock 图标，用户
@@ -688,6 +755,7 @@ fn main() {
             tray_status: Mutex::new(None),
             tray_status_last: Mutex::new(String::new()),
             tray_hint_pending: Mutex::new(cfg!(target_os = "macos")),
+            saved_max_rect: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             snapshot,
@@ -695,7 +763,8 @@ fn main() {
             set_float_style,
             set_float_size,
             quit_app,
-            tray_hint_once
+            tray_hint_once,
+            toggle_maximize_safe
         ])
         .setup(|app| {
             // mac：Accessory 模式——无 Dock 图标、不进 Cmd+Tab，常驻菜单栏托盘；

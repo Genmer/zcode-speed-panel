@@ -19,6 +19,11 @@ const $ = <T extends HTMLElement>(id: string): T => {
 
 const hasTauri = typeof (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ !== "undefined";
 
+const isMac = navigator.userAgent.includes("Mac");
+if (isMac) {
+  document.body.classList.add("platform-mac");
+}
+
 async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T | undefined> {
   if (!hasTauri) return undefined;
   const { invoke } = await import("@tauri-apps/api/core");
@@ -315,14 +320,14 @@ enableDrag($("float-pet"));
 const currentWindow = () => import("@tauri-apps/api/window").then((m) => m.getCurrentWindow());
 $("app-header").addEventListener("dblclick", (e) => {
   if ((e.target as HTMLElement).closest("button, select, input, .dropdown")) return;
-  if (hasTauri) currentWindow().then((w) => w.toggleMaximize()).catch(() => {});
+  if (hasTauri) tauriInvoke("toggle_maximize_safe").catch(() => {});
 });
 if (hasTauri) {
   $("wc-min").addEventListener("click", () => {
     currentWindow().then((w) => w.minimize()).catch(() => {});
   });
   $("wc-max").addEventListener("click", () => {
-    currentWindow().then((w) => w.toggleMaximize()).catch(() => {});
+    tauriInvoke("toggle_maximize_safe").catch(() => {});
   });
   $("wc-close").addEventListener("click", () => requestMode("float"));
 } else {
