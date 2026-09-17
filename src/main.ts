@@ -292,9 +292,9 @@ const btnRecal = $<HTMLButtonElement>("btn-recal");
 if (!hasTauri) btnRecal.style.display = "none"; // 浏览器预览无真实校准
 let recalTimer = 0;
 const flashRecal = () => {
-  btnRecal.textContent = "✓";
+  btnRecal.classList.add("done");
   window.clearTimeout(recalTimer);
-  recalTimer = window.setTimeout(() => (btnRecal.textContent = "⟳"), 1500);
+  recalTimer = window.setTimeout(() => btnRecal.classList.remove("done"), 1500);
 };
 btnRecal.addEventListener("click", () => {
   tauriInvoke("recalibrate").catch((err) => console.warn("recalibrate 失败:", err));

@@ -46,7 +46,13 @@
               type="button"
               aria-label="重新校准"
               title="重新校准：丢弃已学习的字节→token 系数样本，回到默认先验由后续调用重新收敛（换模型后实时读数异常时用；轮均速突变 3 倍以上会自动触发）"
-            >⟳</button>
+            >
+              <!-- 图标用内联 SVG：⟳ 一类符号字形在字体里墨迹相对字宽偏心，文字渲染无法可靠居中 -->
+              <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="currentColor">
+                <path class="recal-refresh" d="M17.65 6.35A7.96 7.96 0 0 0 12 4c-4.42 0-7.99 3.58-8 8s3.57 8 8 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0 1 12 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/>
+                <path class="recal-done" d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
+              </svg>
+            </button>
             <canvas id="g-current"></canvas>
             <canvas
               id="g-last"

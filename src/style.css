@@ -179,9 +179,9 @@ main {
   height: 56px;
 }
 
-/* 当前速度卡右下结构：左上角"重新校准"图标按钮（与右上角"上轮"角标呼应）。
-   图标钮宽度收窄，避免压住画布顶部居中的表名文字（最小窗口宽 720 时
-   表名左缘约 62px） */
+/* 当前速度卡左上角"重新校准"图标按钮（与右上角"上轮"角标呼应；宽度收窄，
+   避免压住画布顶部居中的表名文字，最小窗口宽 720 时表名左缘约 62px）。
+   图标为内联 SVG 精确居中——⟳ 一类符号字形在字体里墨迹相对字宽偏心 */
 .recal-btn {
   position: absolute;
   top: 8px;
@@ -191,9 +191,30 @@ main {
   padding: 0;
   display: grid;
   place-items: center;
-  font-size: 14px;
-  line-height: 1;
   z-index: 2;
+}
+
+.recal-btn svg {
+  display: block;
+}
+
+/* 重校准完成反馈：⟳ 换成绿色 ✓（main.ts flashRecal 切 done 类），1.5s 后复原 */
+.recal-btn .recal-done {
+  display: none;
+}
+
+.recal-btn.done .recal-refresh {
+  display: none;
+}
+
+.recal-btn.done .recal-done {
+  display: block;
+}
+
+.recal-btn.done,
+.recal-btn.done:hover {
+  color: var(--emerald);
+  border-color: rgba(52, 211, 153, 0.4);
 }
 
 .sub {
