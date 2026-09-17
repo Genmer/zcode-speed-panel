@@ -40,6 +40,13 @@
       <main>
         <section class="cards">
           <div class="card gauge-card">
+            <button
+              id="btn-recal"
+              class="ghost-btn recal-btn"
+              type="button"
+              aria-label="重新校准"
+              title="重新校准：丢弃已学习的字节→token 系数样本，回到默认先验由后续调用重新收敛（换模型后实时读数异常时用；轮均速突变 3 倍以上会自动触发）"
+            >⟳</button>
             <canvas id="g-current"></canvas>
             <canvas
               id="g-last"

@@ -61,6 +61,11 @@ const CAL_MIN: f64 = 100.0;
 const CAL_MAX: f64 = 6_000.0;
 /// 校准样本的调用规模下限：小调用的 UI 固定帧开销占比大，禁止入样本
 const CAL_MIN_TOKENS: u64 = 300;
+/// 轮均速漂移自动重校准：一轮 = 门控"进行中"信号连续的一段，轮内显示速度
+/// （io 实测拍）取算术平均；上轮均值与之前连续 DRIFT_ROUNDS 轮的均值差异
+/// ≥ DRIFT_RATIO 倍（双向）判定量级突变（换模型/分词器，旧系数大概率过期）
+const DRIFT_ROUNDS: usize = 5;
+const DRIFT_RATIO: f64 = 3.0;
 
 /// 清洗/校准参数（平台参数化）。Windows 列为长期实测调优值（上方原常量，
 /// 禁改）；macOS 列基于 120s 探针 + 2026-09-17 真值对账（6 条 cal 事件，
@@ -320,6 +325,49 @@ pub(crate) fn awaiting_hint(
     match (inflight_started, anchor) {
         (Some(started), None) => now_ms - started <= TTFT_HINT_MS,
         _ => false,
+    }
+}
+
+/// 轮均速漂移检测（纯函数便于测试）：逐轮喂入显示速度均值，与之前连续
+/// DRIFT_ROUNDS 轮的均值比较，双向差异 ≥ DRIFT_RATIO 倍即判定速度量级突变，
+/// 应触发重新校准（`LiveIo::reset_calibration`）。触发后清空历史，
+/// 新量级重新积累基线，避免同一突变反复触发
+#[derive(Default)]
+pub struct RoundDrift {
+    history: VecDeque<f64>,
+}
+
+impl RoundDrift {
+    pub fn new() -> Self {
+        Self {
+            history: VecDeque::with_capacity(DRIFT_ROUNDS),
+        }
+    }
+
+    /// 观测一轮的显示均值。返回 Some(基线均值) = 触发重校准（基线供日志）；
+    /// 均值 ≤0 的轮（管道静默、无实测拍）不参与也不入历史
+    pub fn observe(&mut self, round_avg: f64) -> Option<f64> {
+        if round_avg <= 0.0 {
+            return None;
+        }
+        let base = (self.history.len() == DRIFT_ROUNDS)
+            .then(|| self.history.iter().sum::<f64>() / DRIFT_ROUNDS as f64);
+        if let Some(b) = base {
+            if round_avg / b >= DRIFT_RATIO || b / round_avg >= DRIFT_RATIO {
+                self.history.clear();
+                return Some(b);
+            }
+        }
+        self.history.push_back(round_avg);
+        while self.history.len() > DRIFT_ROUNDS {
+            self.history.pop_front();
+        }
+        None
+    }
+
+    /// 清空历史（手动重校准后同步复位，新基线从零积累）
+    pub fn reset(&mut self) {
+        self.history.clear();
     }
 }
 
@@ -886,6 +934,17 @@ impl LiveIo {
         self.pending_cal.take()
     }
 
+    /// 重新校准（当前速度卡手动按钮 / 轮均速漂移自动触发）：丢弃已学习的
+    /// 系数样本，回到平台先验的冷启动状态（先验占位防单样本独占），由后续
+    /// 完成调用的样本重新收敛。pending 调用保留——会话→进程归属仍需处理，
+    /// 其携带的旧量级样本在滑动窗口下 1~2 轮即被新样本挤出。返回重置后系数
+    pub fn reset_calibration(&mut self) -> f64 {
+        self.cal.clear();
+        self.cal.push_back(self.params.default_bpt);
+        self.bytes_per_token = self.params.default_bpt;
+        self.bytes_per_token
+    }
+
     /// 每个轮询周期调用一次。now_ms 为墙钟毫秒（与 Engine 快照同源）
     pub fn measure(&mut self, now_ms: i64) -> LiveNow {
         let now = Instant::now();
@@ -1269,6 +1328,82 @@ mod tests {
         // 无进行中调用 → 不提示
         assert!(!awaiting_hint(None, None, 5_000));
         assert!(!awaiting_hint(None, Some(1_000), 5_000));
+    }
+
+    /// 轮均速漂移：上轮均值 vs 之前连续 5 轮均值，双向 ≥3 倍触发重校准
+    #[test]
+    fn round_drift_triggers_on_threefold_jump() {
+        let mut d = RoundDrift::new();
+        for v in [40.0, 42.0, 38.0, 41.0, 39.0] {
+            assert!(d.observe(v).is_none(), "基线积累期不应触发");
+        }
+        // 上轮 120 = 基线均值 40 的整 3 倍 → 触发，返回基线供日志
+        let base = d.observe(120.0).expect("3 倍上跳应触发");
+        assert!((base - 40.0).abs() < 1e-9);
+        // 触发后历史清空：同量级下一轮不再触发
+        assert!(d.observe(120.0).is_none());
+    }
+
+    #[test]
+    fn round_drift_needs_five_round_history() {
+        let mut d = RoundDrift::new();
+        for _ in 0..4 {
+            assert!(d.observe(40.0).is_none());
+        }
+        // 历史不足 5 轮：再极端的上跳也不触发，该轮照常入历史
+        assert!(d.observe(4_000.0).is_none());
+        // 凑满 5 轮后，混合基线（4×40 + 4000 = 832）与旧量级 40 差异仍超 3 倍
+        assert!(d.observe(40.0).is_some());
+    }
+
+    /// 反向（换更快模型后回看，或快→慢）：基线 90 vs 上轮 30 = 1/3 → 同样触发
+    #[test]
+    fn round_drift_downward_jump_triggers() {
+        let mut d = RoundDrift::new();
+        for _ in 0..5 {
+            assert!(d.observe(90.0).is_none());
+        }
+        assert!(d.observe(30.0).is_some());
+    }
+
+    /// 2.5 倍以内的正常波动不触发；滑窗只保留最近 5 轮，旧量级被自然挤出
+    #[test]
+    fn round_drift_moderate_change_and_window_cap() {
+        let mut d = RoundDrift::new();
+        for _ in 0..5 {
+            assert!(d.observe(40.0).is_none());
+        }
+        assert!(d.observe(100.0).is_none(), "2.5 倍上跳不应触发");
+        for _ in 0..5 {
+            assert!(d.observe(100.0).is_none());
+        }
+        // 基线已全为 100，回跳 40 恰 2.5 倍 → 不触发
+        assert!(d.observe(40.0).is_none());
+    }
+
+    /// 无实测拍的静默轮（均值 0）不参与检测、不污染基线
+    #[test]
+    fn round_drift_ignores_zero_round() {
+        let mut d = RoundDrift::new();
+        for v in [50.0, 0.0, 50.0, 0.0, 50.0, 0.0, 50.0] {
+            assert!(d.observe(v).is_none());
+        }
+        // 4 个 50 入历史（0 全被忽略），第 5 个 50 凑满基线不触发
+        assert!(d.observe(50.0).is_none());
+        assert!(d.observe(200.0).is_some());
+    }
+
+    /// 重新校准：系数与样本队列回到平台先验（冷启动状态）
+    #[test]
+    fn reset_calibration_restores_prior() {
+        let mut io = LiveIo::new();
+        io.cal.clear();
+        io.cal.extend([420.0, 380.0, 455.0]);
+        io.bytes_per_token = 420.0;
+        let bpt = io.reset_calibration();
+        assert!((bpt - io.params.default_bpt).abs() < 1e-9);
+        assert_eq!(io.cal.len(), 1, "队列应只余先验占位");
+        assert!((io.bytes_per_token - io.params.default_bpt).abs() < 1e-9);
     }
 
     /// 样本准入用例取自真实调试日志（2026-09-17 现场）：

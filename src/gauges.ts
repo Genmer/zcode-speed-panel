@@ -48,10 +48,14 @@ export interface SpeedTier {
   color: string;
 }
 
+/** 六档覆盖到极速模型（实测部分模型远超 100 t/s）；色相沿绿→黄→红推进，320+ 品红标记极速 */
 export const SPEED_TIERS: readonly SpeedTier[] = [
-  { upTo: 30, color: "#34d399" }, // 0–30 低速 · 绿
-  { upTo: 60, color: "#fbbf24" }, // 30–60 中速 · 黄
-  { upTo: Infinity, color: "#f87171" }, // 60+ 高速 · 红
+  { upTo: 40, color: "#34d399" }, // 0–40 · 绿
+  { upTo: 80, color: "#a3e635" }, // 40–80 · 黄绿
+  { upTo: 160, color: "#fbbf24" }, // 80–160 · 黄
+  { upTo: 240, color: "#fb923c" }, // 160–240 · 橙
+  { upTo: 320, color: "#f87171" }, // 240–320 · 红
+  { upTo: Infinity, color: "#e879f9" }, // 320+ · 品红（极速）
 ];
 
 function speedTier(v: number): SpeedTier {
@@ -236,7 +240,7 @@ export class ArcGauge extends BaseGauge {
       ctx.stroke();
       ctx.restore();
     } else if (this.opts.tiers && !this.est) {
-      // 整条进度弧随当前速度所在档位整体换色：0–30 绿 / 30–60 黄 / 60+ 红
+      // 整条进度弧随当前速度所在档位整体换色（六档见 SPEED_TIERS）
       const tierColor = speedTier(this.value).color;
       ctx.save();
       ctx.shadowColor = tierColor;
@@ -376,7 +380,7 @@ export class MiniGauge extends BaseGauge {
         : this.opts.tiers && !this.est
           ? speedTier(this.value).color
           : "#e6e9f0";
-    ctx.font = `600 ${Math.round(r * 0.5)}px ${FONT}`;
+    ctx.font = `600 ${Math.round(r * 0.46)}px ${FONT}`;
     if (this.starting) ctx.globalAlpha = 0.45 + 0.55 * this.pulse();
     ctx.fillText(this.starting ? "…" : (this.est ? "≈" : "") + fmtTps(this.value), cx, cy + r * 0.12);
     ctx.globalAlpha = 1;

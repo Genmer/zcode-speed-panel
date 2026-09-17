@@ -34,10 +34,11 @@
 
 ## 6. 调试日志是排查的第一手数据
 
-`~/.zcode/speed-panel-debug.jsonl`（JSONL 追加，8MB 轮转保留一代 `.jsonl.1`，轮转旧文件超 7 天启动时自动清理）记录三类事件：
+`~/.zcode/speed-panel-debug.jsonl`（JSONL 追加，8MB 轮转保留一代 `.jsonl.1`，轮转旧文件超 7 天启动时自动清理）记录四类事件：
 - `tick`：显示值 `tps`、来源 `src`（io/window/idle）、启动期 `start`、清洗管道字节率 `pipe`、生效系数 `bpt`、曲线尾桶；
 - `call`：调用完成真值（`eff`/`gen_ms`/`true_tps`）；
-- `cal`：校准对账（`true_tps` vs `pred_tps`、`raw_kb`/`clean_kb`、`bpt_sample`/`bpt_now`、`skipped`、归因诊断 `attr_pid`/`top_pid`）。
+- `cal`：校准对账（`true_tps` vs `pred_tps`、`raw_kb`/`clean_kb`、`bpt_sample`/`bpt_now`、`skipped`、归因诊断 `attr_pid`/`top_pid`）；
+- `cal_reset`：重新校准（`reason`=manual/auto、系数前后 `bpt_old`/`bpt_new`；auto 附触发时的轮均值 `round_avg` 与 5 轮基线 `base_avg`——排查"为什么系数突然回先验"看这里）。
 
 实时准确性评估口径：`pred_tps / true_tps` → 1.00 为准。用 `python scripts/live_vs_true.py` 一键对账（≥300 token 且入校准的调用为达标样本）。诊断实时读数问题先看这里，不要靠猜。
 

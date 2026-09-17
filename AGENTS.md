@@ -21,7 +21,7 @@ python scripts/live_vs_true.py      # 对账：实时读数 vs 落盘真值
 
 ```
 src-tauri/src/metrics.rs   数据层：usage 库轮询 + 当日聚合（Engine/Aggregator，纯函数可测）
-src-tauri/src/liveio.rs    实时测速：跨平台（platform 子模块：Windows 进程句柄 IO / macOS libproc+rusage）+ 平台参数化清洗（CleanParams）/积分/校准
+src-tauri/src/liveio.rs    实时测速：跨平台（platform 子模块：Windows 进程句柄 IO / macOS libproc+rusage）+ 平台参数化清洗（CleanParams）/积分/校准 + 轮均速漂移自动重校准（RoundDrift）
 src-tauri/src/main.rs      应用层：轮询线程、窗口模式/位置持久化、托盘（mac 菜单栏 + Accessory 模式）、DebugLog
 src-tauri/examples/        dump/verify 调试工具（#[path] include src，改公开 API 须同步）
 src-tauri/capabilities/    Tauri 前端权限白名单（窗口 API 必须在此放行）
@@ -41,7 +41,7 @@ public/pets/               宠物包资源；scripts/*.py 调试日志分析；.
 - 无系统标题栏：顶栏自绘（`#app-header` + `data-tauri-drag-region`，左侧为 `app-icon.png` 应用图标）；点 ✕ = 收起为悬浮窗，退出走托盘/右键菜单。mac 为 Accessory 模式（无 Dock/Cmd+Tab），Cmd+Q 也折叠为悬浮窗——真退出只有托盘"退出"与悬浮窗右键"退出程序"（三条防线：自定义菜单无 quit 项、ExitRequested 兜底、prevent_exit）。
 - 平台差异集中在 `liveio.rs` 的 `platform` 子模块与 `CleanParams`（Windows/mac 参数表见 `docs/features.md`），改清洗逻辑须核对两平台口径；FFI 结构镜像必须带 `offset_of!` 编译期断言（见 key-rules #10）。
 - UI 下拉一律自绘（`.dropdown`），禁用原生 `<select>`——WebView2 弹层跟随系统浅色主题，深色界面里看不见字（key-rules #8）；顶栏新增交互组件须加入拖动/双击排除选择器。
-- 仪表配色：速度表分档色定义在 `src/gauges.ts` 顶部 `SPEED_TIERS`（0–30 绿 / 30–60 黄 / 60+ 红，整弧换色不分段，背景轨道恒灰），主表、迷你仪表、"上轮"角标小表（`BadgeGauge`）与胶囊/桌宠的上轮读数共用（`speedColor()` 统一取色）；浮动窗口尺寸改动须同步 `main.rs` 的 `FLOAT_*_SIZE`、`docs/features.md` 与 README。
+- 仪表配色：速度表分档色定义在 `src/gauges.ts` 顶部 `SPEED_TIERS`（六档：0–40 绿 / 40–80 黄绿 / 80–160 黄 / 160–240 橙 / 240–320 红 / 320+ 品红，整弧换色不分段，背景轨道恒灰），主表、迷你仪表、"上轮"角标小表（`BadgeGauge`）与胶囊/桌宠的上轮读数共用（`speedColor()` 统一取色）；浮动窗口尺寸改动须同步 `main.rs` 的 `FLOAT_*_SIZE`、`docs/features.md` 与 README。
 - CI 不随推送自动触发（省机时）：出包走 `v*` 标签（自动发 Release：Windows exe + macOS 双架构 dmg）或 Actions 页手动 Run workflow（Artifacts：windows / macos-x86_64-apple-darwin / macos-aarch64-apple-darwin）；改动 workflow 触发逻辑须同步 README 与 `docs/features.md`。
 - 完整面板与悬浮窗位置各自独立记忆（`~/.zcode/speed-panel-mode.txt`）；悬浮窗尺寸用逻辑像素，物理换算走 `scale_factor()`，多屏定位必须 `clamp_to_screen`。
 

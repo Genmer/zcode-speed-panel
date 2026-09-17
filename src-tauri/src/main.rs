@@ -3,7 +3,7 @@
 mod liveio;
 mod metrics;
 
-use liveio::LiveIo;
+use liveio::{LiveIo, RoundDrift};
 use metrics::{home_dir, Engine, Snapshot};
 use std::fs;
 use std::path::PathBuf;
@@ -95,6 +95,12 @@ struct AppState {
     /// mac 启动引导提示是否待领取（一次性）：setup 在事件循环前执行，
     /// 此时 emit 必然早于页面加载被丢弃，改为前端就绪后 invoke 领取
     tray_hint_pending: Mutex<bool>,
+    /// 当前轮（门控"进行中"连续段）显示速度累计：(Σtps, 实测拍数)
+    round_tps: Mutex<(f64, u32)>,
+    /// 上一拍是否有进行中调用（Some→None 沿 = 一轮结束，结算均值喂漂移检测）
+    round_was_inflight: Mutex<bool>,
+    /// 轮均速漂移检测：上轮均值 vs 之前连续 5 轮均值 ≥3 倍（双向）→ 自动重校准
+    drift: Mutex<RoundDrift>,
 }
 
 /// 调试日志：记录实时显示值、统计值与每轮调用完成后的真值，
@@ -167,8 +173,9 @@ impl DebugLog {
 }
 
 const FULL_SIZE: (f64, f64) = (1000.0, 700.0);
-const FLOAT_GAUGE_SIZE: (f64, f64) = (140.0, 116.0);
-const FLOAT_PILL_SIZE: (f64, f64) = (224.0, 78.0);
+/// 仪表悬浮窗：正方形（加"上轮"小环时曾被拉宽到 140×116，已收回）
+const FLOAT_GAUGE_SIZE: (f64, f64) = (128.0, 128.0);
+const FLOAT_PILL_SIZE: (f64, f64) = (172.0, 72.0);
 /// 桌宠默认边长（逻辑像素），滚轮缩放范围 [100, 480]
 const FLOAT_PET_SIZE: f64 = 200.0;
 const PET_SIZE_MIN: f64 = 100.0;
@@ -496,6 +503,50 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
     }
 
     }
+
+    // ---- 轮均速漂移自动重校准：一轮 = 门控"进行中"连续的一段，轮内显示速度
+    //      （io 实测拍）取均值；上轮均值 vs 之前连续 5 轮均值 ≥3 倍（双向）
+    //      判定量级突变（换模型/分词器，旧系数过期）→ 丢弃系数样本回先验 ----
+    {
+        let state = app.state::<AppState>();
+        let now_inflight = inflight.is_some();
+        let was_inflight = {
+            let mut flag = state.round_was_inflight.lock().unwrap();
+            std::mem::replace(&mut *flag, now_inflight)
+        };
+        if snapshot.is_live && snapshot.current_tps > 0.0 {
+            let mut acc = state.round_tps.lock().unwrap();
+            acc.0 += snapshot.current_tps;
+            acc.1 += 1;
+        }
+        if was_inflight && !now_inflight {
+            // 一轮结束：结算均值。静默/估算轮（无实测拍）不参与漂移检测
+            let (sum, n) = {
+                let mut acc = state.round_tps.lock().unwrap();
+                std::mem::take(&mut *acc)
+            };
+            if n > 0 {
+                let avg = sum / n as f64;
+                let mut drift = state.drift.lock().unwrap();
+                if let Some(base) = drift.observe(avg) {
+                    let (bpt_old, bpt_new) = {
+                        let mut live = state.live.lock().unwrap();
+                        let old = live.bytes_per_token();
+                        (old, live.reset_calibration())
+                    };
+                    state.debug.lock().unwrap().write(serde_json::json!({
+                        "kind": "cal_reset",
+                        "t": now_ms,
+                        "reason": "auto",
+                        "round_avg": (avg * 10.0).round() / 10.0,
+                        "base_avg": (base * 10.0).round() / 10.0,
+                        "bpt_old": (bpt_old * 10.0).round() / 10.0,
+                        "bpt_new": (bpt_new * 10.0).round() / 10.0,
+                    }));
+                }
+            }
+        }
+    }
     SnapshotPayload {
         rollout_dir,
         snapshot,
@@ -559,6 +610,31 @@ fn set_float_size(app: AppHandle, size: f64) {
 fn quit_app(app: AppHandle) {
     save_all(&app);
     app.exit(0);
+}
+
+/// 手动重新校准（完整面板当前速度卡左上角 ⟳ 按钮）：丢弃已学习的系数样本
+/// 回到平台先验，由后续调用重新收敛；漂移检测历史同步复位
+#[tauri::command]
+fn recalibrate(app: AppHandle) {
+    let state = app.state::<AppState>();
+    let (bpt_old, bpt_new) = {
+        let mut live = state.live.lock().unwrap();
+        let old = live.bytes_per_token();
+        (old, live.reset_calibration())
+    };
+    state.drift.lock().unwrap().reset();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    state.debug.lock().unwrap().write(serde_json::json!({
+        "kind": "cal_reset",
+        "t": now,
+        "reason": "manual",
+        "bpt_old": (bpt_old * 10.0).round() / 10.0,
+        "bpt_new": (bpt_new * 10.0).round() / 10.0,
+    }));
+    let _ = app.emit("recalibrated", ());
 }
 
 /// mac 启动引导提示（一次性）：由前端页面就绪后主动 invoke 领取——
@@ -688,6 +764,9 @@ fn main() {
             tray_status: Mutex::new(None),
             tray_status_last: Mutex::new(String::new()),
             tray_hint_pending: Mutex::new(cfg!(target_os = "macos")),
+            round_tps: Mutex::new((0.0, 0)),
+            round_was_inflight: Mutex::new(false),
+            drift: Mutex::new(RoundDrift::new()),
         })
         .invoke_handler(tauri::generate_handler![
             snapshot,
@@ -695,6 +774,7 @@ fn main() {
             set_float_style,
             set_float_size,
             quit_app,
+            recalibrate,
             tray_hint_once
         ])
         .setup(|app| {

@@ -179,6 +179,23 @@ main {
   height: 56px;
 }
 
+/* 当前速度卡右下结构：左上角"重新校准"图标按钮（与右上角"上轮"角标呼应）。
+   图标钮宽度收窄，避免压住画布顶部居中的表名文字（最小窗口宽 720 时
+   表名左缘约 62px） */
+.recal-btn {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  font-size: 14px;
+  line-height: 1;
+  z-index: 2;
+}
+
 .sub {
   color: var(--dim);
   font-size: 12px;
@@ -397,14 +414,15 @@ body.float-mode.style-gauge #float-gauge {
 body.float-mode.style-pill #float-pill {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 0 10px 0 18px;
+  justify-content: center;
+  gap: 10px;
+  padding: 0 12px;
 }
 
-/* 主环占左侧 100px，右侧留给"上轮"小环（窗口 140×116，见 main.rs FLOAT_GAUGE_SIZE）；
-   主环半径由画布尺寸推出，缩小画布宽度会同时缩小它，故宽度写死避免与小环争空间 */
+/* 主环占左侧 96px，右侧留给"上轮"小环（窗口 128×128 正方形，见 main.rs FLOAT_GAUGE_SIZE）；
+   主环半径由画布尺寸推出，收窄画布宽度即同时缩小主环与速度数字 */
 #mini-gauge {
-  width: 100px;
+  width: 96px;
   height: 100%;
 }
 
@@ -413,8 +431,8 @@ body.float-mode.style-pill #float-pill {
   position: absolute;
   top: 6px;
   right: 4px;
-  width: 52px;
-  height: 52px;
+  width: 46px;
+  height: 46px;
 }
 
 #pet-canvas {
@@ -423,11 +441,12 @@ body.float-mode.style-pill #float-pill {
   display: block;
 }
 
-/* 胶囊数值区：第一行实时速度，第二行上轮均速（落盘口径） */
+/* 胶囊数值区：第一行实时速度，第二行上轮均速（落盘口径）；
+   两行各自居中，整组随 justify-content 在胶囊内水平居中 */
 #float-val {
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
+  align-items: center;
   gap: 1px;
 }
 
@@ -469,7 +488,7 @@ body.est #float-approx {
 }
 
 #float-tps {
-  font-size: 30px;
+  font-size: 28px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   color: var(--cyan);
@@ -495,7 +514,7 @@ body.float-mode:not(.live):not(.est) #float-tps {
   position: absolute;
   right: 6px;
   bottom: 6px;
-  padding: 2px 7px;
+  padding: 2px 6px;
   opacity: 0.45;
 }
 
@@ -530,7 +549,7 @@ body.float-mode:not(.live):not(.est) #float-tps {
   pointer-events: auto;
 }
 
-/* 悬浮窗/桌宠模式窗口只有 78~200px 高，放不下提示且会被裁剪：不显示 */
+/* 悬浮窗/桌宠模式窗口只有 72~200px 高，放不下提示且会被裁剪：不显示 */
 body.float-mode #tray-hint {
   display: none;
 }

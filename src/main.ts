@@ -32,7 +32,7 @@ const gCurrent = new ArcGauge($("g-current"), {
   color2: "#0ea5e9",
   kind: "speed",
   minScale: 60, // 最小量程 60 t/s，常见速度落在弧形中段更好读
-  tiers: SPEED_TIERS, // 0–30 绿 / 30–60 黄 / 60+ 红，随当前速度换色
+  tiers: SPEED_TIERS, // 六档（0–40/40–80/80–160/160–240/240–320/320+），随当前速度换色
 });
 
 const gAvg = new ArcGauge($("g-avg"), {
@@ -287,6 +287,19 @@ $("float-pet-cycle").addEventListener("click", () => {
   localStorage.setItem(PET_PACK_KEY, currentPetPack);
 });
 
+// ---- 重新校准（当前速度卡左上角 ⟳）：丢弃字节→token 系数样本回到先验 ----
+const btnRecal = $<HTMLButtonElement>("btn-recal");
+if (!hasTauri) btnRecal.style.display = "none"; // 浏览器预览无真实校准
+let recalTimer = 0;
+const flashRecal = () => {
+  btnRecal.textContent = "✓";
+  window.clearTimeout(recalTimer);
+  recalTimer = window.setTimeout(() => (btnRecal.textContent = "⟳"), 1500);
+};
+btnRecal.addEventListener("click", () => {
+  tauriInvoke("recalibrate").catch((err) => console.warn("recalibrate 失败:", err));
+});
+
 $("float-style-btn").addEventListener("click", () => {
   setStyleDropdownOpen(!styleDropdown.classList.contains("open"));
 });
@@ -325,6 +338,15 @@ enableDrag($("float-gauge"));
 enableDrag($("float-pill"));
 enableDrag($("float-pet"));
 
+// 悬浮窗双击 = 恢复完整面板。桌宠不参与：双击已用于换宠物（pet.ts），
+// 其恢复走 ⤢ 按钮 / 右键菜单 / 托盘。按钮上的双击不触发（click 已处理）
+for (const id of ["float-gauge", "float-pill"]) {
+  $(id).addEventListener("dblclick", (e) => {
+    if ((e.target as HTMLElement).closest("button, select, input, .dropdown")) return;
+    requestMode("full");
+  });
+}
+
 // ---- 自绘标题栏：拖动移动、双击最大化，— / ▢ / ✕ 窗口控制 ----
 const currentWindow = () => import("@tauri-apps/api/window").then((m) => m.getCurrentWindow());
 $("app-header").addEventListener("dblclick", (e) => {
@@ -354,6 +376,8 @@ if (hasTauri) {
     });
     await listen<string>("mode", (e) => applyModeUi(e.payload));
     await listen("tray-hint", () => showTrayHint());
+    // 重新校准完成（手动或漂移自动触发）：按钮闪 ✓ 反馈
+    await listen("recalibrated", flashRecal);
     await listen<string>("float-style", (e) => {
       localStorage.setItem("floatStyle", e.payload);
       applyStyleUi(e.payload);
