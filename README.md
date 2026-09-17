@@ -34,7 +34,12 @@
    **macOS 10.15+**（双架构独立包，不做 universal）：
    - `zcode-speed-panel_x.y.z_x64.dmg` —— Intel 芯片的 Mac；
    - `zcode-speed-panel_x.y.z_aarch64.dmg` —— Apple Silicon（M 系列，需 macOS 11+）。
-   - 安装：打开 dmg，把 `zcode-speed-panel.app` 拖入「应用程序」。**首次打开需绕过 Gatekeeper**（应用未签名公证）：在「应用程序」里**右键 → 打开 → 再点"打开"**；或终端执行 `xattr -cr /Applications/zcode-speed-panel.app` 后正常双击。
+   - 安装：打开 dmg，把 `zcode-speed-panel.app` 拖入「应用程序」。
+
+   > ⚠️ **macOS 首次打开会被 Gatekeeper 拦住**：本项目的 mac 包**没有签名和公证**（签名公证需要付费的 Apple 开发者账号），拖进「应用程序」直接双击会提示"无法打开，因为 Apple 无法检查其是否包含恶意软件"（有些系统版本显示"已损坏，无法打开"）。两条路任选一条：
+   >
+   > 1. **去掉管控**（最快，不重新下载）：在「应用程序」里对 `zcode-speed-panel.app` **右键 → 打开 → 再点一次"打开"**，授权一次之后就能正常双击；或者终端执行 `xattr -cr /Applications/zcode-speed-panel.app` 清掉这个 app 的隔离标记（只对这一个应用生效，不动系统的安全设置）。
+   > 2. **自行编译**（不碰 Gatekeeper 管控）：按[开发与构建](#开发与构建)在本机跑 `npm run tauri build`，自己编出来的包没有隔离标记，装好直接双击即可运行——若不想为下载的包放宽任何安全设置，走这条。
 
 2. 同一系统的各版本功能完全一致，数据都存放在 `~/.zcode/` 下，可共存。
 
