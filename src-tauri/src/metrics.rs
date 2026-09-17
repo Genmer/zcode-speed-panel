@@ -293,9 +293,16 @@ impl Engine {
         let conn = db_path.as_ref().and_then(|p| {
             match rusqlite::Connection::open_with_flags(
                 p,
-                OpenFlags::SQLITE_OPEN_READ_ONLY,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             ) {
-                Ok(c) => Some(c),
+                Ok(c) => {
+                    // WAL 并发与读性能关键优化：
+                    // 1. 设置 busy_timeout 为 3 秒，避免当 ZCode CLI 写事务或 checkpoint 时立即返回 SQLITE_BUSY
+                    // 2. 启用 query_only 确保只读
+                    let _ = c.busy_timeout(std::time::Duration::from_millis(3000));
+                    let _ = c.execute_batch("PRAGMA query_only = ON;");
+                    Some(c)
+                }
                 Err(e) => {
                     eprintln!("[zcode-speed-panel] usage DB open failed: {e}");
                     None

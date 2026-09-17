@@ -88,6 +88,13 @@ struct AppState {
     persist: Mutex<Persisted>,
     /// 位置落盘节流（拖动期间每 2s 一次，关闭/退出立即落盘）
     last_pos_save: Mutex<Option<std::time::Instant>>,
+    /// 托盘菜单顶部的状态项（disabled，仅展示生成状态）
+    tray_status: Mutex<Option<tauri::menu::MenuItem<tauri::Wry>>>,
+    /// 上次写入状态项/托盘 tooltip 的状态文本（变化才更新，避免每拍 churn）
+    tray_status_last: Mutex<String>,
+    /// mac 启动引导提示是否待领取（一次性）：setup 在事件循环前执行，
+    /// 此时 emit 必然早于页面加载被丢弃，改为前端就绪后 invoke 领取
+    tray_hint_pending: Mutex<bool>,
 }
 
 /// 调试日志：记录实时显示值、统计值与每轮调用完成后的真值，
@@ -304,6 +311,17 @@ fn switch_mode(app: &AppHandle, mode: Mode) {
     let _ = app.emit("mode", mode.as_str());
 }
 
+/// 折叠为悬浮窗：完整面板 → 切换悬浮窗模式；已在悬浮窗 → 唤起并聚焦。
+/// CloseRequested / mac 菜单栏 Cmd+Q / ExitRequested 兜底共用
+fn collapse_to_float(app: &AppHandle) {
+    let mode = *app.state::<AppState>().mode.lock().unwrap();
+    if mode == Mode::Full {
+        switch_mode(app, Mode::Float);
+    } else {
+        show_main(app);
+    }
+}
+
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SnapshotPayload {
@@ -439,6 +457,8 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
                 "true_tps": (cal.true_tps * 10.0).round() / 10.0,
                 "raw_kb": (cal.raw_bytes / 1024.0 * 10.0).round() / 10.0,
                 "clean_kb": (cal.clean_bytes / 1024.0 * 10.0).round() / 10.0,
+                "attr_pid": cal.attr_pid,
+                "top_pid": cal.top_pid,
                 "bpt_sample": (cal.bpt_sample * 10.0).round() / 10.0,
                 "bpt_now": (cal.bpt_now * 10.0).round() / 10.0,
                 "pred_tps": (pred_tps * 10.0).round() / 10.0,
@@ -541,11 +561,30 @@ fn quit_app(app: AppHandle) {
     app.exit(0);
 }
 
+/// mac 启动引导提示（一次性）：由前端页面就绪后主动 invoke 领取——
+/// setup 内 emit 会早于 WKWebView 加载被丢弃。非 mac 恒返回 false
+#[tauri::command]
+fn tray_hint_once(app: AppHandle) -> bool {
+    let state = app.state::<AppState>();
+    let mut guard = state.tray_hint_pending.lock().unwrap();
+    let pending = *guard;
+    *guard = false;
+    pending
+}
+
 fn show_main(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
+        // mac：窗口从隐藏→显示时提示"应用常驻菜单栏"（无 Dock 图标，用户
+        // 关掉窗口后靠提示找回入口）；已可见（如重复启动唤起）不打扰
+        #[cfg(target_os = "macos")]
+        let was_hidden = !win.is_visible().unwrap_or(true);
         let _ = win.unminimize();
         let _ = win.show();
         let _ = win.set_focus();
+        #[cfg(target_os = "macos")]
+        if was_hidden {
+            let _ = app.emit("tray-hint", ());
+        }
     }
 }
 
@@ -589,10 +628,44 @@ fn on_window_moved(app: &AppHandle, pos: PhysicalPosition<i32>) {
     }
 }
 
+/// 托盘状态：菜单顶部状态项文本 + 托盘 tooltip。按快照状态生成
+///（生成中/估算中/待机），文本变化才写（避免每 700ms 重复设置）
+fn update_tray_status(app: &AppHandle, s: &Snapshot) {
+    let state_word = if s.is_live || s.is_starting {
+        "生成中"
+    } else if s.is_estimating {
+        "估算中"
+    } else {
+        "待机"
+    };
+    let text = if s.is_live || s.is_starting {
+        format!("生成中 {:.1} t/s", s.current_tps)
+    } else if s.is_estimating {
+        format!("估算中 ≈{:.1} t/s", s.current_tps)
+    } else {
+        "待机".to_string()
+    };
+    let state = app.state::<AppState>();
+    {
+        let mut last = state.tray_status_last.lock().unwrap();
+        if *last == text {
+            return;
+        }
+        *last = text.clone();
+    }
+    if let Some(item) = state.tray_status.lock().unwrap().as_ref() {
+        let _ = item.set_text(text);
+    }
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let _ = tray.set_tooltip(Some(&format!("ZCode 速度仪表盘 · {state_word}")));
+    }
+}
+
 /// 后台轮询线程：增量解析 model-io 文件并推送快照
 fn poller(app: AppHandle) {
     loop {
         let payload = build_payload(&app);
+        update_tray_status(&app, &payload.snapshot);
         let _ = app.emit("metrics", &payload);
         std::thread::sleep(Duration::from_millis(700));
     }
@@ -612,23 +685,51 @@ fn main() {
             debug: Mutex::new(DebugLog::new()),
             persist: Mutex::new(Persisted::default()),
             last_pos_save: Mutex::new(None),
+            tray_status: Mutex::new(None),
+            tray_status_last: Mutex::new(String::new()),
+            tray_hint_pending: Mutex::new(cfg!(target_os = "macos")),
         })
         .invoke_handler(tauri::generate_handler![
             snapshot,
             set_mode,
             set_float_style,
             set_float_size,
-            quit_app
+            quit_app,
+            tray_hint_once
         ])
         .setup(|app| {
+            // mac：Accessory 模式——无 Dock 图标、不进 Cmd+Tab，常驻菜单栏托盘；
+            // 必须在跑起来之前尽早设置（真退出只有托盘"退出"与悬浮窗右键"退出程序"）
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            // mac：自定义应用菜单拦截 Cmd+Q 为"折叠为悬浮窗"（不注册系统
+            // 退出项），并附编辑菜单保住 WebView 的 Cmd+C/V/X/A 快捷键
+            #[cfg(target_os = "macos")]
+            {
+                macos_ui::install(app)?;
+                app.on_menu_event(|app, ev| {
+                    if ev.id().as_ref() == "collapse-to-float" {
+                        save_all(app);
+                        collapse_to_float(app);
+                    }
+                });
+            }
+
             // ---- 系统托盘 ----
+            // 顶部状态项（disabled 不可点，poller 每拍按快照刷新文本）
+            let status = MenuItem::with_id(app, "status", "待机", false, None::<&str>)?;
             let show = MenuItem::with_id(app, "show", "显示面板", true, None::<&str>)?;
             let hide = MenuItem::with_id(app, "hide", "隐藏到托盘", true, None::<&str>)?;
             let toggle_float =
                 MenuItem::with_id(app, "toggle-float", "悬浮窗 / 完整面板", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let sep = PredefinedMenuItem::separator(app)?;
-            let menu = Menu::with_items(app, &[&show, &hide, &toggle_float, &sep, &quit])?;
+            let menu = Menu::with_items(
+                app,
+                &[&status, &sep, &show, &hide, &toggle_float, &quit],
+            )?;
+            app.state::<AppState>().tray_status.lock().unwrap().replace(status);
 
             let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))?;
             TrayIconBuilder::with_id("main-tray")
@@ -668,9 +769,8 @@ fn main() {
                 .on_window_event(move |event| match event {
                     WindowEvent::CloseRequested { api, .. } => {
                         api.prevent_close();
-                        save_all(&win_handle);
                         // 点关闭 = 立刻变悬浮窗（不藏托盘；完全退出走托盘/右键菜单）
-                        switch_mode(&win_handle, Mode::Float);
+                        collapse_to_float(&win_handle);
                     }
                     WindowEvent::Moved(pos) => on_window_moved(&win_handle, *pos),
                     _ => {}
@@ -690,12 +790,71 @@ fn main() {
             let p = app.state::<AppState>().persist.lock().unwrap().clone();
             apply_mode(&window, mode, style, &p);
             let _ = window.show();
+            // mac 启动引导提示不在此 emit：setup 早于事件循环/WKWebView 加载，
+            // 发即被弃——改为前端就绪后 invoke `tray_hint_once` 领取（一次性）
 
             // ---- 启动轮询线程 ----
             let poll_handle = app.handle().clone();
             std::thread::spawn(move || poller(poll_handle));
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running zcode-speed-panel");
+        .build(tauri::generate_context!())
+        .expect("error while building zcode-speed-panel")
+        .run(|app, event| match event {
+            // 兜底防线：非显式 exit(0) 的退出请求（如 mac 上最后的窗口关闭、
+            // 系统注销前的退出）一律阻止并折叠为悬浮窗——真退出只有托盘
+            // "退出"与悬浮窗右键"退出程序"两条路（app.exit 时 code=Some，放行）
+            tauri::RunEvent::ExitRequested { code: None, api, .. } => {
+                api.prevent_exit();
+                save_all(app);
+                collapse_to_float(app);
+            }
+            // 真退出前再保存一次（best-effort）
+            tauri::RunEvent::Exit => {
+                save_all(app);
+            }
+            _ => {}
+        });
+}
+
+/// mac 专属 UI：应用菜单栏。Cmd+Q 被拦截为"折叠为悬浮窗"（Accessory 模式下
+/// 应用没有 Dock/Cmd+Tab 入口，直接退出会让用户以为应用没了）；菜单中不注册
+/// 任何系统退出项，保证退出只走托盘与悬浮窗右键。编辑 submenu 保留
+/// Cmd+C/V/X/A，否则 WebView 的文本编辑快捷键会失灵
+#[cfg(target_os = "macos")]
+mod macos_ui {
+    use super::*;
+    use tauri::menu::{MenuItem, PredefinedMenuItem, Submenu};
+
+    pub fn install(app: &tauri::App) -> tauri::Result<()> {
+        let collapse = MenuItem::with_id(
+            app,
+            "collapse-to-float",
+            "隐藏为悬浮窗",
+            true,
+            Some("CmdOrCtrl+Q"),
+        )?;
+        let app_menu = Submenu::with_id_and_items(
+            app,
+            "app",
+            "zcode-speed-panel",
+            true,
+            &[&collapse],
+        )?;
+        let edit_menu = Submenu::with_id_and_items(
+            app,
+            "edit",
+            "编辑",
+            true,
+            &[
+                &PredefinedMenuItem::cut(app, None)?,
+                &PredefinedMenuItem::copy(app, None)?,
+                &PredefinedMenuItem::paste(app, None)?,
+                &PredefinedMenuItem::select_all(app, None)?,
+            ],
+        )?;
+        let menu = Menu::with_items(app, &[&app_menu, &edit_menu])?;
+        app.set_menu(menu)?;
+        Ok(())
+    }
 }

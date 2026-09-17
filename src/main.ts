@@ -294,6 +294,19 @@ for (const opt of styleOptions) {
   opt.addEventListener("click", () => selectFloatStyle(opt.dataset.value!));
 }
 
+// ---- mac 引导提示：主窗口从隐藏→显示时后端发 "tray-hint"（Windows 不发，前端永不显示）----
+const trayHint = $("tray-hint");
+let trayHintTimer = 0;
+const showTrayHint = () => {
+  trayHint.classList.add("show");
+  window.clearTimeout(trayHintTimer);
+  trayHintTimer = window.setTimeout(() => trayHint.classList.remove("show"), 6000);
+};
+trayHint.addEventListener("click", () => {
+  window.clearTimeout(trayHintTimer);
+  trayHint.classList.remove("show");
+});
+
 // 顶栏/悬浮窗拖动：mousedown 调 startDragging（按钮、下拉框除外）。
 // 目标自身带 data-tauri-drag-region 时由 Tauri 内核直接处理（跳过，避免双重拖动）
 function enableDrag(el: HTMLElement) {
@@ -340,6 +353,7 @@ if (hasTauri) {
       onSnapshot({ ...e.payload.snapshot, rolloutDir: e.payload.rolloutDir });
     });
     await listen<string>("mode", (e) => applyModeUi(e.payload));
+    await listen("tray-hint", () => showTrayHint());
     await listen<string>("float-style", (e) => {
       localStorage.setItem("floatStyle", e.payload);
       applyStyleUi(e.payload);
@@ -353,6 +367,8 @@ if (hasTauri) {
       }
       onSnapshot({ ...p.snapshot, rolloutDir: p.rolloutDir });
     }
+    // mac 启动引导（一次性）：页面就绪后主动领取，避免 setup 内 emit 早于加载被丢弃
+    if (await tauriInvoke<boolean>("tray_hint_once")) showTrayHint();
   })().catch((err) => {
     document.title = `初始化失败 · ZCode 速度仪表盘`;
     subCurrent.textContent = `Tauri 初始化失败：${err}`;

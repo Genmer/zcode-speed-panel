@@ -502,3 +502,48 @@ body.float-mode:not(.live):not(.est) #float-tps {
 .float-expand:hover {
   opacity: 1;
 }
+
+/* mac 引导提示：窗口从隐藏到显示时提醒应用常驻菜单栏（无 Dock 图标，
+   Windows 下后端不发事件，前端永不显示）。顶部小箭头指向屏幕菜单栏方向 */
+#tray-hint {
+  position: fixed;
+  top: 56px;
+  right: 20px;
+  z-index: 120;
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(13, 20, 36, 0.95);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 0.4s ease, visibility 0.4s;
+}
+
+#tray-hint.show {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+
+/* 悬浮窗/桌宠模式窗口只有 78~200px 高，放不下提示且会被裁剪：不显示 */
+body.float-mode #tray-hint {
+  display: none;
+}
+
+#tray-hint::before {
+  content: "";
+  position: absolute;
+  top: -5px;
+  right: 16px;
+  width: 9px;
+  height: 9px;
+  border-top: 1px solid rgba(255, 255, 255, 0.14);
+  border-left: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(13, 20, 36, 0.95);
+  transform: rotate(45deg);
+}

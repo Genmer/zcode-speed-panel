@@ -8,213 +8,29 @@ mod liveio;
 
 use metrics::Engine;
 use std::collections::HashMap;
-use std::ffi::c_void;
 use std::io::Write;
 
-#[cfg(windows)]
 mod raw {
     use super::*;
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
-        fn CloseHandle(h: *mut c_void) -> i32;
-        fn GetProcessIoCounters(h: *mut c_void, counters: *mut IoCounters) -> i32;
-        fn ReadProcessMemory(
-            h: *mut c_void,
-            addr: *const c_void,
-            buf: *mut c_void,
-            size: usize,
-            read: *mut usize,
-        ) -> i32;
-        fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> isize;
-        fn Process32FirstW(snap: isize, entry: *mut ProcessEntry32W) -> i32;
-        fn Process32NextW(snap: isize, entry: *mut ProcessEntry32W) -> i32;
-    }
-    #[link(name = "ntdll")]
-    extern "system" {
-        fn NtQueryInformationProcess(
-            h: *mut c_void,
-            class: u32,
-            info: *mut c_void,
-            len: u32,
-            ret_len: *mut u32,
-        ) -> i32;
-    }
-    #[repr(C)]
-    pub struct IoCounters {
-        pub read_ops: u64,
-        pub write_ops: u64,
-        pub other_ops: u64,
-        pub read_bytes: u64,
-        pub write_bytes: u64,
-        pub other_bytes: u64,
-    }
-    #[repr(C)]
-    pub struct ProcessEntry32W {
-        pub size: u32,
-        pub usage: u32,
-        pub process_id: u32,
-        pub default_heap_id: usize,
-        pub module_id: u32,
-        pub threads: u32,
-        pub parent_process_id: u32,
-        pub pri_class_base: i32,
-        pub flags: u32,
-        pub exe_file: [u16; 260],
-    }
-    pub const PROCESS_QUERY_LIMITED: u32 = 0x1410;
-    pub const TH32CS_SNAPPROCESS: u32 = 2;
+    use super::liveio::platform;
 
-    pub unsafe fn open(pid: u32) -> isize {
-        OpenProcess(PROCESS_QUERY_LIMITED, 0, pid) as isize
-    }
-    pub unsafe fn write_bytes(h: isize) -> Option<u64> {
-        let mut io = IoCounters {
-            read_ops: 0,
-            write_ops: 0,
-            other_ops: 0,
-            read_bytes: 0,
-            write_bytes: 0,
-            other_bytes: 0,
-        };
-        if GetProcessIoCounters(h as *mut c_void, &mut io) != 0 {
-            Some(io.write_bytes)
-        } else {
-            None
-        }
-    }
-    pub unsafe fn close(h: isize) {
-        CloseHandle(h as *mut c_void);
-    }
-
-    pub fn command_line(pid: u32) -> Option<String> {
-        unsafe {
-            let h = open(pid);
-            if h == 0 {
-                return None;
-            }
-            let rd = |addr: usize, buf: &mut [u8]| -> bool {
-                let mut n = 0usize;
-                ReadProcessMemory(h as *mut c_void, addr as *const c_void, buf.as_mut_ptr().cast(), buf.len(), &mut n) != 0
-            };
-            let mut pbi = [0u8; 48];
-            let mut ret: u32 = 0;
-            if NtQueryInformationProcess(h as *mut c_void, 0, pbi.as_mut_ptr().cast(), 48, &mut ret) != 0 {
-                close(h);
-                return None;
-            }
-            let peb = usize::from_ne_bytes(pbi[8..16].try_into().ok()?);
-            if peb == 0 {
-                close(h);
-                return None;
-            }
-            let mut pp_ptr = [0u8; 8];
-            if !rd(peb + 0x20, &mut pp_ptr) {
-                close(h);
-                return None;
-            }
-            let pp = usize::from_ne_bytes(pp_ptr.try_into().ok()?);
-            if pp == 0 {
-                close(h);
-                return None;
-            }
-            let mut us = [0u8; 16];
-            if !rd(pp + 0x70, &mut us) {
-                close(h);
-                return None;
-            }
-            let len = u16::from_ne_bytes([us[0], us[1]]) as usize;
-            let buf_ptr = usize::from_ne_bytes(us[8..16].try_into().ok()?);
-            if len == 0 || buf_ptr == 0 {
-                close(h);
-                return None;
-            }
-            let mut wbuf = vec![0u8; len];
-            if !rd(buf_ptr, &mut wbuf) {
-                close(h);
-                return None;
-            }
-            close(h);
-            let u16s: Vec<u16> = wbuf.chunks_exact(2).map(|c| u16::from_ne_bytes([c[0], c[1]])).collect();
-            Some(String::from_utf16_lossy(&u16s))
-        }
-    }
-
-    /// 独立实现：枚举含 zcode.cjs 的 CLI 进程 → pid → 累计写字节
+    /// 独立采样：枚举 CLI 进程 → pid → 累计写字节。
+    /// 复用 liveio 的平台原语（进程识别与面板同口径），但采样节奏独立于引擎
     pub fn sample_cli_writes() -> HashMap<u32, u64> {
         let mut out = HashMap::new();
-        unsafe {
-            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if snap == -1 {
-                return out;
-            }
-            let mut e = ProcessEntry32W {
-                size: std::mem::size_of::<ProcessEntry32W>() as u32,
-                usage: 0,
-                process_id: 0,
-                default_heap_id: 0,
-                module_id: 0,
-                threads: 0,
-                parent_process_id: 0,
-                pri_class_base: 0,
-                flags: 0,
-                exe_file: [0; 260],
-            };
-            if Process32FirstW(snap, &mut e) != 0 {
-                loop {
-                    let exe = String::from_utf16_lossy(
-                        &e.exe_file[..e.exe_file.iter().position(|c| *c == 0).unwrap_or(260)],
-                    );
-                    if exe.eq_ignore_ascii_case("zcode.exe") {
-                        let pid = e.process_id;
-                        if let Some(cmd) = command_line(pid) {
-                            if cmd.contains("zcode.cjs") {
-                                let h = open(pid);
-                                if h != 0 {
-                                    if let Some(w) = write_bytes(h) {
-                                        out.insert(pid, w);
-                                    }
-                                    close(h);
-                                }
-                            }
-                        }
-                    }
-                    if Process32NextW(snap, &mut e) == 0 {
-                        break;
-                    }
+        for pid in platform::discover_cli_pids() {
+            if let Some(h) = platform::open_proc(pid) {
+                if let Some(w) = platform::io_write_bytes(&h) {
+                    out.insert(pid, w);
                 }
             }
-            CloseHandle(snap as *mut c_void);
         }
         out
     }
 }
 
-#[cfg(not(windows))]
-mod raw {
-    use super::*;
-    pub fn sample_cli_writes() -> HashMap<u32, u64> {
-        HashMap::new()
-    }
-}
-
 fn tracked_files_total() -> u64 {
-    let mut total = 0u64;
-    if let Some(home) = metrics::home_dir() {
-        for dir in [home.join(".zcode/cli/rollout"), home.join(".zcode/cli/log")] {
-            if let Ok(rd) = std::fs::read_dir(&dir) {
-                for e in rd.flatten() {
-                    if let Ok(m) = e.metadata() {
-                        total += m.len();
-                    }
-                }
-            }
-        }
-        if let Ok(m) = std::fs::metadata(home.join(".zcode/cli/db/db.sqlite-wal")) {
-            total += m.len();
-        }
-    }
-    total
+    liveio::platform::tracked_files_total()
 }
 
 fn main() {
@@ -273,6 +89,8 @@ fn main() {
                 "true_tps": (cal.true_tps * 10.0).round() / 10.0,
                 "raw_kb": (cal.raw_bytes / 1024.0 * 10.0).round() / 10.0,
                 "clean_kb": (cal.clean_bytes / 1024.0 * 10.0).round() / 10.0,
+                "attr_pid": cal.attr_pid,
+                "top_pid": cal.top_pid,
                 "bpt_sample": (cal.bpt_sample * 10.0).round() / 10.0,
                 "bpt_now": (cal.bpt_now * 10.0).round() / 10.0,
                 "pred_tps": (pred_tps * 10.0).round() / 10.0,
