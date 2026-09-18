@@ -4,6 +4,7 @@
 // 锁阻断 ZCode 工作区快照落盘上传：不碰网络、不影响模型对话/补全/工具调用；
 // 状态随 metrics payload 的 guard 字段每拍推送（src/main.ts 调 renderGuard）。
 import { fmtBytes } from "./gauges";
+import type { CkptStat } from "./mock";
 
 /** metrics payload 附带的防护状态（src-tauri/src/snapshot_guard.rs，camelCase） */
 export interface GuardStatus {
@@ -15,6 +16,8 @@ export interface GuardStatus {
   artifactBytes: number;
   workspaceCount: number;
   failureCount: number;
+  /** 防护前的原上传记录留档（apply 清空前保存；防护期间完整回看） */
+  history: CkptStat[];
 }
 
 type InvokeFn = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T | undefined>;
@@ -56,12 +59,14 @@ export function renderGuard(g: GuardStatus | null): void {
   if (!g.supported) {
     e.scope.textContent = "文件锁仅支持 macOS";
   }
-  // 防护生效时目录已清空，"已积累工件 0 个 · 0 B"没有信息量且像故障——
-  // 换成生效语义；未防护时保留扫描统计（那是 ZCode 已落盘的真实库存）
+  // 未防护 = 实时扫描统计（那是 ZCode 已落盘的真实库存）；防护中 = 生效
+  // 语义（清空后全零统计没有信息量）。术语用"加密快照"，不用内部黑话
   e.stats.textContent = g.locked
-    ? "防护生效中：快照目录已清空并锁定，ZCode 写不进任何新快照（历史工件已随开启删除）"
-    : `已积累工件 ${g.artifactCount} 个 · ${fmtBytes(g.artifactBytes)} · ` +
-      `覆盖 ${g.workspaceCount} 个工作区 · ZCode 记录上传失败 ${g.failureCount} 次`;
+    ? `防护生效中：快照目录已清空并锁定，ZCode 写不进新快照；防护前的上传记录在上方列表完整保留（${g.history.length} 条）`
+    : g.artifactCount > 0
+      ? `本地已积累加密快照 ${g.artifactCount} 个 · 共 ${fmtBytes(g.artifactBytes)} · ` +
+        `覆盖 ${g.workspaceCount} 个项目 · ZCode 记录上传失败 ${g.failureCount} 次`
+      : `本地未发现 ZCode 快照（checkpoints 目录为空，可能从未生成或已被清理）`;
   // 防护后追加行：开启以来的对话轮次（锁定期间目录不可写，新快照恒为 0）
   if (g.locked) {
     e.rounds.hidden = false;
@@ -125,11 +130,11 @@ export function initGuard(invoke: InvokeFn): void {
     if (action === "apply") {
       title.textContent = "开启快照防护？";
       okBtn.textContent = "确认开启";
-      // 用户明确要求的四点：损失检查点回滚 / 对话不受影响 / 删除现有工件 / 可逆
+      // 用户明确要求的四点：损失检查点回滚 / 对话不受影响 / 删除现有快照（留档） / 可逆
       const lines = [
         "开启后将损失 **「检查点回滚 / 时间线」功能**——无法再回滚到历史检查点",
         "模型对话、代码补全、工具调用**不受任何影响**",
-        `将删除本地已积累的 ${latest.artifactCount} 个快照工件（共 ${fmtBytes(latest.artifactBytes)}）并锁定目录`,
+        `将删除本地已积累的 ${latest.artifactCount} 个加密快照（共 ${fmtBytes(latest.artifactBytes)}）并锁定目录；删除前会把完整清单留档，防护期间仍可在上方列表回看`,
         "随时可解除防护（目录会自动重建）",
       ];
       for (const raw of lines) {

@@ -93,6 +93,27 @@ pub(crate) fn ckpt_rows(states: &HashMap<String, CkptState>) -> Vec<crate::metri
     rows
 }
 
+/// 扫描 checkpoints 目录 → (状态, 观测列表)。NetIo 每拍观测与
+/// snapshot_guard 的 apply 留档（先留档再清空，key-rules #16）共用
+pub(crate) fn scan_ckpt_states(base: &std::path::Path) -> (String, Vec<(String, CkptState)>) {
+    let rd = match std::fs::read_dir(base) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ("missing".into(), Vec::new()),
+        // 权限拒绝（如 ACL 封锁）或其他错误：如实上报 blocked
+        Err(_) => return ("blocked".into(), Vec::new()),
+    };
+    let mut obs = Vec::new();
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if let Ok(text) = std::fs::read_to_string(e.path().join("state.json")) {
+            if let Some(st) = parse_ckpt_state(&text) {
+                obs.push((name, st));
+            }
+        }
+    }
+    ("ok".into(), obs)
+}
+
 /// 接口计数器差分（纯函数，可测）：wrap>0 时按模数做回绕差分（Windows
 /// 32 位 octets），wrap=0 时为裸差分（mac 64 位）并对回退钳 0（计数器重置）。
 /// 单接口单拍增量超过 2^31 视为异常（重置/索引复用），钳 0 防假流量
@@ -934,23 +955,7 @@ impl NetIo {
         let Some(home) = crate::metrics::home_dir() else {
             return ("missing".into(), Vec::new());
         };
-        let base = home.join(".zcode").join("v2").join("checkpoints");
-        let rd = match std::fs::read_dir(&base) {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ("missing".into(), Vec::new()),
-            // 权限拒绝（如 ACL 封锁）或其他错误：如实上报 blocked
-            Err(_) => return ("blocked".into(), Vec::new()),
-        };
-        let mut obs = Vec::new();
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if let Ok(text) = std::fs::read_to_string(e.path().join("state.json")) {
-                if let Some(st) = parse_ckpt_state(&text) {
-                    obs.push((name, st));
-                }
-            }
-        }
-        ("ok".into(), obs)
+        scan_ckpt_states(&home.join(".zcode").join("v2").join("checkpoints"))
     }
 
     /// 差分事件 → 当日累计 + 调试日志事件（工作区实况列表由 `ckpt_rows`

@@ -26,10 +26,15 @@
 //!   跨天回退按 0 增量重置基准拍；
 //! - **目录已锁但无记录**（用户看过文档后手动 chflags / 重装面板）：首拍
 //!   探测到即补记基线，从该时刻起算轮次；
+//! - **先留档再清空**：apply 删除 checkpoints 前把当时的上传记录行
+//!   （每工作区最近一次快照）存入 `~/.zcode/speed-panel-ckpt-history.json`，
+//!   防护期间前端可完整回看「防护前的原上传记录」（用户明确要求，
+//!   2026-09-18）；重复开启按工作区合并（新记录覆盖同工作区旧行）；
 //! - **仅 macOS**：Windows 无等价的用户级不可变标志，`supported=false`，
 //!   apply/release 返回中文错误，前端按钮禁用并如实标注。
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// chflags 仅 macOS（其他平台 apply/release 拒绝执行）
@@ -58,6 +63,8 @@ pub struct SnapshotGuardStatus {
     pub workspace_count: u64,
     /// Σ failureCount（ZCode 自己记录的上传失败计数）
     pub failure_count: u64,
+    /// 防护前的原上传记录（apply 留档；防护期间前端完整回看）
+    pub history: Vec<crate::metrics::CkptStat>,
 }
 
 /// 单工作区 state.json 里防护关心的字段（解析纯函数的输出）
@@ -133,6 +140,51 @@ fn checkpoints_dir() -> Option<PathBuf> {
 
 fn guard_file_path() -> Option<PathBuf> {
     crate::metrics::home_dir().map(|h| h.join(".zcode").join("speed-panel-guard.json"))
+}
+
+/// 防护前的原上传记录留档（apply 清空前写入，防护期间可完整回看）
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GuardHistory {
+    saved_at_ms: i64,
+    rows: Vec<crate::metrics::CkptStat>,
+}
+
+fn history_file_path() -> Option<PathBuf> {
+    crate::metrics::home_dir().map(|h| h.join(".zcode").join("speed-panel-ckpt-history.json"))
+}
+
+fn load_history() -> GuardHistory {
+    let Some(path) = history_file_path() else { return GuardHistory::default() };
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_history(h: &GuardHistory) {
+    if let Some(path) = history_file_path() {
+        if let Err(e) = std::fs::write(&path, serde_json::to_string(h).unwrap_or_default()) {
+            eprintln!("[zcode-speed-panel] 快照历史留档失败: {e}");
+        }
+    }
+}
+
+/// 历史合并（纯函数，可测）：新扫描的行覆盖同工作区旧行（"每工作区最近
+/// 一次"语义），其余工作区保留；按记录时刻倒序，上限 500 行防爆档
+pub(crate) fn merge_history(
+    old: Vec<crate::metrics::CkptStat>,
+    new: Vec<crate::metrics::CkptStat>,
+) -> Vec<crate::metrics::CkptStat> {
+    let mut map: HashMap<String, crate::metrics::CkptStat> =
+        old.into_iter().map(|r| (r.workspace.clone(), r)).collect();
+    for r in new {
+        map.insert(r.workspace.clone(), r);
+    }
+    let mut rows: Vec<crate::metrics::CkptStat> = map.into_values().collect();
+    rows.sort_by(|a, b| b.recorded_ms.cmp(&a.recorded_ms));
+    rows.truncate(500);
+    rows
 }
 
 /// 损坏/缺失回默认（未防护），不报错——状态探测按目录实际锁定为准
@@ -222,6 +274,8 @@ pub struct SnapshotGuard {
     last_calls: u64,
     scan: ScanSummary,
     last_scan: Option<std::time::Instant>,
+    /// 防护前的原上传记录留档（apply 写入；随 status 推给前端回看）
+    history: Vec<crate::metrics::CkptStat>,
 }
 
 impl SnapshotGuard {
@@ -235,6 +289,7 @@ impl SnapshotGuard {
             last_calls,
             scan: ScanSummary::default(),
             last_scan: None,
+            history: load_history().rows,
         }
     }
 
@@ -253,6 +308,7 @@ impl SnapshotGuard {
             artifact_bytes: self.scan.artifact_bytes,
             workspace_count: self.scan.workspace_count,
             failure_count: self.scan.failure_count,
+            history: self.history.clone(),
         }
     }
 
@@ -306,14 +362,25 @@ impl SnapshotGuard {
         self.status(locked)
     }
 
-    /// 开启防护（前端已过确认弹窗）：先解锁（幂等，重复开启时才能清空）→
-    /// 清空 checkpoints → 重建空目录 → uchg 锁定 → 写入探测校验 → 记录
-    /// guard.json（锁定时刻 + calls 基线）
+    /// 开启防护（前端已过确认弹窗）：**先留档再清空**（当时的上传记录行
+    /// 合并进 ckpt-history.json，防护期间可完整回看）→ 解锁（幂等）→
+    /// 清空 checkpoints → 重建空目录 → uchg 锁定 → 写入探测校验 →
+    /// 记录 guard.json（锁定时刻 + calls 基线）
     pub fn apply(&mut self, calls_today: u64, now_ms: i64) -> Result<SnapshotGuardStatus, String> {
         if !SUPPORTED {
             return Err("文件锁仅支持 macOS（chflags）".into());
         }
         let dir = checkpoints_dir().ok_or("无法定位用户目录")?;
+        // 留档：清空前把每工作区最近一次快照的记录行存下来（复用 netio
+        // 的解析与行构建，口径与实时列表完全一致）
+        let (_, obs) = crate::netio::scan_ckpt_states(&dir);
+        let states: HashMap<String, _> = obs.into_iter().collect();
+        let rows = crate::netio::ckpt_rows(&states);
+        if !rows.is_empty() || !self.history.is_empty() {
+            let merged = merge_history(std::mem::take(&mut self.history), rows);
+            save_history(&GuardHistory { saved_at_ms: now_ms, rows: merged.clone() });
+            self.history = merged;
+        }
         if probe_locked(&dir) {
             set_immutable(&dir, false)?;
         }
@@ -403,6 +470,13 @@ mod tests {
             artifact_bytes: 302_000_000,
             workspace_count: 23,
             failure_count: 11,
+            history: vec![crate::metrics::CkptStat {
+                workspace: "proj".into(),
+                bytes: 175_400_000,
+                recorded_ms: 1_788_000_000_000,
+                accepted: true,
+                uploading: false,
+            }],
         };
         let json = serde_json::to_value(&st).unwrap();
         assert_eq!(json["supported"], true);
@@ -413,6 +487,8 @@ mod tests {
         assert_eq!(json["artifactBytes"], 302_000_000);
         assert_eq!(json["workspaceCount"], 23);
         assert_eq!(json["failureCount"], 11);
+        assert_eq!(json["history"][0]["workspace"], "proj");
+        assert_eq!(json["history"][0]["recordedMs"], 1_788_000_000_000i64);
         // 未防护默认值：locked=false、时刻为 null（前端按空隐藏"防护后"行）
         let def = serde_json::to_value(SnapshotGuardStatus::default()).unwrap();
         assert_eq!(def["locked"], false);
@@ -438,5 +514,29 @@ mod tests {
         // （旧 bug：内存归零 → 470 - 0 = +470）
         assert_eq!(accrue_rounds(0, 456, 470), (14, 470));
         assert_eq!(accrue_rounds(0, 0, 0), (0, 0));
+    }
+
+    /// 历史合并：新行覆盖同工作区旧行、未知工作区保留、按时刻倒序、
+    /// 上限截断（防护前记录"先留档再清空"，key-rules #16）
+    #[test]
+    fn merge_history_replaces_same_workspace_keeps_rest() {
+        use crate::metrics::CkptStat;
+        let row = |ws: &str, ms: i64, bytes: u64| CkptStat {
+            workspace: ws.into(),
+            bytes,
+            recorded_ms: ms,
+            accepted: true,
+            uploading: false,
+        };
+        let old = vec![row("a", 100, 10), row("b", 200, 20), row("c", 300, 30)];
+        let new = vec![row("b", 900, 99), row("d", 800, 40)];
+        let merged = merge_history(old, new);
+        let names: Vec<&str> = merged.iter().map(|r| r.workspace.as_str()).collect();
+        assert_eq!(names, vec!["b", "d", "c", "a"]); // 时刻倒序，b 已是 900 的新行
+        assert_eq!(merged[0].bytes, 99);
+        // 上限 500 截断
+        let many = (0..600).map(|i| row(&format!("w{i}"), i, 1)).collect();
+        assert_eq!(merge_history(Vec::new(), many).len(), 500);
+        assert_eq!(merge_history(Vec::new(), Vec::new()), Vec::new());
     }
 }

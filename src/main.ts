@@ -223,7 +223,7 @@ function renderNet(s: Snapshot) {
   netSessUpEl.textContent = fmtBytes(s.netSessUpToday);
   netSessDownEl.textContent = fmtBytes(s.netSessDownToday);
   netCkptEl.textContent = fmtBytes(s.netCkptToday);
-  netCkptCountEl.textContent = s.netCkptTodayCount > 0 ? `（${s.netCkptTodayCount} 个工件）` : "";
+  netCkptCountEl.textContent = s.netCkptTodayCount > 0 ? `（${s.netCkptTodayCount} 个）` : "";
   netUpTodayEl.textContent = fmtBytes(s.netUpToday);
   netDownTodayEl.textContent = fmtBytes(s.netDownToday);
 
@@ -278,10 +278,10 @@ function renderNet(s: Snapshot) {
     const nameText =
       names.length > 4 ? `${names.slice(0, 4).join("、")} 等 ${names.length} 个` : names.join("、");
     netCkptText.textContent =
-      `今日快照工件上传 ${fmtBytes(s.netCkptToday)}（${s.netCkptTodayCount} 个）` +
+      `今日快照上传 ${fmtBytes(s.netCkptToday)}（${s.netCkptTodayCount} 个）` +
       (nameText ? `：${nameText}` : "");
     netCkptInfo.title = todayList.length
-      ? `今日已接受的快照工件（${todayList.length} 个）：\n${todayList
+      ? `今日已成功上传的加密快照（${todayList.length} 个）：\n${todayList
           .map((r) => `${fmtDayClock(r.recordedMs)} · ${r.workspace || "?"} · ${fmtBytes(r.bytes)}`)
           .join("\n")}`
       : "";
@@ -322,15 +322,17 @@ function renderNet(s: Snapshot) {
   } else if (s.guard?.locked) {
     const banner = document.createElement("div");
     banner.className = "ckpt-empty locked";
-    banner.textContent = "🔒 防护已开启 · 快照目录已清空并锁定，ZCode 无法落盘新快照";
+    banner.textContent = "🔒 防护已开启 · 快照目录已清空并锁定，ZCode 无法落盘新快照。以下为防护前的原上传记录（留档可回看）：";
     netCkptList.append(banner);
-    for (const r of s.netCkptTodayList ?? []) {
-      appendRow(r, "ckpt-row history", "已上传 ✓");
+    // 防护前留档（apply 清空前保存）；旧版本未留档时退回今日已上传名单
+    const history: CkptStat[] = s.guard.history?.length ? s.guard.history : s.netCkptTodayList ?? [];
+    for (const r of history) {
+      appendRow(r, "ckpt-row history", r.uploading ? "待传" : "已上传 ✓");
     }
   } else {
     const empty = document.createElement("div");
     empty.className = "ckpt-empty";
-    empty.textContent = "暂无快照记录（ZCode 未产生工作区快照工件）";
+    empty.textContent = "暂无快照记录（ZCode 未生成过工作区快照）";
     netCkptList.append(empty);
   }
   lastCkptReport = buildCkptReport(s);
@@ -345,7 +347,7 @@ function buildCkptReport(s: Snapshot): string {
   const now = new Date();
   const p = (x: number) => x.toString().padStart(2, "0");
   lines.push(`ZCode 快照上传记录 · 导出于 ${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())} ${p(now.getHours())}:${p(now.getMinutes())}`);
-  lines.push("口径：每工作区最近一次工件（~/.zcode/v2/checkpoints/*/state.json）；大小为加密压缩后字节；状态 = 上传中/待传/已接受");
+  lines.push("口径：每工作区最近一次快照（~/.zcode/v2/checkpoints/*/state.json）；大小为加密压缩后字节；状态 = 上传中/待传/已接受");
   lines.push("");
   lines.push("时间          工作区                       大小         状态");
   lines.push("------------  ---------------------------  -----------  --------");
@@ -355,8 +357,19 @@ function buildCkptReport(s: Snapshot): string {
       `${fmtDayClock(r.recordedMs).padEnd(12)}  ${(r.workspace || "?").padEnd(27).slice(0, 27)}  ${fmtBytes(r.bytes).padEnd(11)}  ${st}`,
     );
   }
+  // 防护前留档（apply 清空前保存）——防护中磁盘扫描为空，取证报告仍要
+  // 能看到完整的原上传记录
+  if (s.guard?.locked && s.guard.history?.length) {
+    lines.push("");
+    lines.push(`防护前原上传记录（清空快照前留档，共 ${s.guard.history.length} 条）：`);
+    for (const r of s.guard.history) {
+      lines.push(
+        `${fmtDayClock(r.recordedMs).padEnd(12)}  ${(r.workspace || "?").padEnd(27).slice(0, 27)}  ${fmtBytes(r.bytes).padEnd(11)}  防护前`,
+      );
+    }
+  }
   lines.push("");
-  lines.push(`今日快照工件上传：${fmtBytes(s.netCkptToday)}（${s.netCkptTodayCount} 个）`);
+  lines.push(`今日快照上传：${fmtBytes(s.netCkptToday)}（${s.netCkptTodayCount} 个）`);
   for (const r of s.netCkptTodayList ?? []) {
     lines.push(`  ${fmtDayClock(r.recordedMs)}  ${(r.workspace || "?").padEnd(27).slice(0, 27)}  ${fmtBytes(r.bytes)}`);
   }

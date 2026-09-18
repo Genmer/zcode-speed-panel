@@ -92,7 +92,7 @@
 
         <!-- 网络流量与上传监控：整机接口实测速度 + 会话/非会话上传拆分。
              按进程直测网络字节无公开原语（socket 不进进程 IO 计数、ESTATS 已坏），
-             口径分层：整机=真实 / 快照工件=真实下界 / 会话=token 估算（≈）。
+             口径分层：整机=真实 / 快照上传=真实下界 / 会话=token 估算（≈）。
              双栏布局（左：速度与当日累计 / 右：快照上传记录）控制卡片高度，
              窄窗口（<860px）自动退回单栏 -->
         <section class="card net-card" id="net-card" hidden>
@@ -126,7 +126,7 @@
                 <div class="net-today-row">
                   <span class="net-today-label">今日上传</span>
                   <span class="net-part">会话 ≈<b id="net-sess-up">--</b></span>
-                  <span class="net-part warn" id="net-ckpt-part">快照工件 <b id="net-ckpt">--</b><span class="dim" id="net-ckpt-count"></span></span>
+                  <span class="net-part warn" id="net-ckpt-part">快照上传 <b id="net-ckpt">--</b><span class="dim" id="net-ckpt-count"></span></span>
                   <span class="net-part">整机 <b id="net-up-today">--</b></span>
                 </div>
                 <div class="net-today-row">
@@ -158,7 +158,7 @@
              （明示损失「检查点回滚 / 时间线」，key-rules #16） -->
         <section class="card guard-card" id="guard-card" hidden>
           <div class="chart-head">
-            <span>快照防护（工作区快照静默上传）</span>
+            <span title="防护原理：ZCode 上传工作区快照（整个项目含 .git 历史，加密压缩包）之前，必须先把它写到 ~/.zcode/v2/checkpoints/ 目录。防护 = 清空该目录并加 macOS 不可变标志（chflags uchg），ZCode 从此写不进任何文件——没有本地落盘，就没有东西可上传。全程不碰网络、不碰进程，模型对话/补全/工具调用不受影响。&#10;&#10;监控边界（如实说明，不打包票）：&#10;① 锁定状态每拍做写入探测——锁被意外/人为解除会立即显示"未防护"；&#10;② 已知机制下 ZCode 写不进目录，新快照恒为 0（"防护后 N 轮 · 0 新快照"即阻断证据）；&#10;③ 整机上传速度监控独立兜底——若 ZCode 将来改用不经本地落盘的直传，文件锁拦不住它，只能靠流量异常（无对话时上传飙升）发现；mac 无按进程的连接归属，分辨不了是哪个进程在传。&#10;结论：已知上传机制（先落盘再上传）可确定阻断并留痕；换新机制的偷传无法事前阻止，只能靠流量层发现异常。">快照防护（工作区快照静默上传）</span>
             <span class="dim" id="guard-scope">chflags 不可变锁 · 可逆</span>
           </div>
           <div class="guard-body">

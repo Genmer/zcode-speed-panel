@@ -1,6 +1,6 @@
 use chrono::{Datelike, Local, NaiveTime, Utc};
 use rusqlite::OpenFlags;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -59,9 +59,10 @@ pub struct ConnStat {
     pub proc: String,
 }
 
-/// 快照上传记录行（netio 填充）：每个 workspace 的**最近一次**工件实况，
-/// 来自 `~/.zcode/v2/checkpoints/*/state.json`
-#[derive(Serialize, Clone, Debug, Default, PartialEq)]
+/// 快照上传记录行（netio 填充）：每个 workspace 的**最近一次**快照实况，
+/// 来自 `~/.zcode/v2/checkpoints/*/state.json`。Deserialize 供防护历史
+/// 文件（speed-panel-ckpt-history.json）读回
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CkptStat {
     /// 工作区显示名（workspacePath 末段）
