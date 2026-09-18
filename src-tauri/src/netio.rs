@@ -51,8 +51,7 @@ const CKPT_SCAN_EVERY: Duration = Duration::from_secs(2);
 const NET_SAVE_EVERY: Duration = Duration::from_secs(30);
 /// 连接远端列表上限（tooltip 展示用，多了没意义）
 const REMOTE_CAP: usize = 6;
-/// 快照上传记录列表的行数上限（每工作区一行，超出截断）
-const CKPT_LIST_CAP: usize = 12;
+
 
 /// 会话上传估算系数（字节/token）：请求体为 JSON 转义后的**未缓存**提示
 /// 增量（实测 98% 缓存命中下整机上传仅数十 KB——缓存命中的提示部分不重发），
@@ -74,8 +73,8 @@ pub fn sess_bytes_est(uncached_input_tokens: u64, output_tokens: u64) -> (u64, u
 }
 
 /// 工作区实况列表（纯函数，可测）：状态表 → 快照上传记录行，
-/// 排序 = 上传中 > 待传（未接受）> 已接受，同状态按记录时刻倒序，
-/// 截断 CKPT_LIST_CAP 行
+/// 排序 = 上传中 > 待传（未接受）> 已接受，同状态按记录时刻倒序。
+/// 不截断——全部工作区都要能列出（用户明确要求，2026-09-18）
 pub(crate) fn ckpt_rows(states: &HashMap<String, CkptState>) -> Vec<crate::metrics::CkptStat> {
     let mut rows: Vec<crate::metrics::CkptStat> = states
         .values()
@@ -93,7 +92,6 @@ pub(crate) fn ckpt_rows(states: &HashMap<String, CkptState>) -> Vec<crate::metri
             .then(a.accepted.cmp(&b.accepted))
             .then(b.recorded_ms.cmp(&a.recorded_ms))
     });
-    rows.truncate(CKPT_LIST_CAP);
     rows
 }
 
@@ -140,8 +138,8 @@ pub struct NetNow {
     /// 当日接受的快照工件字节（加密压缩后，面板观测期下界）
     pub ckpt_today_bytes: u64,
     pub ckpt_today_count: u32,
-    /// 快照上传记录（每工作区最近一次工件的实况；上传中 > 待传 > 已接受，
-    /// 同状态按记录时刻倒序，截断 CKPT_LIST_CAP 行）
+    /// 快照上传记录（每工作区最近一次工件的实况，**不设行数上限**——
+    /// 全部列出，前端列表限高滚动；上传中 > 待传 > 已接受，同状态按记录时刻倒序）
     pub ckpt_list: Vec<crate::metrics::CkptStat>,
 }
 
@@ -1159,9 +1157,10 @@ mod tests {
         assert_eq!(wrap_delta(1000, 1_000_000, W), 0);
     }
 
-    /// 快照上传记录列表：上传中 > 待传 > 已接受，同状态按时刻倒序，截断上限
+    /// 快照上传记录列表：上传中 > 待传 > 已接受，同状态按时刻倒序；
+    /// 不截断——全部工作区都列出
     #[test]
-    fn ckpt_rows_sorted_and_capped() {
+    fn ckpt_rows_sorted_all_workspaces() {
         let mut st = HashMap::new();
         let mk = |ws: &str, bytes: u64, rec: i64, acc: bool, up: bool| {
             (
@@ -1185,13 +1184,13 @@ mod tests {
             rows.iter().map(|r| r.workspace.as_str()).collect::<Vec<_>>(),
             vec!["flying", "pending", "new-acc", "old-acc"]
         );
-        // 截断：塞满 20 个已接受工作区，只保留前 CKPT_LIST_CAP 行
+        // 不截断：20 个工作区全部列出
         let mut big = HashMap::new();
         for i in 0..20 {
             let (k, v) = mk(&format!("ws{i}"), 1, i, true, false);
             big.insert(k, v);
         }
-        assert_eq!(ckpt_rows(&big).len(), CKPT_LIST_CAP);
+        assert_eq!(ckpt_rows(&big).len(), 20);
         // 空表 → 空列表
         assert!(ckpt_rows(&HashMap::new()).is_empty());
     }

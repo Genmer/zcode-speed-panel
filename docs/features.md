@@ -88,7 +88,7 @@
 - **口径为面板观测期**：面板未运行期间的接受只在上述回补时计入；两拍之间的多次跳变按末态计（下界）。
 - **目录状态**：`ok` / `missing`（无目录）/ `blocked`（不可读——用户用 ACL 封锁 checkpoints 后的如实显示，此时监控不到新上传）。
 - 事件同时写调试日志（`kind:"net"`，`ev`=ckpt_accepted / ckpt_upload_start / ckpt_upload_end，含 `mb` 与 `ws` 工作区名）。
-- **快照上传记录列表**（卡片右栏；窄窗口 <860px 退回单栏）：每个 workspace 一行 = 记录时间（今天 HH:MM，跨天 MM-DD HH:MM）/ 工作区名（workspacePath 末段）/ 加密后大小 / 状态（**上传中 ⬆ / 待传 / 已接受 ✓**），排序 = 上传中 > 待传 > 已接受（同状态按记录时刻倒序），最多 12 行、限高滚动（`ckpt_rows` 纯函数，测试 `ckpt_rows_sorted_and_capped` 守护）。列表读的是 checkpoints 实况（state.json 只保留各工作区最近一次工件，更早历史不可考），面板未运行期间的最后状态启动即见。
+- **快照上传记录列表**（卡片右栏；窄窗口 <860px 退回单栏）：每个 workspace 一行 = 记录时间（今天 HH:MM，跨天 MM-DD HH:MM）/ 工作区名（workspacePath 末段）/ 加密后大小 / 状态（**上传中 ⬆ / 待传 / 已接受 ✓**），排序 = 上传中 > 待传 > 已接受（同状态按记录时刻倒序），**不设行数上限、全部列出**（限高 60vh 随窗口自适应，常规数量无需滚动，极端大量时内部滚动；`ckpt_rows` 纯函数，测试 `ckpt_rows_sorted_all_workspaces` 守护）。列表读的是 checkpoints 实况（state.json 只保留各工作区最近一次工件，更早历史不可考），面板未运行期间的最后状态启动即见。
 
 ### ZCode 连接归属（真实值，仅 Windows）
 

@@ -455,13 +455,14 @@ main {
   font-size: 11.5px;
 }
 
-/* 快照上传记录列表：每工作区一行（时间/工作区/大小/状态），限高滚动
- * （高度与左侧列对齐，行多时内部滚动） */
+/* 快照上传记录列表：每工作区一行（时间/工作区/大小/状态），不截断行数
+ * 全部列出；限高 60vh（随窗口高度自适应，常规数量无需滚动即可全见，
+ * 极端大量时内部滚动，不把页面撑爆） */
 .net-ckpt-list {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  max-height: 132px;
+  max-height: 60vh;
   overflow-y: auto;
   font-size: 12px;
   font-variant-numeric: tabular-nums;
