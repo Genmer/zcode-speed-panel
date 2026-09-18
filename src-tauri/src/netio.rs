@@ -15,7 +15,8 @@
 //!
 //! 1. **整机上传/下载（真实值）**：接口计数器求和（Windows `GetIfTable` 的
 //!    32 位 octets 做模差；macOS `getifaddrs` 的 ifi_*bytes），均排除回环。
-//!    速度 = 10s 滑窗差分；当日累计跨重启持久化（`speed-panel-net.json`）。
+//!    速度 = ~1s 滑窗差分（对齐任务管理器 ~1s 的刷新节奏）；当日累计跨重启
+//!    持久化（`speed-panel-net.json`）。
 //!    注意：本机若走本地代理（ZCode → 127.0.0.1 代理进程 → 外网），整机口径
 //!    含代理隧道加密开销、且混合其他应用流量。
 //! 2. **上传构成拆分**：
@@ -39,8 +40,8 @@ use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-/// 整机速度滑窗（接口计数器抖动大，短窗会跳）
-const NET_WINDOW_MS: i64 = 10_000;
+/// 整机速度滑窗（对齐任务管理器 ~1s 的刷新节奏；短窗读数比长窗更跳，属预期）
+const NET_WINDOW_MS: i64 = 1_000;
 /// 整机采样环容量（~4.5min @700ms）
 const NET_RING_CAP: usize = 400;
 /// 进程分组刷新周期（Toolhelp + 命令行读取，不逐拍）
@@ -534,7 +535,7 @@ pub mod platform {
     /// 端（快照上传监控的取证链），mac 面板如实显示"连接明细仅 Windows"
     #[cfg(target_os = "macos")]
     mod mac {
-        use std::collections::HashMap;
+        use std::collections::{HashMap, HashSet};
         use std::ffi::{c_char, c_int, c_void};
 
         #[link(name = "System")]
@@ -1046,7 +1047,8 @@ impl NetIo {
             available = false;
         }
 
-        // 10s 滑窗差分速度（窗口内最早的样本 vs 最新；累计值单调，直接相减）
+        // 约 1s 滑窗差分速度（窗口内最早的样本 vs 最新；累计值单调，直接相减；
+        // 对齐任务管理器 ~1s 刷新的口径，读数更跳属预期）
         let (up_bps, down_bps) = {
             let r = &self.ring;
             match (r.front(), r.back()) {

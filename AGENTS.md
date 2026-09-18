@@ -15,6 +15,7 @@ npm run tauri build                 # 正式版（Windows NSIS / macOS dmg，按
 rustup target add aarch64-apple-darwin
 MACOSX_DEPLOYMENT_TARGET=11.0 npm run tauri build -- --target aarch64-apple-darwin --bundles dmg
 python scripts/live_vs_true.py      # 对账：实时读数 vs 落盘真值
+python scripts/estats_probe.py      # 复验 TCP ESTATS 每连接字节可用性（key-rules #14 证据；已定论普通权限不可用）
 ```
 
 ## 发版流程（v* 标签 → CI 自动出 Release）

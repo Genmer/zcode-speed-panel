@@ -115,7 +115,7 @@ pub struct Snapshot {
     // ---- 网络流量监控（netio.rs 填充；口径见该模块注释）----
     /// 整机接口计数是否可用（stub 平台 false，前端隐藏网络卡）
     pub net_available: bool,
-    /// 整机实时上传/下载速度（B/s，接口计数器 10s 滑窗实测）
+    /// 整机实时上传/下载速度（B/s，接口计数器约 1s 滑窗实测）
     pub net_up_bps: f64,
     pub net_down_bps: f64,
     /// 整机当日上传/下载累计（真实，跨重启持久化续算）
