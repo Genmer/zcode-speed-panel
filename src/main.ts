@@ -289,7 +289,7 @@ function renderNet(s: Snapshot) {
   netCkptPart.style.display = s.netCkptStatus === "ok" ? "" : "none";
 
   // 快照上传记录：每工作区最近一次工件（时间 / 工作区 / 加密后大小 / 状态），
-  // 上传中 > 待传 > 已接受排序（后端排好）。固定显示 7 行，其余列表内滚动
+  // 上传中 > 待传 > 已接受排序（后端排好）。固定显示 5 行，其余列表内滚动
   // 看完；文字可选中复制，另有 复制/导出 按钮（见 net-ckpt-tools）
   const ckptRows: CkptStat[] = s.netCkptList ?? [];
   netCkptList.textContent = "";

@@ -89,7 +89,7 @@
 - **口径为面板观测期**：面板未运行期间的接受只在上述回补时计入；两拍之间的多次跳变按末态计（下界）。
 - **目录状态**：`ok` / `missing`（无目录）/ `blocked`（不可读——用户用 ACL 封锁 checkpoints 后的如实显示，此时监控不到新上传）。
 - 事件同时写调试日志（`kind:"net"`，`ev`=ckpt_accepted / ckpt_upload_start / ckpt_upload_end，含 `mb` 与 `ws` 工作区名）。
-- **快照上传记录列表**（卡片右栏；窄窗口 <860px 退回单栏）：每个 workspace 一行 = 记录时间（今天 HH:MM，跨天 MM-DD HH:MM）/ 工作区名（workspacePath 末段）/ 加密后大小 / 状态（**上传中 ⬆ / 待传 / 已接受 ✓**），排序 = 上传中 > 待传 > 已接受（同状态按记录时刻倒序），**固定显示 7 行（行高 18px：7×18 + 6×2 间隙 = 138px 限高），其余列表内上下滚动看完**（不把页面整页撑开；`ckpt_rows` 纯函数，测试 `ckpt_rows_sorted_all_workspaces` 守护）。列表读的是 checkpoints 实况（state.json 只保留各工作区最近一次工件，更早历史不可考），面板未运行期间的最后状态启动即见。
+- **快照上传记录列表**（卡片右栏；窄窗口 <860px 退回单栏）：每个 workspace 一行 = 记录时间（今天 HH:MM，跨天 MM-DD HH:MM）/ 工作区名（workspacePath 末段）/ 加密后大小 / 状态（**上传中 ⬆ / 待传 / 已接受 ✓**），排序 = 上传中 > 待传 > 已接受（同状态按记录时刻倒序），**固定显示 5 行（行高 18px：5×18 + 4×2 间隙 = 98px 限高），其余列表内上下滚动看完**（不把页面整页撑开；`ckpt_rows` 纯函数，测试 `ckpt_rows_sorted_all_workspaces` 守护）。列表读的是 checkpoints 实况（state.json 只保留各工作区最近一次工件，更早历史不可考），面板未运行期间的最后状态启动即见。
 - **复制与导出**：列表文字可选中复制（全局 `user-select:none` 的例外区）；列表头有 **复制 / 导出** 按钮——复制把整份纯文本报告（表头 + 逐行记录 + 当日汇总 + ZCode 两组连接实况）写入剪贴板（`navigator.clipboard`，失败退回 `execCommand`），导出走 `export_text_file` 命令写入 `~/.zcode/speed-panel-exports/zcode快照上传记录-日期-时间.txt`（文件名白名单清洗防路径穿越，右下角轻提示完整路径；浏览器预览模式退化为浏览器下载）。
 
 ### ZCode 连接归属（真实值，仅 Windows）

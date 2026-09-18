@@ -263,7 +263,7 @@ function snapshot(now: number, pending: MockCall | null): Snapshot {
     netCkptUploading: mockCkptUploading,
     netCkptStatus: "ok",
     // 快照上传记录模拟：上传中 > 待传 > 已接受（含跨天记录演示月日显示），
-    // 共 9 行演示"固定显示 7 行、其余滚动"
+    // 共 9 行演示"固定显示 5 行、其余滚动"
     netCkptList: [
       { workspace: "GenePad", bytes: 549.2 * 1048576, recordedMs: now - 3600_000, accepted: !mockCkptUploading, uploading: mockCkptUploading },
       { workspace: "GenePad-free", bytes: 1024.0 * 1048576, recordedMs: now - 7 * 3600_000, accepted: true, uploading: false },
