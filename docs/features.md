@@ -50,7 +50,7 @@
 
 ### 为什么是分层口径（平台限制）
 
-**Windows 非管理员下没有"按进程的网络收发字节"公开原语**，2026-09-18 本机实验定论（详见 key-rules #14）：
+**Windows 非管理员下没有"按进程的网络收发字节"公开原语**，2026-09-18 本机实验定论（详见 key-rules #15）：
 
 - Winsock 收发字节**不进** `GetProcessIoCounters` 的任何计数（20MB 下载期间 Read 仅 7.8KB）——进程 IO 计数器只含文件/管道/设备，liveio 的流式测速因此天然不受网络污染；
 - TCP ESTATS（`SetPerTcpConnectionEStats`，唯一的每连接字节 API）在新版 Windows 上对所有连接（含本进程自有的）返回 `ERROR_NOT_SUPPORTED`，管理员也一样；
@@ -100,6 +100,20 @@ TCP 连接表（`GetExtendedTcpTable` OWNER_PID，v4+v6，仅 ESTABLISHED）按�
 
 每条连接都标注**归属进程**（类型标签 + pid，按 Electron `--type` 参数区分：CLI 会话进程 / 主进程 / 渲染进程 / GPU 进程 / 工具进程 / 崩溃报告进程，`proc_label` 纯函数、测试 `proc_label_by_command_line` 守护）；两组各行显示按 远端+pid 去重的条数，**悬停 tooltip 逐条列出 `远端 ip:port · 进程类型(pid)`**。**证据链用法**：整机上传速度飙升 + 桌面端组出现新连接 + activeUpload = 快照上传正在发生的现场证据。mac 侧连接归属未实现（面板隐藏该行，接口计数仍可用）。
 
+## 快照防护（snapshot_guard.rs + src/guard.ts）
+
+完整面板"网络流量与上传监控"卡下方的独立卡片：**阻断 ZCode 工作区快照的静默上传**。
+
+- **机制**：ZCode 登录后会把整个工作区（含 `.git/` 全历史）打成加密 tar.gz 写入 `~/.zcode/v2/checkpoints/<工作区hash>/pending/*.tar.gz.enc`，经 zcode.z.ai 拿凭证直传阿里云 OSS；设置开关无效，凭证 API 与模型 API 同域**不能封网络**（2026-09 本机验证，[机制分析文章](https://blog.ferstar.org/posts/zcode-silent-workspace-snapshot-upload/)）。防护 = 清空该目录后对目录本身 `chflags uchg`（macOS 用户级不可变标志，用户自有目录无需 sudo）——ZCode 写不进去，快照链路死亡。**不碰网络、不碰进程**，对运行中的 ZCode 无侵入。
+- **代价与可逆**：唯一功能损失是**「检查点回滚 / 时间线」**（无法再回滚到历史检查点）；模型对话、代码补全、工具调用完全不受影响。`chflags nouchg` 随时可逆，目录留空时 ZCode 会自动重建内容。开启防护还会**删除本地已积累的全部快照工件**（开启前弹确认窗明示数量与体积）。
+- **卡片口径**：
+  - 状态徽标 🔒 已防护（绿色描边）/ 🔓 未防护，由**写入探测**判定（在目录里 create+delete 临时文件，创建失败 = 已锁；目录不存在 = 未锁）；
+  - 数据行 `已积累工件 N 个 · X · 覆盖 M 个工作区 · ZCode 记录上传失败 K 次`——工件 = `**/pending/*.enc` 逐文件实测体积，K = 各 `state.json` 的 `failureCount` 求和（ZCode 自己记录的上传失败计数），损坏的 state.json 跳过但仍计工件与目录数；扫描 5s 节流；
+  - 防护中追加 `防护开启后 P 轮对话 · 新快照落盘 0 个`——P 为锁定后的对话轮次：锁定时刻的 `calls_today` 基线存 `~/.zcode/speed-panel-guard.json`，poller 每拍按 calls 增量累计并落盘（跨天 calls 回退按 0 增量重置基准拍）；目录已锁但 guard.json 无记录（用户手动 chflags / 重装面板）时首拍补记基线。
+- **命令**：`snapshot_guard_status` / `snapshot_guard_apply` / `snapshot_guard_release`（均注册在 generate_handler）；状态另随 metrics payload 的 `guard` 字段每拍附带。apply = 先 nouchg（幂等）→ 清空 → 重建空目录 → uchg → 写入探测校验 → 记 guard.json；release = nouchg + 清空计数，目录内容留空由 ZCode 自动重建。**确认弹窗在前端**（`#guard-confirm`，复用模型弹窗遮罩风格）——开启文案必须明示损失检查点回滚 / 对话不受影响 / 删除现有工件 / 可逆（key-rules #16 知情同意）。
+- **平台**：`chflags` 仅 macOS——其他平台卡片仍显示但按钮禁用、标题右侧标注"文件锁仅支持 macOS"（沿用连接明细"仅 Windows"的如实降级先例）。
+- **守护测试**：`state_summary_parse_and_aggregate`（failureCount 求和 / 工件体积累计 / 损坏容错）、`guard_status_serializes_locked_fields`（状态字段 camelCase 序列化契约 + guard.json 往返）。
+
 ## 仪表与曲线（gauges.ts）
 
 - **当前速度表**：最小量程 60 t/s（`minScale` 可按表覆盖）；卡片左上角有 **⟳ 重新校准按钮**（口径见"实时速度"节），与右上角"上轮"角标呼应；**平均速度表**：最小 10 t/s；**今日总量表**：最小量程 1 亿 token，超峰值后自动放大（1亿→2亿→5亿→…），回落缓慢收缩。
@@ -115,6 +129,7 @@ TCP 连接表（`GetExtendedTcpTable` OWNER_PID，v4+v6，仅 ESTABLISHED）按�
 - **桶粒度**：统一 60 桶，`bucket_ms = 窗口 ÷ 60`（10min→10s、1h→60s、6h→360s）；桶序号 = `(now − completed_at) ÷ bucket_ms`（0 = 最新桶、59 = 最旧，越界丢弃）；无调用的桶 tps = 0。
 - **每模型曲线**：桶 tps = Σ(output+reasoning) ÷ Σ纯生成秒；gen_ms 口径与全局一致（`completed_at − first_token_at`，first_token 缺失或非正退 `duration_ms`，下限 50ms）。y 轴 0~峰值×1.15 自适应（3 条横网格线 + 刻度），x 轴 5 个真实墙钟刻度（HH:MM）；折线配色按序取 8 色调色板循环，图例中模型名超 18 字符截断加 …（完整名放 title）。
 - **每模型统计条**：模型名 + `均速（全窗口 Σeff ÷ Σgen_s）· 峰值（各桶 tps 最大值）· 调用次数 · token（=Σeff，附占比 = 该模型 eff ÷ 全部模型 eff）`；series 按 total_tokens 降序排列。
+- **图例 chips 多选**：图例每模型一个自绘 chip（色点 + 名字，深色按钮风格），点击切换该模型显隐——折线与底部统计行同步过滤，chip 配色取模型在完整列表中的原始序号（隐藏再显示颜色不变）；**至少保留一个**：全取消时自动回到全选。图例行尾有「全选」「仅 Top3」（按 total_tokens 前三，模型不足 3 个时等价全选）两个小文字按钮。选中集合持久化在 localStorage（`modelStats.visible.v1`，存可见模型名数组；查不到 / 模型已全部不存在时回退全选；5s 轮询刷新期间选中集合在内存保持，新出现的模型默认可见，不被旧存档静默隐藏）。
 - **数据源与零存储**：直接只读查询 `~/.zcode/cli/db/db.sqlite` 的 `model_usage` 表（`status='completed' AND completed_at >= now − 窗口`），Rust 现算聚合、内存缓存最近一次结果；**不给该库建索引/写入，也不新增任何本地存储**。前端仅在弹窗打开期间每 5s `invoke("model_stats", { windowMin })` 拉取，关闭即 clearInterval。
 - **测试**：`aggregate_model_stats` 为纯函数（`metrics.rs`），两模型两桶聚合、窗口 clamp 与 gen_ms 退化各有单测守护。
 
@@ -158,6 +173,7 @@ TCP 连接表（`GetExtendedTcpTable` OWNER_PID，v4+v6，仅 ESTABLISHED）按�
 | `~/.zcode/speed-panel-mode.txt` | JSON：mode/style/full_pos/float_pos/pet_size（旧格式纯文本兼容） |
 | `~/.zcode/speed-panel-cal.json` | 系数样本队列（updated_ms + samples，超 14 天过期回先验；见"实时速度"节） |
 | `~/.zcode/speed-panel-net.json` | 网络当日累计（day/up/down/ckpt/ckpt_count + 当日已接受工件名单 uploads，跨天清零；见"网络流量与上传监控"节） |
+| `~/.zcode/speed-panel-guard.json` | 快照防护状态（lockedSinceMs/callsBaseline/blockedRounds，未防护时不落多余键；见"快照防护"节） |
 | `~/.zcode/speed-panel-debug.jsonl` | 调试日志（8MB 轮转 + 7 天清理） |
 
 ## 应用内更新（updater.rs）

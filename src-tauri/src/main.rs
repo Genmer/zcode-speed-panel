@@ -3,6 +3,7 @@
 mod liveio;
 mod metrics;
 mod netio;
+mod snapshot_guard;
 mod updater;
 
 use liveio::{LiveIo, RoundDrift};
@@ -89,6 +90,8 @@ struct AppState {
     live: Mutex<LiveIo>,
     /// 网络流量监控（netio.rs：整机接口计数 + 连接归属 + 快照上传证据）
     net: Mutex<netio::NetIo>,
+    /// 快照防护（snapshot_guard.rs：chflags 目录不可变锁，随 poller 每拍更新）
+    guard: Mutex<snapshot_guard::SnapshotGuard>,
     debug: Mutex<DebugLog>,
     persist: Mutex<Persisted>,
     /// 位置落盘节流（拖动期间每 2s 一次，关闭/退出立即落盘）
@@ -433,6 +436,8 @@ struct SnapshotPayload {
     rollout_dir: String,
     mode: String,
     float_style: String,
+    /// 快照防护状态（每拍附带，前端卡片渲染）
+    guard: snapshot_guard::SnapshotGuardStatus,
 }
 
 fn build_payload(app: &AppHandle) -> SnapshotPayload {
@@ -455,6 +460,9 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
     // 实时实测：进程 IO 写字节流（真实值）。多任务并发（多窗口/子代理）时
     // 按进行中会话的归属进程并集聚合，当前速度 = 真实总吞吐
     let now_ms = snapshot.now_ms;
+    // 快照防护（snapshot_guard.rs）：锁定探测 + blocked_rounds 增量累计 +
+    // 节流扫描，随 payload 推送前端卡片
+    let guard_status = state.guard.lock().unwrap().tick(snapshot.calls_today, now_ms);
     // 网络流量监控：整机接口计数差分 + 连接归属 + checkpoint 工件证据
     let net_now = state.net.lock().unwrap().tick(now_ms);
     let net_log_events: Vec<serde_json::Value> = state.net.lock().unwrap().take_events().into_iter().collect();
@@ -739,12 +747,52 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
         snapshot,
         mode: mode.as_str().to_string(),
         float_style: style.as_str().to_string(),
+        guard: guard_status,
     }
 }
 
 #[tauri::command]
 fn snapshot(app: AppHandle) -> SnapshotPayload {
     build_payload(&app)
+}
+
+/// 当前 epoch ms（快照防护锁定时刻记录用）
+fn epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+// ---- 快照防护（snapshot_guard.rs）：状态随 metrics payload 每拍附带，
+//      此处三个命令供前端卡片手动查询 / 开启 / 解除（开启与解除的知情
+//      同意确认弹窗在前端 #guard-confirm，见 key-rules #16）----
+
+#[tauri::command]
+fn snapshot_guard_status(app: AppHandle) -> snapshot_guard::SnapshotGuardStatus {
+    let state = app.state::<AppState>();
+    let mut guard = state.guard.lock().unwrap();
+    let calls = guard.last_calls_seen();
+    guard.tick(calls, epoch_ms())
+}
+
+/// 开启防护：清空并锁定 ~/.zcode/v2/checkpoints（前端已过确认弹窗）
+#[tauri::command]
+fn snapshot_guard_apply(app: AppHandle) -> Result<snapshot_guard::SnapshotGuardStatus, String> {
+    let state = app.state::<AppState>();
+    // 锁定时刻的 calls_today 基线取实时真值（Engine 只读聚合，一次性开销可接受）
+    let calls = state.engine.lock().unwrap().snapshot().calls_today;
+    let result = state.guard.lock().unwrap().apply(calls, epoch_ms());
+    result
+}
+
+/// 解除防护：解锁目录（内容留空，ZCode 自动重建），清空计数
+#[tauri::command]
+fn snapshot_guard_release(app: AppHandle) -> Result<snapshot_guard::SnapshotGuardStatus, String> {
+    let state = app.state::<AppState>();
+    let calls = state.engine.lock().unwrap().snapshot().calls_today;
+    let result = state.guard.lock().unwrap().release(calls);
+    result
 }
 
 /// 模型速度趋势：只读查询 usage 库按模型 × 桶聚合（详情弹窗打开期间前端每 5s 拉取）。
@@ -1391,6 +1439,7 @@ fn main() {
             style: Mutex::new(FloatStyle::Gauge),
             live: Mutex::new(LiveIo::new()),
             net: Mutex::new(netio::NetIo::new()),
+            guard: Mutex::new(snapshot_guard::SnapshotGuard::new()),
             debug: Mutex::new(DebugLog::new()),
             persist: Mutex::new(Persisted::default()),
             last_pos_save: Mutex::new(None),
@@ -1420,7 +1469,10 @@ fn main() {
             install_update,
             app_version,
             export_text_file,
-            open_url
+            open_url,
+            snapshot_guard_status,
+            snapshot_guard_apply,
+            snapshot_guard_release
         ])
         .setup(|app| {
             // mac：Accessory 模式——无 Dock 图标、不进 Cmd+Tab，常驻菜单栏托盘；

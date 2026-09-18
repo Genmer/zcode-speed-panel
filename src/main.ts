@@ -4,12 +4,15 @@ import { ArcGauge, BadgeGauge, MiniGauge, SPEED_TIERS, drawSpark, fmtBps, fmtByt
 import { PetWidget } from "./pet";
 import { startMock, type CkptStat, type ConnStat, type Snapshot } from "./mock";
 import { initModelStats } from "./model_stats";
+import { initGuard, renderGuard, type GuardStatus } from "./guard";
 
 interface SnapshotPayload {
   snapshot: Snapshot;
   rolloutDir: string;
   mode: string;
   floatStyle: string;
+  /** 快照防护状态（后端 snapshot_guard.rs；mock 模式无此字段 → 卡片隐藏） */
+  guard?: GuardStatus;
 }
 
 const $ = <T extends HTMLElement>(id: string): T => {
@@ -842,11 +845,15 @@ applyStyleUi(localStorage.getItem("floatStyle") ?? "gauge");
 // ---- 模型速度趋势详情弹窗（图表卡片"模型详情"入口；复用同一个 tauriInvoke） ----
 initModelStats(tauriInvoke);
 
+// ---- 快照防护卡片（网络监控卡下方；状态随 metrics payload 的 guard 字段推送） ----
+initGuard(tauriInvoke);
+
 if (hasTauri) {
   (async () => {
     const { listen } = await import("@tauri-apps/api/event");
     await listen<SnapshotPayload>("metrics", (e) => {
       onSnapshot({ ...e.payload.snapshot, rolloutDir: e.payload.rolloutDir });
+      renderGuard(e.payload.guard ?? null);
     });
     await listen<string>("mode", (e) => applyModeUi(e.payload));
     await listen("tray-hint", () => showTrayHint());
@@ -865,6 +872,7 @@ if (hasTauri) {
         applyStyleUi(p.floatStyle);
       }
       onSnapshot({ ...p.snapshot, rolloutDir: p.rolloutDir });
+      renderGuard(p.guard ?? null);
     }
     // mac 启动引导（一次性）：页面就绪后主动领取，避免 setup 内 emit 早于加载被丢弃
     if (await tauriInvoke<boolean>("tray_hint_once")) showTrayHint();
