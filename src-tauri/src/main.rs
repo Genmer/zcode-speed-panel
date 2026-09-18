@@ -4,7 +4,7 @@ mod liveio;
 mod metrics;
 
 use liveio::LiveIo;
-use metrics::{home_dir, Engine, Snapshot};
+use metrics::{home_dir, Engine, ModelStatsPayload, Snapshot};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -514,6 +514,15 @@ fn snapshot(app: AppHandle) -> SnapshotPayload {
     build_payload(&app)
 }
 
+/// 模型速度趋势：只读查询 usage 库按模型 × 桶聚合（详情弹窗打开期间前端每 5s 拉取）。
+/// 聚合在 Engine 内现算完成，零本地存储、不写入 usage 库
+#[tauri::command]
+fn model_stats(app: AppHandle, window_min: i64) -> ModelStatsPayload {
+    let state = app.state::<AppState>();
+    let engine = state.engine.lock().unwrap();
+    engine.model_stats(window_min)
+}
+
 #[tauri::command]
 fn set_mode(app: AppHandle, mode: String, style: Option<String>) {
     if let Some(s) = style {
@@ -759,6 +768,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             snapshot,
+            model_stats,
             set_mode,
             set_float_style,
             set_float_size,

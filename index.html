@@ -56,7 +56,10 @@
         <section class="card chart-card">
           <div class="chart-head">
             <span>近 15 分钟输出速度（10 秒一档 · token/s，横轴为真实时刻）</span>
-            <span id="chart-max" class="dim">峰值 0</span>
+            <span class="chart-head-right">
+              <span id="chart-max" class="dim">峰值 0</span>
+              <button id="btn-model-stats" class="ghost-btn" type="button" title="按模型分类的速度趋势与统计（最近 10 分钟 / 1 小时 / 6 小时）">模型详情</button>
+            </span>
           </div>
           <canvas id="spark"></canvas>
         </section>
@@ -101,6 +104,33 @@
 
       <!-- mac 引导提示：应用常驻菜单栏（无 Dock 图标），窗口每次从隐藏到显示时出现，6 秒自动淡出 -->
       <div id="tray-hint" title="点击关闭">应用常驻菜单栏 ↗ 点菜单栏图标可显示面板 / 退出</div>
+
+      <!-- 模型速度趋势详情弹窗：三档时间窗 × 按模型折线与统计（只读查询 usage 库现算，零本地存储） -->
+      <div id="model-modal">
+        <div id="model-modal-box">
+          <div class="model-modal-head">
+            <span class="model-modal-title">模型速度趋势</span>
+            <div id="model-window" class="dropdown" title="统计窗口">
+              <button id="model-window-btn" class="ghost-btn" type="button" aria-haspopup="listbox" aria-expanded="false">
+                <span id="model-window-label">最近 1 小时</span>
+                <span class="caret">▾</span>
+              </button>
+              <div id="model-window-list" class="dropdown-list" role="listbox" aria-label="统计窗口">
+                <button type="button" role="option" data-value="10">最近 10 分钟</button>
+                <button type="button" role="option" data-value="60" class="selected">最近 1 小时</button>
+                <button type="button" role="option" data-value="360">最近 6 小时</button>
+              </div>
+            </div>
+            <button id="model-modal-close" class="ghost-btn" type="button" title="关闭">✕</button>
+          </div>
+          <div id="model-legend"></div>
+          <div id="model-chart-wrap">
+            <canvas id="model-chart"></canvas>
+            <div id="model-empty">窗口内暂无调用数据</div>
+          </div>
+          <div id="model-summary"></div>
+        </div>
+      </div>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>

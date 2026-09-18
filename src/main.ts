@@ -3,6 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ArcGauge, MiniGauge, SPEED_TIERS, drawSpark, fmtClock, fmtTokens, fmtTps } from "./gauges";
 import { PetWidget } from "./pet";
 import { startMock, type Snapshot } from "./mock";
+import { initModelStats } from "./model_stats";
 
 interface SnapshotPayload {
   snapshot: Snapshot;
@@ -336,6 +337,9 @@ if (hasTauri) {
 }
 
 applyStyleUi(localStorage.getItem("floatStyle") ?? "gauge");
+
+// ---- 模型速度趋势详情弹窗（图表卡片"模型详情"入口；复用同一个 tauriInvoke） ----
+initModelStats(tauriInvoke);
 
 if (hasTauri) {
   (async () => {
