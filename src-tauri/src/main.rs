@@ -2,6 +2,7 @@
 
 mod liveio;
 mod metrics;
+mod netio;
 mod updater;
 
 use liveio::{LiveIo, RoundDrift};
@@ -86,6 +87,8 @@ struct AppState {
     mode: Mutex<Mode>,
     style: Mutex<FloatStyle>,
     live: Mutex<LiveIo>,
+    /// 网络流量监控（netio.rs：整机接口计数 + 连接归属 + 快照上传证据）
+    net: Mutex<netio::NetIo>,
     debug: Mutex<DebugLog>,
     persist: Mutex<Persisted>,
     /// 位置落盘节流（拖动期间每 2s 一次，关闭/退出立即落盘）
@@ -291,6 +294,8 @@ fn save_all(app: &AppHandle) {
     let mode = *state.mode.lock().unwrap();
     let style = *state.style.lock().unwrap();
     let p = state.persist.lock().unwrap().clone();
+    // 网络当日累计一并落盘（退出/位置保存路径共用）
+    state.net.lock().unwrap().save_forced();
     if let Some(path) = mode_file() {
         let json = serde_json::json!({
             "mode": mode.as_str(),
@@ -450,6 +455,38 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
     // 实时实测：进程 IO 写字节流（真实值）。多任务并发（多窗口/子代理）时
     // 按进行中会话的归属进程并集聚合，当前速度 = 真实总吞吐
     let now_ms = snapshot.now_ms;
+    // 网络流量监控：整机接口计数差分 + 连接归属 + checkpoint 工件证据
+    let net_now = state.net.lock().unwrap().tick(now_ms);
+    let net_log_events: Vec<serde_json::Value> = state.net.lock().unwrap().take_events().into_iter().collect();
+    snapshot.net_available = net_now.available;
+    snapshot.net_up_bps = net_now.up_bps;
+    snapshot.net_down_bps = net_now.down_bps;
+    snapshot.net_up_today = net_now.up_today;
+    snapshot.net_down_today = net_now.down_today;
+    // 会话流量估算（≈）：上传分子用未缓存提示（缓存命中不重发，实测整机
+    // 当日上传仅数十 KB），下载按输出 token × SSE 密度系数；非会话上传的
+    // 真实下界来自 checkpoint 工件
+    let uncached_prompt = snapshot
+        .input_tokens
+        .saturating_add(snapshot.cache_creation_tokens)
+        .saturating_sub(snapshot.cache_read_tokens);
+    let (sess_up, sess_down) = netio::sess_bytes_est(
+        uncached_prompt,
+        snapshot.output_tokens + snapshot.reasoning_tokens,
+    );
+    snapshot.net_sess_up_today = sess_up;
+    snapshot.net_sess_down_today = sess_down;
+    snapshot.net_ckpt_today = net_now.ckpt_today_bytes;
+    snapshot.net_ckpt_today_count = net_now.ckpt_today_count;
+    snapshot.net_ckpt_today_list = net_now.ckpt_today_list.clone();
+    snapshot.net_ckpt_uploading = net_now.ckpt_uploading;
+    snapshot.net_ckpt_status = net_now.ckpt_status.clone();
+    snapshot.net_ckpt_list = net_now.ckpt_list.clone();
+    snapshot.net_conns_available = net_now.conns_available;
+    snapshot.net_cli_conns = net_now.cli_conns;
+    snapshot.net_app_conns = net_now.app_conns;
+    snapshot.net_cli_conn_list = net_now.cli_conn_list.clone();
+    snapshot.net_app_conn_list = net_now.app_conn_list.clone();
     let cal_event;
     let bpt_now;
     let pipe_bps;
@@ -556,6 +593,9 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
     {
         let state = app.state::<AppState>();
         let mut log = state.debug.lock().unwrap();
+        for ev in &net_log_events {
+            log.write(ev.clone());
+        }
         for c in &new_calls {
             log.write(serde_json::json!({
                 "kind": "call",
@@ -633,6 +673,11 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
                 "infl": inflight.len(),
                 "pids": pids_json,
                 "attr": attr_json,
+                "net_up": (net_now.up_bps / 1024.0 * 10.0).round() / 10.0,
+                "net_dn": (net_now.down_bps / 1024.0 * 10.0).round() / 10.0,
+                "cli_conn": net_now.cli_conns,
+                "app_conn": net_now.app_conns,
+                "ckpt_up": net_now.ckpt_uploading,
             }));
         }
     }
@@ -1151,6 +1196,32 @@ fn app_version(app: AppHandle) -> String {
     current_version(&app)
 }
 
+/// 导出文本文件（快照上传记录等前端生成的报告）：写入
+/// `~/.zcode/speed-panel-exports/<file_name>`，返回完整路径供前端提示。
+/// 文件名做白名单清洗（只留字母数字._-，防路径注入/穿越）
+#[tauri::command]
+fn export_text_file(file_name: String, text: String) -> Result<String, String> {
+    const MAX_TEXT: usize = 4 * 1024 * 1024;
+    if text.len() > MAX_TEXT {
+        return Err("内容过大".into());
+    }
+    let cleaned: String = file_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .collect();
+    if cleaned.is_empty() || cleaned.starts_with('.') {
+        return Err("文件名无效".into());
+    }
+    let Some(home) = home_dir() else {
+        return Err("无法定位用户目录".into());
+    };
+    let dir = home.join(".zcode").join("speed-panel-exports");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建导出目录失败: {e}"))?;
+    let path = dir.join(cleaned);
+    std::fs::write(&path, text.as_bytes()).map_err(|e| format!("写入失败: {e}"))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 /// 用系统默认浏览器打开链接（更新说明页）。WebView 内 <a> 导航行为不可控，
 /// 统一由后端代开；仅接受 https，防前端注入 file:// 一类协议
 #[tauri::command]
@@ -1319,6 +1390,7 @@ fn main() {
             mode: Mutex::new(Mode::Full),
             style: Mutex::new(FloatStyle::Gauge),
             live: Mutex::new(LiveIo::new()),
+            net: Mutex::new(netio::NetIo::new()),
             debug: Mutex::new(DebugLog::new()),
             persist: Mutex::new(Persisted::default()),
             last_pos_save: Mutex::new(None),
@@ -1347,6 +1419,7 @@ fn main() {
             check_update,
             install_update,
             app_version,
+            export_text_file,
             open_url
         ])
         .setup(|app| {

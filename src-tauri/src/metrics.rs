@@ -46,6 +46,36 @@ pub struct TaskStat {
     pub streaming: bool,
 }
 
+/// ZCode 连接明细行（netio 填充）：一条 ESTABLISHED 连接 + 归属进程
+#[derive(Serialize, Clone, Debug, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnStat {
+    /// 远端 "ip:port"（v6 为 "[addr]:port"）
+    pub remote: String,
+    /// 归属进程 pid
+    pub pid: u32,
+    /// 进程类型标签（"CLI 会话进程" / "主进程" / "渲染进程" / "GPU 进程" /
+    /// "工具进程" / "崩溃报告进程"）——两组都是 ZCode 自身进程，按角色区分
+    pub proc: String,
+}
+
+/// 快照上传记录行（netio 填充）：每个 workspace 的**最近一次**工件实况，
+/// 来自 `~/.zcode/v2/checkpoints/*/state.json`
+#[derive(Serialize, Clone, Debug, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CkptStat {
+    /// 工作区显示名（workspacePath 末段）
+    pub workspace: String,
+    /// 最近一次压缩加密工件字节数
+    pub bytes: u64,
+    /// 工件记录时刻（recordedAt，epoch ms；0 = 未知）
+    pub recorded_ms: i64,
+    /// 最近工件已被服务端接受（lastAcceptedManifestHash 非空）
+    pub accepted: bool,
+    /// activeUpload 进行中
+    pub uploading: bool,
+}
+
 /// 推送给前端的指标快照
 #[derive(Serialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
@@ -82,6 +112,37 @@ pub struct Snapshot {
     pub spark: Vec<f64>,
     /// 并发任务分进程明细（实时链路填充；≥2 个时前端显示任务列表）
     pub tasks: Vec<TaskStat>,
+    // ---- 网络流量监控（netio.rs 填充；口径见该模块注释）----
+    /// 整机接口计数是否可用（stub 平台 false，前端隐藏网络卡）
+    pub net_available: bool,
+    /// 整机实时上传/下载速度（B/s，接口计数器 10s 滑窗实测）
+    pub net_up_bps: f64,
+    pub net_down_bps: f64,
+    /// 整机当日上传/下载累计（真实，跨重启持久化续算）
+    pub net_up_today: u64,
+    pub net_down_today: u64,
+    /// 会话流量估算（≈，token×系数）：当日上传（请求体）/ 下载（流式响应）
+    pub net_sess_up_today: u64,
+    pub net_sess_down_today: u64,
+    /// 当日接受的快照工件字节（非会话上传的真实下界，加密压缩后）
+    pub net_ckpt_today: u64,
+    pub net_ckpt_today_count: u32,
+    /// 当日已接受工件名单（时间/工作区/大小——回答"是哪几个"，跨重启持久化）
+    pub net_ckpt_today_list: Vec<CkptStat>,
+    /// 是否有快照上传进行中（activeUpload）
+    pub net_ckpt_uploading: bool,
+    /// checkpoints 目录状态：ok / missing / blocked（ACL 封锁）
+    pub net_ckpt_status: String,
+    /// 快照上传记录（每工作区最近一次工件的实况列表）
+    pub net_ckpt_list: Vec<CkptStat>,
+    /// 连接归属是否可用（仅 Windows）
+    pub net_conns_available: bool,
+    /// 会话组（CLI 进程）/ 桌面端组（其余 zcode.exe）的连接数与明细
+    /// （每条含远端 + 归属 pid + 进程类型标签；两组均为 ZCode 自身进程）
+    pub net_cli_conns: u32,
+    pub net_app_conns: u32,
+    pub net_cli_conn_list: Vec<ConnStat>,
+    pub net_app_conn_list: Vec<ConnStat>,
 }
 
 /// 当前速度统计窗口
@@ -293,6 +354,24 @@ impl Aggregator {
             rollout_dir: String::new(),
             spark,
             tasks: Vec::new(),
+            net_available: false,
+            net_up_bps: 0.0,
+            net_down_bps: 0.0,
+            net_up_today: 0,
+            net_down_today: 0,
+            net_sess_up_today: 0,
+            net_sess_down_today: 0,
+            net_ckpt_today: 0,
+            net_ckpt_today_count: 0,
+            net_ckpt_today_list: Vec::new(),
+            net_ckpt_uploading: false,
+            net_ckpt_status: String::new(),
+            net_ckpt_list: Vec::new(),
+            net_conns_available: false,
+            net_cli_conns: 0,
+            net_app_conns: 0,
+            net_cli_conn_list: Vec::new(),
+            net_app_conn_list: Vec::new(),
         }
     }
 }

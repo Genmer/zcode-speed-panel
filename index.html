@@ -90,6 +90,69 @@
           <div id="task-list"></div>
         </section>
 
+        <!-- 网络流量与上传监控：整机接口实测速度 + 会话/非会话上传拆分。
+             按进程直测网络字节无公开原语（socket 不进进程 IO 计数、ESTATS 已坏），
+             口径分层：整机=真实 / 快照工件=真实下界 / 会话=token 估算（≈）。
+             双栏布局（左：速度与当日累计 / 右：快照上传记录）控制卡片高度，
+             窄窗口（<860px）自动退回单栏 -->
+        <section class="card net-card" id="net-card" hidden>
+          <div class="chart-head">
+            <span>网络流量与上传监控</span>
+            <span class="dim" id="net-scope">整机实测</span>
+          </div>
+          <div class="net-body">
+            <div class="net-left">
+              <div class="net-speeds">
+                <div class="net-speed up" title="整机口径：本机全部应用（含系统/浏览器/代理隧道）的网络上传，非仅 ZCode。ZCode 的部分见下方拆分与连接归属">
+                  <span class="net-arrow">↑</span>
+                  <div class="net-speed-body">
+                    <span class="net-val" id="net-up-bps">--</span>
+                    <span class="net-sub">整机上传 · 全部应用</span>
+                  </div>
+                </div>
+                <div class="net-speed down" title="整机口径：本机全部应用（含系统/浏览器/代理隧道）的网络下载，非仅 ZCode。会话（模型输出）的估算值见下方">
+                  <span class="net-arrow">↓</span>
+                  <div class="net-speed-body">
+                    <span class="net-val" id="net-down-bps">--</span>
+                    <span class="net-sub">整机下载 · 全部应用</span>
+                  </div>
+                </div>
+                <div class="net-conns" id="net-conns" title="两组都是 ZCode 自身进程的连接（不含其他应用）：会话进程 = CLI（app-server），走对话 API 流量；桌面端 = ZCode 桌面端（Electron 主/渲染/GPU/工具进程），走快照上传、遥测等非对话流量。悬停下方两行可看每条连接的远端与归属进程">
+                  <span class="net-conn-row" id="net-conn-cli" title="">ZCode 会话进程 <b id="net-cli-conns">0</b> 连接</span>
+                  <span class="net-conn-row" id="net-conn-app" title="">ZCode 桌面端 <b id="net-app-conns">0</b> 连接</span>
+                </div>
+              </div>
+              <div class="net-today">
+                <div class="net-today-row">
+                  <span class="net-today-label">今日上传</span>
+                  <span class="net-part">会话 ≈<b id="net-sess-up">--</b></span>
+                  <span class="net-part warn" id="net-ckpt-part">快照工件 <b id="net-ckpt">--</b><span class="dim" id="net-ckpt-count"></span></span>
+                  <span class="net-part">整机 <b id="net-up-today">--</b></span>
+                </div>
+                <div class="net-today-row">
+                  <span class="net-today-label">今日下载</span>
+                  <span class="net-part">会话 ≈<b id="net-sess-down">--</b></span>
+                  <span class="net-part">整机 <b id="net-down-today">--</b></span>
+                </div>
+              </div>
+              <div class="net-ckpt" id="net-ckpt-info" hidden>
+                <span class="dot live" id="net-ckpt-dot"></span>
+                <span id="net-ckpt-text"></span>
+              </div>
+            </div>
+            <div class="net-right">
+              <div class="net-ckpt-list-head">
+                <span class="dim">快照上传记录（ZCode 各工作区 · 时间 / 工作区 / 加密后大小 / 状态，上下滚动查看全部）</span>
+                <span class="net-ckpt-tools">
+                  <button id="net-ckpt-copy" class="ghost-btn net-tool-btn" type="button" title="把快照上传记录复制到剪贴板">复制</button>
+                  <button id="net-ckpt-export" class="ghost-btn net-tool-btn" type="button" title="把快照上传记录导出为文本文件（保存到 ~/.zcode/speed-panel-exports/）">导出</button>
+                </span>
+              </div>
+              <div class="net-ckpt-list" id="net-ckpt-list"></div>
+            </div>
+          </div>
+        </section>
+
         <section class="card chart-card">
           <div class="chart-head">
             <span>近 15 分钟输出速度（10 秒一档 · token/s，横轴为真实时刻）</span>

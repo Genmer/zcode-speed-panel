@@ -11,6 +11,23 @@ export interface TaskStat {
   streaming: boolean;
 }
 
+/** 快照上传记录行（与后端 CkptStat 同形） */
+export interface CkptStat {
+  workspace: string;
+  bytes: number;
+  recordedMs: number;
+  accepted: boolean;
+  uploading: boolean;
+}
+
+/** ZCode 连接明细行（与后端 ConnStat 同形）：两组均为 ZCode 自身进程 */
+export interface ConnStat {
+  remote: string;
+  pid: number;
+  /** 进程类型标签：CLI 会话进程 / 主进程 / 渲染进程 / GPU 进程 / 工具进程 / 崩溃报告进程 */
+  proc: string;
+}
+
 export interface Snapshot {
   currentTps: number;
   avgTps: number;
@@ -38,6 +55,28 @@ export interface Snapshot {
   spark: number[];
   /** 并发任务分进程明细（≥2 个时前端显示任务列表） */
   tasks: TaskStat[];
+  // ---- 网络流量监控（netio.rs；浏览器预览为模拟值） ----
+  netAvailable: boolean;
+  netUpBps: number;
+  netDownBps: number;
+  netUpToday: number;
+  netDownToday: number;
+  netSessUpToday: number;
+  netSessDownToday: number;
+  netCkptToday: number;
+  netCkptTodayCount: number;
+  /** 当日已接受工件名单（时间/工作区/大小） */
+  netCkptTodayList: CkptStat[];
+  netCkptUploading: boolean;
+  netCkptStatus: string;
+  /** 快照上传记录（每工作区最近一次工件实况） */
+  netCkptList: CkptStat[];
+  netConnsAvailable: boolean;
+  netCliConns: number;
+  netAppConns: number;
+  /** 连接明细（每条含远端 + 归属 pid + 进程类型标签） */
+  netCliConnList: ConnStat[];
+  netAppConnList: ConnStat[];
 }
 
 interface MockCall {
@@ -62,6 +101,11 @@ const rnd = (a: number, b: number) => a + Math.random() * (b - a);
 
 let calls: MockCall[] = [];
 let sessionNo = 1;
+// 网络监控模拟状态：当日累计单调累加；偶发一段"快照上传"演示警示行
+let netUpToday = rnd(2e8, 6e8);
+let netDownToday = rnd(1e9, 4e9);
+let mockCkptUploading = false;
+let ckptNextToggle = Date.now() + rnd(15_000, 40_000);
 
 function newCall(now: number): MockCall {
   if (Math.random() < 0.18) sessionNo++;
@@ -199,6 +243,47 @@ function snapshot(now: number, pending: MockCall | null): Snapshot {
     rolloutDir: "（浏览器预览 · 模拟数据）",
     spark,
     tasks,
+    // 网络监控模拟：速度随调用活动起伏，当日累计单调累加
+    netAvailable: true,
+    netUpBps: isLive ? rnd(20_000, 90_000) : rnd(0, 3_000),
+    netDownBps: isLive ? rnd(80_000, 400_000) : rnd(0, 8_000),
+    netUpToday: netUpToday,
+    netDownToday: netDownToday,
+    // 与后端同口径：上传按未缓存提示（input−cache_read）×5，下载按输出 ×400
+    netSessUpToday: Math.max(0, input - cache) * 5,
+    netSessDownToday: out * 400,
+    // 与实机同款：今日 3 个工件（1GB 大件 + 两个 KB 级小件）
+    netCkptToday: 1024.0 * 1048576 + 990 + 1013,
+    netCkptTodayCount: 3,
+    netCkptTodayList: [
+      { workspace: "GenePad-free", bytes: 1024.0 * 1048576, recordedMs: now - 7 * 3600_000, accepted: true, uploading: false },
+      { workspace: "default", bytes: 990, recordedMs: now - 16 * 3600_000, accepted: true, uploading: false },
+      { workspace: "zcode-speed-panel", bytes: 1013, recordedMs: now - 5 * 3600_000, accepted: true, uploading: false },
+    ],
+    netCkptUploading: mockCkptUploading,
+    netCkptStatus: "ok",
+    // 快照上传记录模拟：上传中 > 待传 > 已接受（含跨天记录演示月日显示）
+    netCkptList: [
+      { workspace: "GenePad", bytes: 549.2 * 1048576, recordedMs: now - 3600_000, accepted: !mockCkptUploading, uploading: mockCkptUploading },
+      { workspace: "GenePad-free", bytes: 1024.0 * 1048576, recordedMs: now - 7 * 3600_000, accepted: true, uploading: false },
+      { workspace: "zcode-speed-panel", bytes: 990, recordedMs: now - 4 * 3600_000, accepted: true, uploading: false },
+      { workspace: "Gene_Editor-master", bytes: 522.5 * 1048576, recordedMs: now - 13 * 86400_000, accepted: true, uploading: false },
+    ],
+    netConnsAvailable: true,
+    netCliConns: isLive ? 2 : 1,
+    netAppConns: mockCkptUploading ? 3 : 1,
+    // 连接明细模拟：两组都是 ZCode 自身进程（CLI / Electron 壳），按进程标注
+    netCliConnList: [
+      { remote: "61.170.79.24:443", pid: 41092, proc: "CLI 会话进程" },
+      { remote: "61.170.79.31:443", pid: 41092, proc: "CLI 会话进程" },
+    ],
+    netAppConnList: mockCkptUploading
+      ? [
+          { remote: "61.151.230.245:443", pid: 18104, proc: "主进程" },
+          { remote: "oss-cn-hangzhou.aliyuncs.com:443", pid: 18104, proc: "主进程" },
+          { remote: "oss-cn-hangzhou.aliyuncs.com:443", pid: 18220, proc: "工具进程" },
+        ]
+      : [{ remote: "61.151.230.245:443", pid: 18104, proc: "主进程" }],
   };
 }
 
@@ -220,6 +305,13 @@ export function startMock(onData: (s: Snapshot) => void) {
     }
     if (!pending && t >= nextStart) {
       pending = newCall(t);
+    }
+    // 网络监控模拟：累计按模拟速度推进；快照上传段偶发启停
+    netUpToday += rnd(500, 120_000) * 0.4;
+    netDownToday += rnd(2_000, 500_000) * 0.4;
+    if (t >= ckptNextToggle) {
+      mockCkptUploading = !mockCkptUploading;
+      ckptNextToggle = t + (mockCkptUploading ? rnd(20_000, 50_000) : rnd(40_000, 120_000));
     }
     onData(snapshot(t, pending));
   };
