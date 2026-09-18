@@ -36,7 +36,7 @@
 
 use chrono::{Datelike, Local};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 /// 整机速度滑窗（接口计数器抖动大，短窗会跳）
@@ -49,8 +49,6 @@ const PROC_REFRESH_EVERY: Duration = Duration::from_secs(5);
 const CKPT_SCAN_EVERY: Duration = Duration::from_secs(2);
 /// 当日累计落盘节流（退出时另有强制保存）
 const NET_SAVE_EVERY: Duration = Duration::from_secs(30);
-/// 连接远端列表上限（tooltip 展示用，多了没意义）
-const REMOTE_CAP: usize = 6;
 
 
 /// 会话上传估算系数（字节/token）：请求体为 JSON 转义后的**未缓存**提示
@@ -128,9 +126,10 @@ pub struct NetNow {
     pub cli_conns: u32,
     /// 非会话组（Electron 桌面端进程）去重后的远端条数
     pub app_conns: u32,
-    /// 两组的去重远端（"ip:port"，升序截断；tooltip 用）
-    pub cli_remotes: Vec<String>,
-    pub app_remotes: Vec<String>,
+    /// 两组的连接明细（远端 + 归属 pid + 进程类型标签，按远端+pid 去重排序；
+    /// tooltip 逐条展示"哪个进程连了哪里"）
+    pub cli_conn_list: Vec<crate::metrics::ConnStat>,
+    pub app_conn_list: Vec<crate::metrics::ConnStat>,
     /// checkpoints 目录状态：ok / missing（无目录）/ blocked（不可读，如 ACL 封锁）
     pub ckpt_status: String,
     /// 有 activeUpload 进行中
@@ -153,7 +152,7 @@ pub mod platform {
     /// liveio 只发现 CLI 进程，这里还要拿"其余 zcode.exe"做非会话组）
     #[cfg(windows)]
     mod win {
-        use std::collections::HashSet;
+        use std::collections::{HashMap, HashSet};
         use std::ffi::c_void;
 
         #[link(name = "kernel32")]
@@ -329,14 +328,33 @@ pub mod platform {
             s
         }
 
-        /// ZCode 相关进程的 ESTABLISHED 远端列表，按 (cli_pids, app_pids) 分组
-        /// 返回（各自去重排序）。连接表读不到时返回 None（连接归属不可用）
+        /// 命令行 → 进程类型标签（Electron 壳的 --type 参数区分各子进程；
+        /// CLI 判定在前，渲染进程命令行里不会出现 zcode.cjs）
+        pub(crate) fn proc_label(cmd: &str) -> &'static str {
+            if cmd.contains("zcode.cjs") {
+                "CLI 会话进程"
+            } else if cmd.contains("crashpad") {
+                "崩溃报告进程"
+            } else if cmd.contains("--type=renderer") {
+                "渲染进程"
+            } else if cmd.contains("--type=gpu-process") {
+                "GPU 进程"
+            } else if cmd.contains("--type=utility") {
+                "工具进程"
+            } else {
+                "主进程"
+            }
+        }
+
+        /// ZCode 相关进程的 ESTABLISHED 连接（远端, 归属 pid），按
+        /// (cli_pids, app_pids) 两组返回（各自按 remote+pid 去重、排序）。
+        /// 连接表读不到时返回 None（连接归属不可用）
         pub fn zcode_conns(
-            cli_pids: &HashSet<u32>,
-            app_pids: &HashSet<u32>,
-        ) -> Option<(Vec<String>, Vec<String>)> {
-            let mut cli: HashSet<String> = HashSet::new();
-            let mut app: HashSet<String> = HashSet::new();
+            cli_pids: &HashMap<u32, String>,
+            app_pids: &HashMap<u32, String>,
+        ) -> Option<(Vec<(String, u32)>, Vec<(String, u32)>)> {
+            let mut cli: HashSet<(String, u32)> = HashSet::new();
+            let mut app: HashSet<(String, u32)> = HashSet::new();
             unsafe {
                 let mut size = 0u32;
                 GetExtendedTcpTable(std::ptr::null_mut(), &mut size, 0, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
@@ -350,14 +368,14 @@ pub mod platform {
                             if r.state != MIB_TCP_STATE_ESTAB {
                                 continue;
                             }
-                            let target = if cli_pids.contains(&r.pid) {
+                            let target = if cli_pids.contains_key(&r.pid) {
                                 &mut cli
-                            } else if app_pids.contains(&r.pid) {
+                            } else if app_pids.contains_key(&r.pid) {
                                 &mut app
                             } else {
                                 continue;
                             };
-                            target.insert(format!("{}:{}", ipv4(r.remote_addr), port(r.remote_port)));
+                            target.insert((format!("{}:{}", ipv4(r.remote_addr), port(r.remote_port)), r.pid));
                         }
                     }
                 }
@@ -373,20 +391,20 @@ pub mod platform {
                             if r.state != MIB_TCP_STATE_ESTAB {
                                 continue;
                             }
-                            let target = if cli_pids.contains(&r.pid) {
+                            let target = if cli_pids.contains_key(&r.pid) {
                                 &mut cli
-                            } else if app_pids.contains(&r.pid) {
+                            } else if app_pids.contains_key(&r.pid) {
                                 &mut app
                             } else {
                                 continue;
                             };
-                            target.insert(format!("[{}]:{}", ipv6(&r.remote_addr), port(r.remote_port)));
+                            target.insert((format!("[{}]:{}", ipv6(&r.remote_addr), port(r.remote_port)), r.pid));
                         }
                     }
                 }
             }
-            let sort = |s: HashSet<String>| {
-                let mut v: Vec<String> = s.into_iter().collect();
+            let sort = |s: HashSet<(String, u32)>| {
+                let mut v: Vec<(String, u32)> = s.into_iter().collect();
                 v.sort();
                 v
             };
@@ -455,11 +473,12 @@ pub mod platform {
             }
         }
 
-        /// 发现 ZCode 进程并分组：(CLI 进程 = 会话组, 其余 zcode.exe = 桌面端组)。
-        /// CLI = exe 名 zcode.exe（大小写不敏感）且命令行含 zcode.cjs；不含
-        /// zcode.cjs 的 zcode.exe = Electron 桌面端（主/渲染/GPU/工具进程——
-        /// 快照上传等非会话流量的承载者）
-        pub fn zcode_pid_groups() -> (Vec<u32>, Vec<u32>) {
+        /// 发现 ZCode 进程并分组（pid + 进程类型标签）：
+        /// (CLI 进程 = 会话组, 其余 zcode.exe = 桌面端组)。CLI = exe 名
+        /// zcode.exe（大小写不敏感）且命令行含 zcode.cjs；不含 zcode.cjs 的
+        /// zcode.exe = Electron 桌面端（主/渲染/GPU/工具进程——快照上传等
+        /// 非会话流量的承载者）。两组都是 ZCode 自身进程，不含其他应用
+        pub fn zcode_pid_groups() -> (Vec<(u32, String)>, Vec<(u32, String)>) {
             let mut cli = Vec::new();
             let mut app = Vec::new();
             unsafe {
@@ -486,8 +505,14 @@ pub mod platform {
                         );
                         if exe.eq_ignore_ascii_case("zcode.exe") {
                             match process_command_line(entry.process_id) {
-                                Some(cmd) if cmd.contains("zcode.cjs") => cli.push(entry.process_id),
-                                Some(_) => app.push(entry.process_id),
+                                Some(cmd) => {
+                                    let label = proc_label(&cmd).to_string();
+                                    if cmd.contains("zcode.cjs") {
+                                        cli.push((entry.process_id, label));
+                                    } else {
+                                        app.push((entry.process_id, label));
+                                    }
+                                }
                                 None => {} // 命令行读不到（权限/竞态）不计入任何组
                             }
                         }
@@ -507,7 +532,7 @@ pub mod platform {
     /// 端（快照上传监控的取证链），mac 面板如实显示"连接明细仅 Windows"
     #[cfg(target_os = "macos")]
     mod mac {
-        use std::collections::HashSet;
+        use std::collections::HashMap;
         use std::ffi::{c_char, c_int, c_void};
 
         #[link(name = "System")]
@@ -592,13 +617,13 @@ pub mod platform {
 
         /// 连接归属仅 Windows 实现；mac 返回 None（面板显示"不可用"）
         pub fn zcode_conns(
-            _cli_pids: &HashSet<u32>,
-            _app_pids: &HashSet<u32>,
-        ) -> Option<(Vec<String>, Vec<String>)> {
+            _cli_pids: &HashMap<u32, String>,
+            _app_pids: &HashMap<u32, String>,
+        ) -> Option<(Vec<(String, u32)>, Vec<(String, u32)>)> {
             None
         }
 
-        pub fn zcode_pid_groups() -> (Vec<u32>, Vec<u32>) {
+        pub fn zcode_pid_groups() -> (Vec<(u32, String)>, Vec<(u32, String)>) {
             (Vec::new(), Vec::new())
         }
     }
@@ -606,7 +631,7 @@ pub mod platform {
     /// 其他平台：接口计数与连接归属均不可用（面板显示"不支持"）
     #[cfg(not(any(windows, target_os = "macos")))]
     mod stub {
-        use std::collections::HashSet;
+        use std::collections::HashMap;
 
         pub const NET_COUNTER_WRAP: u64 = 0;
 
@@ -614,12 +639,12 @@ pub mod platform {
             None
         }
         pub fn zcode_conns(
-            _cli: &HashSet<u32>,
-            _app: &HashSet<u32>,
-        ) -> Option<(Vec<String>, Vec<String>)> {
+            _cli: &HashMap<u32, String>,
+            _app: &HashMap<u32, String>,
+        ) -> Option<(Vec<(String, u32)>, Vec<(String, u32)>)> {
             None
         }
-        pub fn zcode_pid_groups() -> (Vec<u32>, Vec<u32>) {
+        pub fn zcode_pid_groups() -> (Vec<(u32, String)>, Vec<(u32, String)>) {
             (Vec::new(), Vec::new())
         }
     }
@@ -786,8 +811,9 @@ pub struct NetIo {
     down_today: u64,
     ckpt_today_bytes: u64,
     ckpt_today_count: u32,
-    cli_pids: HashSet<u32>,
-    app_pids: HashSet<u32>,
+    /// pid → 进程类型标签（"CLI 会话进程"/"主进程"/"渲染进程"/…）
+    cli_pids: HashMap<u32, String>,
+    app_pids: HashMap<u32, String>,
     proc_refresh: Option<Instant>,
     ckpt_scan: Option<Instant>,
     ckpt_states: HashMap<String, CkptState>,
@@ -811,8 +837,8 @@ impl NetIo {
             down_today: 0,
             ckpt_today_bytes: 0,
             ckpt_today_count: 0,
-            cli_pids: HashSet::new(),
-            app_pids: HashSet::new(),
+            cli_pids: HashMap::new(),
+            app_pids: HashMap::new(),
             proc_refresh: None,
             ckpt_scan: None,
             ckpt_states: HashMap::new(),
@@ -1005,12 +1031,24 @@ impl NetIo {
             self.app_pids = app.into_iter().collect();
         }
 
-        // 连接归属（仅 Windows 实现返回 Some）
+        // 连接归属（仅 Windows 实现返回 Some）：每条连接标注归属 pid，
+        // 组装 ConnStat 时带上进程类型标签（同进程可有多条连接）
         let conns = platform::zcode_conns(&self.cli_pids, &self.app_pids);
         let conns_available = conns.is_some();
-        let (cli_remotes, app_remotes) = conns.unwrap_or_default();
-        let cli_conns = cli_remotes.len() as u32;
-        let app_conns = app_remotes.len() as u32;
+        let mut cli_conn_list: Vec<crate::metrics::ConnStat> = Vec::new();
+        let mut app_conn_list: Vec<crate::metrics::ConnStat> = Vec::new();
+        if let Some((cli_raw, app_raw)) = conns {
+            for (remote, pid) in cli_raw {
+                let proc = self.cli_pids.get(&pid).cloned().unwrap_or_default();
+                cli_conn_list.push(crate::metrics::ConnStat { remote, pid, proc });
+            }
+            for (remote, pid) in app_raw {
+                let proc = self.app_pids.get(&pid).cloned().unwrap_or_default();
+                app_conn_list.push(crate::metrics::ConnStat { remote, pid, proc });
+            }
+        }
+        let cli_conns = cli_conn_list.len() as u32;
+        let app_conns = app_conn_list.len() as u32;
 
         // checkpoint 扫描（2s 节流）
         if self.ckpt_scan.map_or(true, |t| t.elapsed() > CKPT_SCAN_EVERY) {
@@ -1035,8 +1073,8 @@ impl NetIo {
             conns_available,
             cli_conns,
             app_conns,
-            cli_remotes: cli_remotes.into_iter().take(REMOTE_CAP).collect(),
-            app_remotes: app_remotes.into_iter().take(REMOTE_CAP).collect(),
+            cli_conn_list,
+            app_conn_list,
             ckpt_status: self.ckpt_status.clone(),
             ckpt_uploading: self.ckpt_uploading,
             ckpt_today_bytes: self.ckpt_today_bytes,
@@ -1155,6 +1193,20 @@ mod tests {
         // 计数器重置（百万级回退到小值）：按回绕解释会得到 ≥2^31 的假增量，钳 0。
         // 注：回退幅度 <2^31 的重置与回绕在 32 位计数器下固有不可区分
         assert_eq!(wrap_delta(1000, 1_000_000, W), 0);
+    }
+
+    /// 进程类型标签（Windows 口径）：CLI 判定在 --type 之前——渲染进程
+    /// 命令行里不会出现 zcode.cjs，两类判定不冲突
+    #[test]
+    #[cfg(windows)]
+    fn proc_label_by_command_line() {
+        use crate::netio::platform::proc_label;
+        assert_eq!(proc_label(r#""C:\...\zcode.exe" "C:\...\zcode.cjs" app-server"#), "CLI 会话进程");
+        assert_eq!(proc_label(r#""C:\...\ZCode.exe" --type=renderer --field-trial-handle=x"#), "渲染进程");
+        assert_eq!(proc_label(r#""C:\...\ZCode.exe" --type=gpu-process"#), "GPU 进程");
+        assert_eq!(proc_label(r#""C:\...\ZCode.exe" --type=utility --utility-sub-type=net"#), "工具进程");
+        assert_eq!(proc_label(r#""C:\...\ZCode.exe" --type=crashpad-handler"#), "崩溃报告进程");
+        assert_eq!(proc_label(r#""C:\...\ZCode.exe" --js-flags=..."#), "主进程");
     }
 
     /// 快照上传记录列表：上传中 > 待传 > 已接受，同状态按时刻倒序；

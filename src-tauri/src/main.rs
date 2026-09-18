@@ -479,8 +479,8 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
     snapshot.net_conns_available = net_now.conns_available;
     snapshot.net_cli_conns = net_now.cli_conns;
     snapshot.net_app_conns = net_now.app_conns;
-    snapshot.net_cli_remotes = net_now.cli_remotes.clone();
-    snapshot.net_app_remotes = net_now.app_remotes.clone();
+    snapshot.net_cli_conn_list = net_now.cli_conn_list.clone();
+    snapshot.net_app_conn_list = net_now.app_conn_list.clone();
     let cal_event;
     let bpt_now;
     let pipe_bps;
@@ -1119,6 +1119,32 @@ fn app_version(app: AppHandle) -> String {
     current_version(&app)
 }
 
+/// 导出文本文件（快照上传记录等前端生成的报告）：写入
+/// `~/.zcode/speed-panel-exports/<file_name>`，返回完整路径供前端提示。
+/// 文件名做白名单清洗（只留字母数字._-，防路径注入/穿越）
+#[tauri::command]
+fn export_text_file(file_name: String, text: String) -> Result<String, String> {
+    const MAX_TEXT: usize = 4 * 1024 * 1024;
+    if text.len() > MAX_TEXT {
+        return Err("内容过大".into());
+    }
+    let cleaned: String = file_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .collect();
+    if cleaned.is_empty() || cleaned.starts_with('.') {
+        return Err("文件名无效".into());
+    }
+    let Some(home) = home_dir() else {
+        return Err("无法定位用户目录".into());
+    };
+    let dir = home.join(".zcode").join("speed-panel-exports");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建导出目录失败: {e}"))?;
+    let path = dir.join(cleaned);
+    std::fs::write(&path, text.as_bytes()).map_err(|e| format!("写入失败: {e}"))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 /// 用系统默认浏览器打开链接（更新说明页）。WebView 内 <a> 导航行为不可控，
 /// 统一由后端代开；仅接受 https，防前端注入 file:// 一类协议
 #[tauri::command]
@@ -1313,6 +1339,7 @@ fn main() {
             check_update,
             install_update,
             app_version,
+            export_text_file,
             open_url
         ])
         .setup(|app| {

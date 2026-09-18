@@ -117,9 +117,9 @@
                     <span class="net-sub">整机下载 · 全部应用</span>
                   </div>
                 </div>
-                <div class="net-conns" id="net-conns">
-                  <span class="net-conn-row" id="net-conn-cli" title="">会话进程 <b id="net-cli-conns">0</b> 连接</span>
-                  <span class="net-conn-row" id="net-conn-app" title="">桌面端 <b id="net-app-conns">0</b> 连接</span>
+                <div class="net-conns" id="net-conns" title="两组都是 ZCode 自身进程的连接（不含其他应用）：会话进程 = CLI（app-server），走对话 API 流量；桌面端 = ZCode 桌面端（Electron 主/渲染/GPU/工具进程），走快照上传、遥测等非对话流量。悬停下方两行可看每条连接的远端与归属进程">
+                  <span class="net-conn-row" id="net-conn-cli" title="">ZCode 会话进程 <b id="net-cli-conns">0</b> 连接</span>
+                  <span class="net-conn-row" id="net-conn-app" title="">ZCode 桌面端 <b id="net-app-conns">0</b> 连接</span>
                 </div>
               </div>
               <div class="net-today">
@@ -141,7 +141,13 @@
               </div>
             </div>
             <div class="net-right">
-              <div class="net-ckpt-list-head dim" id="net-ckpt-list-head">快照上传记录（全部工作区各一行 · 时间 / 工作区 / 加密后大小 / 状态）</div>
+              <div class="net-ckpt-list-head">
+                <span class="dim">快照上传记录（ZCode 各工作区 · 时间 / 工作区 / 加密后大小 / 状态，上下滚动查看全部）</span>
+                <span class="net-ckpt-tools">
+                  <button id="net-ckpt-copy" class="ghost-btn net-tool-btn" type="button" title="把快照上传记录复制到剪贴板">复制</button>
+                  <button id="net-ckpt-export" class="ghost-btn net-tool-btn" type="button" title="把快照上传记录导出为文本文件（保存到 ~/.zcode/speed-panel-exports/）">导出</button>
+                </span>
+              </div>
               <div class="net-ckpt-list" id="net-ckpt-list"></div>
             </div>
           </div>

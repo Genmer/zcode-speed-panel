@@ -46,6 +46,19 @@ pub struct TaskStat {
     pub streaming: bool,
 }
 
+/// ZCode 连接明细行（netio 填充）：一条 ESTABLISHED 连接 + 归属进程
+#[derive(Serialize, Clone, Debug, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnStat {
+    /// 远端 "ip:port"（v6 为 "[addr]:port"）
+    pub remote: String,
+    /// 归属进程 pid
+    pub pid: u32,
+    /// 进程类型标签（"CLI 会话进程" / "主进程" / "渲染进程" / "GPU 进程" /
+    /// "工具进程" / "崩溃报告进程"）——两组都是 ZCode 自身进程，按角色区分
+    pub proc: String,
+}
+
 /// 快照上传记录行（netio 填充）：每个 workspace 的**最近一次**工件实况，
 /// 来自 `~/.zcode/v2/checkpoints/*/state.json`
 #[derive(Serialize, Clone, Debug, Default, PartialEq)]
@@ -122,11 +135,12 @@ pub struct Snapshot {
     pub net_ckpt_list: Vec<CkptStat>,
     /// 连接归属是否可用（仅 Windows）
     pub net_conns_available: bool,
-    /// 会话组（CLI 进程）/ 桌面端组（其余 zcode.exe）的连接数与去重远端
+    /// 会话组（CLI 进程）/ 桌面端组（其余 zcode.exe）的连接数与明细
+    /// （每条含远端 + 归属 pid + 进程类型标签；两组均为 ZCode 自身进程）
     pub net_cli_conns: u32,
     pub net_app_conns: u32,
-    pub net_cli_remotes: Vec<String>,
-    pub net_app_remotes: Vec<String>,
+    pub net_cli_conn_list: Vec<ConnStat>,
+    pub net_app_conn_list: Vec<ConnStat>,
 }
 
 /// 当前速度统计窗口
@@ -353,8 +367,8 @@ impl Aggregator {
             net_conns_available: false,
             net_cli_conns: 0,
             net_app_conns: 0,
-            net_cli_remotes: Vec::new(),
-            net_app_remotes: Vec::new(),
+            net_cli_conn_list: Vec::new(),
+            net_app_conn_list: Vec::new(),
         }
     }
 }

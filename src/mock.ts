@@ -20,6 +20,14 @@ export interface CkptStat {
   uploading: boolean;
 }
 
+/** ZCode 连接明细行（与后端 ConnStat 同形）：两组均为 ZCode 自身进程 */
+export interface ConnStat {
+  remote: string;
+  pid: number;
+  /** 进程类型标签：CLI 会话进程 / 主进程 / 渲染进程 / GPU 进程 / 工具进程 / 崩溃报告进程 */
+  proc: string;
+}
+
 export interface Snapshot {
   currentTps: number;
   avgTps: number;
@@ -64,8 +72,9 @@ export interface Snapshot {
   netConnsAvailable: boolean;
   netCliConns: number;
   netAppConns: number;
-  netCliRemotes: string[];
-  netAppRemotes: string[];
+  /** 连接明细（每条含远端 + 归属 pid + 进程类型标签） */
+  netCliConnList: ConnStat[];
+  netAppConnList: ConnStat[];
 }
 
 interface MockCall {
@@ -255,8 +264,18 @@ function snapshot(now: number, pending: MockCall | null): Snapshot {
     netConnsAvailable: true,
     netCliConns: isLive ? 2 : 1,
     netAppConns: mockCkptUploading ? 3 : 1,
-    netCliRemotes: ["61.170.79.24:443"],
-    netAppRemotes: ["61.151.230.245:443", "oss-cn-hangzhou.aliyuncs.com:443"],
+    // 连接明细模拟：两组都是 ZCode 自身进程（CLI / Electron 壳），按进程标注
+    netCliConnList: [
+      { remote: "61.170.79.24:443", pid: 41092, proc: "CLI 会话进程" },
+      { remote: "61.170.79.31:443", pid: 41092, proc: "CLI 会话进程" },
+    ],
+    netAppConnList: mockCkptUploading
+      ? [
+          { remote: "61.151.230.245:443", pid: 18104, proc: "主进程" },
+          { remote: "oss-cn-hangzhou.aliyuncs.com:443", pid: 18104, proc: "主进程" },
+          { remote: "oss-cn-hangzhou.aliyuncs.com:443", pid: 18220, proc: "工具进程" },
+        ]
+      : [{ remote: "61.151.230.245:443", pid: 18104, proc: "主进程" }],
   };
 }
 

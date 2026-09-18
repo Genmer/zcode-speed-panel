@@ -88,16 +88,17 @@
 - **口径为面板观测期**：面板未运行期间的接受只在上述回补时计入；两拍之间的多次跳变按末态计（下界）。
 - **目录状态**：`ok` / `missing`（无目录）/ `blocked`（不可读——用户用 ACL 封锁 checkpoints 后的如实显示，此时监控不到新上传）。
 - 事件同时写调试日志（`kind:"net"`，`ev`=ckpt_accepted / ckpt_upload_start / ckpt_upload_end，含 `mb` 与 `ws` 工作区名）。
-- **快照上传记录列表**（卡片右栏；窄窗口 <860px 退回单栏）：每个 workspace 一行 = 记录时间（今天 HH:MM，跨天 MM-DD HH:MM）/ 工作区名（workspacePath 末段）/ 加密后大小 / 状态（**上传中 ⬆ / 待传 / 已接受 ✓**），排序 = 上传中 > 待传 > 已接受（同状态按记录时刻倒序），**不设行数上限、全部列出**（限高 60vh 随窗口自适应，常规数量无需滚动，极端大量时内部滚动；`ckpt_rows` 纯函数，测试 `ckpt_rows_sorted_all_workspaces` 守护）。列表读的是 checkpoints 实况（state.json 只保留各工作区最近一次工件，更早历史不可考），面板未运行期间的最后状态启动即见。
+- **快照上传记录列表**（卡片右栏；窄窗口 <860px 退回单栏）：每个 workspace 一行 = 记录时间（今天 HH:MM，跨天 MM-DD HH:MM）/ 工作区名（workspacePath 末段）/ 加密后大小 / 状态（**上传中 ⬆ / 待传 / 已接受 ✓**），排序 = 上传中 > 待传 > 已接受（同状态按记录时刻倒序），**不截断行数，固定限高 168px 内部上下滚动看完**（不把页面整页撑开；`ckpt_rows` 纯函数，测试 `ckpt_rows_sorted_all_workspaces` 守护）。列表读的是 checkpoints 实况（state.json 只保留各工作区最近一次工件，更早历史不可考），面板未运行期间的最后状态启动即见。
+- **复制与导出**：列表文字可选中复制（全局 `user-select:none` 的例外区）；列表头有 **复制 / 导出** 按钮——复制把整份纯文本报告（表头 + 逐行记录 + 当日汇总 + ZCode 两组连接实况）写入剪贴板（`navigator.clipboard`，失败退回 `execCommand`），导出走 `export_text_file` 命令写入 `~/.zcode/speed-panel-exports/zcode快照上传记录-日期-时间.txt`（文件名白名单清洗防路径穿越，右下角轻提示完整路径；浏览器预览模式退化为浏览器下载）。
 
 ### ZCode 连接归属（真实值，仅 Windows）
 
-TCP 连接表（`GetExtendedTcpTable` OWNER_PID，v4+v6，仅 ESTABLISHED）按进程分组：
+TCP 连接表（`GetExtendedTcpTable` OWNER_PID，v4+v6，仅 ESTABLISHED）按进程分组。**两组都是 ZCode 自身进程的连接，不含其他应用**（界面标签即"ZCode 会话进程 / ZCode 桌面端"，悬停标题有完整说明）：
 
-- **会话组**：命令行含 `zcode.cjs` 的 CLI 进程（API 对话流量的承载者；进程发现口径与 liveio 一致，5s 刷新一次 pid 分组，连接表每拍枚举）；
-- **桌面端组**：其余 `zcode.exe`（Electron 主/渲染/GPU/工具进程——快照上传、遥测等非会话流量的承载者）。
+- **会话组（ZCode 会话进程）**：命令行含 `zcode.cjs` 的 CLI（app-server）进程——对话 API 流量的承载者；进程发现口径与 liveio 一致，5s 刷新一次 pid 分组，连接表每拍枚举；
+- **桌面端组（ZCode 桌面端）**：其余 `zcode.exe` = ZCode 桌面端的 Electron 壳（主/渲染/GPU/工具/崩溃报告进程）——快照上传、遥测等**非对话**流量的承载者。
 
-各组显示**去重后远端条数**，悬停 tooltip 列出远端 `ip:port`（≤6 条）。**证据链用法**：整机上传速度飙升 + 桌面端组出现新连接 + activeUpload = 快照上传正在发生的现场证据。mac 侧连接归属未实现（面板隐藏该行，接口计数仍可用）。
+每条连接都标注**归属进程**（类型标签 + pid，按 Electron `--type` 参数区分：CLI 会话进程 / 主进程 / 渲染进程 / GPU 进程 / 工具进程 / 崩溃报告进程，`proc_label` 纯函数、测试 `proc_label_by_command_line` 守护）；两组各行显示按 远端+pid 去重的条数，**悬停 tooltip 逐条列出 `远端 ip:port · 进程类型(pid)`**。**证据链用法**：整机上传速度飙升 + 桌面端组出现新连接 + activeUpload = 快照上传正在发生的现场证据。mac 侧连接归属未实现（面板隐藏该行，接口计数仍可用）。
 
 ## 仪表与曲线（gauges.ts）
 

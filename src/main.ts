@@ -2,7 +2,7 @@ import "./style.css";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ArcGauge, BadgeGauge, MiniGauge, SPEED_TIERS, drawSpark, fmtBps, fmtBytes, fmtClock, fmtDayClock, fmtTokens, fmtTps, speedColor } from "./gauges";
 import { PetWidget } from "./pet";
-import { startMock, type CkptStat, type Snapshot } from "./mock";
+import { startMock, type CkptStat, type ConnStat, type Snapshot } from "./mock";
 
 interface SnapshotPayload {
   snapshot: Snapshot;
@@ -218,17 +218,20 @@ function renderNet(s: Snapshot) {
   netUpTodayEl.textContent = fmtBytes(s.netUpToday);
   netDownTodayEl.textContent = fmtBytes(s.netDownToday);
 
-  // 连接归属（仅 Windows）：远端列表挂 tooltip
+  // 连接归属（仅 Windows）：每条连接的远端 + 归属进程（类型 + pid）挂 tooltip。
+  // 两组都是 ZCode 自身进程：会话 = CLI（对话 API 流量），
+  // 桌面端 = Electron 壳（快照上传/遥测等非对话流量），不含其他应用
   netConnsEl.style.display = s.netConnsAvailable ? "" : "none";
   if (s.netConnsAvailable) {
     netCliConnsEl.textContent = String(s.netCliConns);
     netAppConnsEl.textContent = String(s.netAppConns);
-    netConnCli.title = s.netCliRemotes.length
-      ? `会话进程（CLI）的连接远端：\n${s.netCliRemotes.join("\n")}`
-      : "会话进程当前无外连";
-    netConnApp.title = s.netAppRemotes.length
-      ? `桌面端进程（非会话流量）的连接远端：\n${s.netAppRemotes.join("\n")}`
-      : "桌面端进程当前无外连";
+    const connLines = (list: ConnStat[]) => list.map((r) => `${r.remote} · ${r.proc || "?"}(${r.pid})`);
+    netConnCli.title = s.netCliConnList.length
+      ? `ZCode 会话进程（CLI，对话 API 流量）的连接：\n${connLines(s.netCliConnList).join("\n")}`
+      : "ZCode 会话进程当前无外连";
+    netConnApp.title = s.netAppConnList.length
+      ? `ZCode 桌面端进程（Electron 主/渲染/GPU/工具——快照上传、遥测等非对话流量）的连接：\n${connLines(s.netAppConnList).join("\n")}`
+      : "ZCode 桌面端进程当前无外连";
   }
 
   // 快照上传状态行：上传中（脉冲）> blocked（ACL 封锁）> 今日有量 > 隐藏
@@ -251,7 +254,8 @@ function renderNet(s: Snapshot) {
   netCkptPart.style.display = s.netCkptStatus === "ok" ? "" : "none";
 
   // 快照上传记录：每工作区最近一次工件（时间 / 工作区 / 加密后大小 / 状态），
-  // 上传中 > 待传 > 已接受排序（后端排好），限高滚动
+  // 上传中 > 待传 > 已接受排序（后端排好）。不截断行数，固定限高内部滚动
+  // 看完；文字可选中复制，另有 复制/导出 按钮（见 net-ckpt-tools）
   const ckptRows: CkptStat[] = s.netCkptList ?? [];
   netCkptList.textContent = "";
   netCkptListHead.style.display = ckptRows.length > 0 ? "" : "none";
@@ -273,8 +277,114 @@ function renderNet(s: Snapshot) {
     row.append(time, ws, size, st);
     netCkptList.append(row);
   }
+  lastCkptReport = buildCkptReport(s);
   netScope.textContent = s.netConnsAvailable ? "整机 = 本机全部应用流量（非仅 ZCode）" : "整机 = 本机全部应用流量";
 }
+
+/** 快照上传记录的纯文本报告（复制/导出共用）：表头 + 逐行 + 当日汇总 +
+ *  ZCode 连接实况——取证时可整体留存 */
+let lastCkptReport = "";
+function buildCkptReport(s: Snapshot): string {
+  const lines: string[] = [];
+  const now = new Date();
+  const p = (x: number) => x.toString().padStart(2, "0");
+  lines.push(`ZCode 快照上传记录 · 导出于 ${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())} ${p(now.getHours())}:${p(now.getMinutes())}`);
+  lines.push("口径：每工作区最近一次工件（~/.zcode/v2/checkpoints/*/state.json）；大小为加密压缩后字节；状态 = 上传中/待传/已接受");
+  lines.push("");
+  lines.push("时间          工作区                       大小         状态");
+  lines.push("------------  ---------------------------  -----------  --------");
+  for (const r of s.netCkptList ?? []) {
+    const st = r.uploading ? "上传中" : r.accepted ? "已接受" : "待传";
+    lines.push(
+      `${fmtDayClock(r.recordedMs).padEnd(12)}  ${(r.workspace || "?").padEnd(27).slice(0, 27)}  ${fmtBytes(r.bytes).padEnd(11)}  ${st}`,
+    );
+  }
+  lines.push("");
+  lines.push(`今日快照工件上传：${fmtBytes(s.netCkptToday)}（${s.netCkptTodayCount} 个）`);
+  lines.push(`今日整机上传：${fmtBytes(s.netUpToday)} / 下载：${fmtBytes(s.netDownToday)}（全部应用）`);
+  lines.push(`会话流量估算：上传 ≈${fmtBytes(s.netSessUpToday)} / 下载 ≈${fmtBytes(s.netSessDownToday)}`);
+  if (s.netConnsAvailable) {
+    const conn = (list: ConnStat[]) =>
+      list.map((r) => `  ${r.remote} · ${r.proc || "?"}(${r.pid})`).join("\n") || "  （无）";
+    lines.push("");
+    lines.push("ZCode 会话进程（CLI）连接：");
+    lines.push(conn(s.netCliConnList ?? []));
+    lines.push("ZCode 桌面端进程（Electron 壳，非会话流量）连接：");
+    lines.push(conn(s.netAppConnList ?? []));
+  }
+  return lines.join("\n");
+}
+
+/** 复制到剪贴板：优先 navigator.clipboard，WebView 拒绝时退回
+ *  execCommand（临时 textarea；body 是 user-select:none，需临时可选） */
+async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      ta.style.userSelect = "text";
+      document.body.append(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+}
+
+// 复制 / 导出按钮：按钮闪 ✓ 反馈，导出路径走右下角轻提示
+const netCkptCopyBtn = $<HTMLButtonElement>("net-ckpt-copy");
+const netCkptExportBtn = $<HTMLButtonElement>("net-ckpt-export");
+let netToolTimer = 0;
+const flashNetBtn = (btn: HTMLButtonElement, okText: string) => {
+  const orig = btn.textContent;
+  btn.textContent = okText;
+  window.clearTimeout(netToolTimer);
+  netToolTimer = window.setTimeout(() => {
+    btn.textContent = orig;
+  }, 1500);
+};
+netCkptCopyBtn.addEventListener("click", async () => {
+  if (!lastCkptReport) return;
+  const ok = await copyText(lastCkptReport);
+  flashNetBtn(netCkptCopyBtn, ok ? "已复制 ✓" : "失败");
+});
+netCkptExportBtn.addEventListener("click", () => {
+  if (!lastCkptReport) return;
+  const now = new Date();
+  const p = (x: number) => x.toString().padStart(2, "0");
+  const name = `zcode快照上传记录-${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}-${p(now.getHours())}${p(now.getMinutes())}.txt`;
+  if (!hasTauri) {
+    // 浏览器预览模式：无后端命令，退化为浏览器下载
+    const blob = new Blob([lastCkptReport], { type: "text/plain;charset=utf-8" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    flashNetBtn(netCkptExportBtn, "已下载 ✓");
+    return;
+  }
+  tauriInvoke<string>("export_text_file", { fileName: name, text: lastCkptReport })
+    .then((path) => {
+      if (path) {
+        flashNetBtn(netCkptExportBtn, "已导出 ✓");
+        toast(`已导出到 ${path}`);
+      }
+    })
+    .catch((err) => {
+      flashNetBtn(netCkptExportBtn, "失败");
+      toast(`导出失败：${err}`);
+      console.warn("导出失败:", err);
+    });
+});
 
 /** 缓存命中率 = cache_read ÷ input（usage 库的 input 本身就是全部提示 token，
  *  缓存命中的部分已含其中，分母再加 cache_read 会重复计数；cache_creation 全库
