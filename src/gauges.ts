@@ -34,6 +34,40 @@ export function fmtClock(ms: number): string {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
+/** 快照记录等粗粒度时刻：今天只显 HH:MM，跨天带月日（MM-DD HH:MM） */
+export function fmtDayClock(ms: number): string {
+  if (!ms) return "--:--";
+  const d = new Date(ms);
+  const now = new Date();
+  const p = (x: number) => x.toString().padStart(2, "0");
+  const hm = `${p(d.getHours())}:${p(d.getMinutes())}`;
+  if (
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate()
+  ) {
+    return hm;
+  }
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${hm}`;
+}
+
+/** 字节量（网络流量累计）：KB/MB/GB，中文界面沿用国际单位 */
+export function fmtBytes(n: number): string {
+  if (!isFinite(n) || n < 0) return "--";
+  if (n < 1024) return `${Math.round(n)} B`;
+  if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1073741824) return `${(n / 1048576).toFixed(1)} MB`;
+  return `${(n / 1073741824).toFixed(2)} GB`;
+}
+
+/** 字节率（网络速度） */
+export function fmtBps(bps: number): string {
+  if (!isFinite(bps) || bps < 0) return "--";
+  if (bps < 1024) return `${Math.round(bps)} B/s`;
+  if (bps < 1048576) return `${(bps / 1024).toFixed(1)} KB/s`;
+  return `${(bps / 1048576).toFixed(2)} MB/s`;
+}
+
 const TAU = Math.PI * 2;
 /** 弧形起止角（270° 扫过，缺口朝下） */
 const A0 = Math.PI * 0.75;

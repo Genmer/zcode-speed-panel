@@ -1,8 +1,8 @@
 import "./style.css";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { ArcGauge, BadgeGauge, MiniGauge, SPEED_TIERS, drawSpark, fmtClock, fmtTokens, fmtTps, speedColor } from "./gauges";
+import { ArcGauge, BadgeGauge, MiniGauge, SPEED_TIERS, drawSpark, fmtBps, fmtBytes, fmtClock, fmtDayClock, fmtTokens, fmtTps, speedColor } from "./gauges";
 import { PetWidget } from "./pet";
-import { startMock, type Snapshot } from "./mock";
+import { startMock, type CkptStat, type Snapshot } from "./mock";
 
 interface SnapshotPayload {
   snapshot: Snapshot;
@@ -159,6 +159,26 @@ const stLast = $("st-last");
 const chartMax = $("chart-max");
 const taskCard = $("task-card");
 const taskList = $("task-list");
+const netCard = $("net-card");
+const netScope = $("net-scope");
+const netUpBpsEl = $("net-up-bps");
+const netDownBpsEl = $("net-down-bps");
+const netConnsEl = $("net-conns");
+const netConnCli = $("net-conn-cli");
+const netConnApp = $("net-conn-app");
+const netCliConnsEl = $("net-cli-conns");
+const netAppConnsEl = $("net-app-conns");
+const netSessUpEl = $("net-sess-up");
+const netSessDownEl = $("net-sess-down");
+const netCkptEl = $("net-ckpt");
+const netCkptCountEl = $("net-ckpt-count");
+const netCkptPart = $("net-ckpt-part");
+const netUpTodayEl = $("net-up-today");
+const netDownTodayEl = $("net-down-today");
+const netCkptInfo = $("net-ckpt-info");
+const netCkptText = $("net-ckpt-text");
+const netCkptListHead = $("net-ckpt-list-head");
+const netCkptList = $("net-ckpt-list");
 const floatTps = $("float-tps");
 const floatDot = $("float-dot");
 const floatLast = $("float-last");
@@ -180,6 +200,82 @@ function statusClass(s: Snapshot): string {
   return "dot idle";
 }
 
+/** 网络流量与上传监控卡：整机实测速度 + 会话/非会话上传拆分。
+ *  整机 = 接口计数器真实值；快照工件 = 非会话上传的真实下界（加密压缩后
+ *  字节）；会话 = token×系数估算（带 ≈）。接口不可用（stub 平台）时整卡隐藏 */
+function renderNet(s: Snapshot) {
+  if (!s.netAvailable) {
+    netCard.hidden = true;
+    return;
+  }
+  netCard.hidden = false;
+  netUpBpsEl.textContent = fmtBps(s.netUpBps);
+  netDownBpsEl.textContent = fmtBps(s.netDownBps);
+  netSessUpEl.textContent = fmtBytes(s.netSessUpToday);
+  netSessDownEl.textContent = fmtBytes(s.netSessDownToday);
+  netCkptEl.textContent = fmtBytes(s.netCkptToday);
+  netCkptCountEl.textContent = s.netCkptTodayCount > 0 ? `（${s.netCkptTodayCount} 个工件）` : "";
+  netUpTodayEl.textContent = fmtBytes(s.netUpToday);
+  netDownTodayEl.textContent = fmtBytes(s.netDownToday);
+
+  // 连接归属（仅 Windows）：远端列表挂 tooltip
+  netConnsEl.style.display = s.netConnsAvailable ? "" : "none";
+  if (s.netConnsAvailable) {
+    netCliConnsEl.textContent = String(s.netCliConns);
+    netAppConnsEl.textContent = String(s.netAppConns);
+    netConnCli.title = s.netCliRemotes.length
+      ? `会话进程（CLI）的连接远端：\n${s.netCliRemotes.join("\n")}`
+      : "会话进程当前无外连";
+    netConnApp.title = s.netAppRemotes.length
+      ? `桌面端进程（非会话流量）的连接远端：\n${s.netAppRemotes.join("\n")}`
+      : "桌面端进程当前无外连";
+  }
+
+  // 快照上传状态行：上传中（脉冲）> blocked（ACL 封锁）> 今日有量 > 隐藏
+  if (s.netCkptUploading) {
+    netCkptInfo.hidden = false;
+    netCkptInfo.classList.add("uploading");
+    netCkptText.textContent = "⬆ 快照上传进行中——工作区内容正整包加密上传";
+  } else if (s.netCkptStatus === "blocked") {
+    netCkptInfo.hidden = false;
+    netCkptInfo.classList.remove("uploading");
+    netCkptText.textContent = "checkpoints 目录不可读（可能已被 ACL 封锁，监控不到新上传）";
+  } else if (s.netCkptStatus === "missing") {
+    netCkptInfo.hidden = true;
+    netCkptInfo.classList.remove("uploading");
+  } else {
+    netCkptInfo.hidden = s.netCkptToday === 0;
+    netCkptInfo.classList.remove("uploading");
+    netCkptText.textContent = `今日快照工件上传 ${fmtBytes(s.netCkptToday)}（${s.netCkptTodayCount} 个）`;
+  }
+  netCkptPart.style.display = s.netCkptStatus === "ok" ? "" : "none";
+
+  // 快照上传记录：每工作区最近一次工件（时间 / 工作区 / 加密后大小 / 状态），
+  // 上传中 > 待传 > 已接受排序（后端排好），限高滚动
+  const ckptRows: CkptStat[] = s.netCkptList ?? [];
+  netCkptList.textContent = "";
+  netCkptListHead.style.display = ckptRows.length > 0 ? "" : "none";
+  for (const r of ckptRows) {
+    const row = document.createElement("div");
+    row.className = r.uploading ? "ckpt-row uploading" : r.accepted ? "ckpt-row" : "ckpt-row pending";
+    const time = document.createElement("span");
+    time.className = "ckpt-time";
+    time.textContent = fmtDayClock(r.recordedMs);
+    const ws = document.createElement("span");
+    ws.className = "ckpt-ws";
+    ws.textContent = r.workspace || "?";
+    const size = document.createElement("span");
+    size.className = "ckpt-size";
+    size.textContent = fmtBytes(r.bytes);
+    const st = document.createElement("span");
+    st.className = "ckpt-st";
+    st.textContent = r.uploading ? "上传中 ⬆" : r.accepted ? "已接受 ✓" : "待传";
+    row.append(time, ws, size, st);
+    netCkptList.append(row);
+  }
+  netScope.textContent = s.netConnsAvailable ? "整机 = 本机全部应用流量（非仅 ZCode）" : "整机 = 本机全部应用流量";
+}
+
 /** 缓存命中率 = cache_read ÷ input（usage 库的 input 本身就是全部提示 token，
  *  缓存命中的部分已含其中，分母再加 cache_read 会重复计数；cache_creation 全库
  *  恒为 0，防御性保留在分母以兼容将来单列它的 provider） */
@@ -196,6 +292,7 @@ function onSnapshot(s: Snapshot) {
   gTotal.setTarget(s.totalTokens);
   miniGauge.setTarget(s.currentTps, s.isEstimating, s.isStarting);
   miniLast.setTarget(s.lastCallTps);
+  renderNet(s);
 
   // 并发任务明细：≥2 个任务时显示（单任务时隐藏，不占版面）。
   // 一个 CLI 进程 = 一行，行值合计 = 当前速度表（文件增长按字节占比分摊）；

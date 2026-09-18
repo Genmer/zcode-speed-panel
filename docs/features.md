@@ -44,6 +44,61 @@
 - **归属与样本准入的并发守卫**：会话→进程归属带**切换迟滞**（`should_reattribute`：已有归属时，仅当候选进程在调用窗口内原始字节 ≥ 现归属的 2 倍才切换，杜绝并发窗口间逐调用翻转；现归属进程窗口内零字节时直接采信 top 自愈；归属建立门槛为窗口原始字节 > 20KB）；校准样本另带**跨进程守卫**（`cross_pid_ok`：窗口内其他进程原始字节 > 基准进程的 20% 即拒收——对方窗口并发流式时积分必然混入外来字节。基准 = 归属进程；无归属的全进程求和分支以 top 进程为基准，该分支同样不能放行），cal 日志 `others_kb` 供诊断；`cal_sample` 的 clean/raw≥0.2 守卫分子分母**配对**（clean 来自归属进程时 raw 也用归属进程的字节，不用全进程 raw）。
 - 精度：达标调用 `pred/true` 应在 0.8~1.25（实测 1.00~1.05）；对账命令 `python scripts/live_vs_true.py`。
 
+## 网络流量与上传监控（netio.rs）
+
+完整面板在任务卡与曲线卡之间的「网络流量与上传监控」卡（双栏布局：左速度/当日累计、右快照记录，避免把底部曲线卡挤出视口；`main` 另有兜底滚动；接口计数不可用的平台整卡隐藏）。监控 ZCode 的上传/下载流量并区分**会话流量**（CLI 进程承载的 API 对话流量）与**非会话上传**（Electron 桌面端的快照上传等），背景是 2026-09-17 的发现：ZCode 会把整个工作区（含完整 `.git/` 历史）打包加密上传到阿里云 OSS（单个工件实测 549MB）。
+
+### 为什么是分层口径（平台限制）
+
+**Windows 非管理员下没有"按进程的网络收发字节"公开原语**，2026-09-18 本机实验定论（详见 key-rules #14）：
+
+- Winsock 收发字节**不进** `GetProcessIoCounters` 的任何计数（20MB 下载期间 Read 仅 7.8KB）——进程 IO 计数器只含文件/管道/设备，liveio 的流式测速因此天然不受网络污染；
+- TCP ESTATS（`SetPerTcpConnectionEStats`，唯一的每连接字节 API）在新版 Windows 上对所有连接（含本进程自有的）返回 `ERROR_NOT_SUPPORTED`，管理员也一样；
+- ETW 内核网络事件需要管理员。
+
+因此按三层诚实分层，前端 UI 上逐项标注口径：
+
+| 层 | 内容 | 口径 |
+|---|---|---|
+| 整机上传/下载速度 + 当日总量 | 接口计数器求和（排除回环） | **真实值** |
+| 会话流量（当日上传/下载） | token 数 × 字节系数 | **估算 ≈** |
+| 非会话上传（快照工件） | checkpoints `state.json` 的接受事件 | **真实下界** |
+
+### 整机实测（真实值）
+
+- **Windows**：`GetIfTable` 全部非回环接口的 `dwIn/dwOutOctets` 求和。计数器为 **32 位**，必须**逐接口**做模 2³² 差分（各接口回绕时机不同，先求和再差分会错——测试 `wrap_delta_handles_32bit_wrap_and_resets` 守护）；单接口单拍增量 ≥2³¹ 视为计数器重置/索引复用，钳 0。`MIB_IF_ROW` 镜像关键字段偏移（dwInOctets=552 / dwOutOctets=556）编译期断言。
+- **macOS**：`getifaddrs` 求和 `ifi_obytes/ifi_ibytes`（64 位不回绕，裸差分、回退钳 0），排除 `lo0`；每接口按地址族返回多行，**必须按接口名去重**否则字节翻倍。`if_data64` 镜像 ibytes=64/obytes=72 编译期断言（按 xnu SDK 布局，mac 侧换 SDK 后若断言失败须实测复核）。
+- 速度 = 10s 滑窗差分；当日累计跨天清零、跨重启持久化续算（`~/.zcode/speed-panel-net.json`，30s 节流落盘 + 退出强制保存）。
+- **整机口径的含义（UI 显式标注）**：整机 = **本机全部应用**的网络流量（含系统/浏览器/代理隧道加密开销），**非仅 ZCode**——速度值标签写明"全部应用"、卡片右上角注明"整机 = 本机全部应用流量（非仅 ZCode）"、速度块悬停 tooltip 有完整说明。它回答"这台机器今天上传了多少"，不回答"其中多少是 ZCode"（后者由下两层回答）；本机走本地代理时（ZCode → 127.0.0.1 代理 → 外网）尤其须注意隧道开销的放大。
+
+### 会话流量（估算 ≈）
+
+由 usage 库当日 token 数 × 字节系数得出（`sess_bytes_est` 纯函数，前端带 ≈ 标注）：
+
+- **上传** ≈ 未缓存提示 token × 5 B/token。分子用 `input + cache_creation − cache_read`（**缓存命中的提示部分不重发**——实测 98% 命中下整机当日上传仅数十 KB，按全量重发估算会虚高数十倍）。
+- **下载** ≈ 输出+思考 token × 400 B/token（SSE 事件流密度；2026-09-18 实测标定：流式期整机下载 ÷ token ≈ 731 B/token 为上界、UI 管道系数 bpt≈320 为下界，取居中值）。
+
+### 非会话上传 = 快照工件（真实下界）
+
+轮询 `~/.zcode/v2/checkpoints/*/state.json`（2s 一拍）：
+
+- **接受事件**：`lastAcceptedManifestHash` 变化 = 快照工件被服务端接受，按 `lastCompressedSize.encryptedSizeBytes`（加密压缩后字节）计入当日累计；`recordedAt` 早于本地今日 0 点的不计（跨天去重守卫——同一哈希永远归属其记录当天）。
+- **上传进行中**：任一 workspace 的 `activeUpload` 非空 → 状态行脉冲提示「快照上传进行中」。
+- **回补**：当日首次启动时，把 recordedAt 在今天、但面板未在场观测到的接受按当前 `lastCompressedSize` 回补计入（面板今天已运行过则只建基线不回补）。
+- **口径为面板观测期**：面板未运行期间的接受只在上述回补时计入；两拍之间的多次跳变按末态计（下界）。
+- **目录状态**：`ok` / `missing`（无目录）/ `blocked`（不可读——用户用 ACL 封锁 checkpoints 后的如实显示，此时监控不到新上传）。
+- 事件同时写调试日志（`kind:"net"`，`ev`=ckpt_accepted / ckpt_upload_start / ckpt_upload_end，含 `mb` 与 `ws` 工作区名）。
+- **快照上传记录列表**（卡片右栏；窄窗口 <860px 退回单栏）：每个 workspace 一行 = 记录时间（今天 HH:MM，跨天 MM-DD HH:MM）/ 工作区名（workspacePath 末段）/ 加密后大小 / 状态（**上传中 ⬆ / 待传 / 已接受 ✓**），排序 = 上传中 > 待传 > 已接受（同状态按记录时刻倒序），最多 12 行、限高滚动（`ckpt_rows` 纯函数，测试 `ckpt_rows_sorted_and_capped` 守护）。列表读的是 checkpoints 实况（state.json 只保留各工作区最近一次工件，更早历史不可考），面板未运行期间的最后状态启动即见。
+
+### ZCode 连接归属（真实值，仅 Windows）
+
+TCP 连接表（`GetExtendedTcpTable` OWNER_PID，v4+v6，仅 ESTABLISHED）按进程分组：
+
+- **会话组**：命令行含 `zcode.cjs` 的 CLI 进程（API 对话流量的承载者；进程发现口径与 liveio 一致，5s 刷新一次 pid 分组，连接表每拍枚举）；
+- **桌面端组**：其余 `zcode.exe`（Electron 主/渲染/GPU/工具进程——快照上传、遥测等非会话流量的承载者）。
+
+各组显示**去重后远端条数**，悬停 tooltip 列出远端 `ip:port`（≤6 条）。**证据链用法**：整机上传速度飙升 + 桌面端组出现新连接 + activeUpload = 快照上传正在发生的现场证据。mac 侧连接归属未实现（面板隐藏该行，接口计数仍可用）。
+
 ## 仪表与曲线（gauges.ts）
 
 - **当前速度表**：最小量程 60 t/s（`minScale` 可按表覆盖）；卡片左上角有 **⟳ 重新校准按钮**（口径见"实时速度"节），与右上角"上轮"角标呼应；**平均速度表**：最小 10 t/s；**今日总量表**：最小量程 1 亿 token，超峰值后自动放大（1亿→2亿→5亿→…），回落缓慢收缩。
@@ -78,8 +133,8 @@
 ## 日志系统（main.rs DebugLog）
 
 - `~/.zcode/speed-panel-debug.jsonl`：JSONL 追加写，8MB 轮转为 `.jsonl.1`；轮转旧文件超 7 天在启动时自动删除。
-- 事件四类：`tick` / `call` / `cal`（格式与排查方法见 [key-rules.md](key-rules.md) #6）与 `cal_reset`（手动/漂移自动重校准：`reason`=manual/auto、系数前后 `bpt_old`/`bpt_new`，auto 另附触发时的轮均值 `round_avg` 与 5 轮基线 `base_avg`）。
-- `tick` 另含**多任务排查三件套**：`infl`（进行中会话数）、`pids`（每台被跟踪进程的探测窗清洗速率，KB/s）、`attr`（进行中会话尾 4 位 → 归属 pid 列表）。多任务显示异常时先对账这三项：`pids` 里哪台在写、`attr` 是否把两会话挤到同一 pid、`infl` 与门控是否一致（2026-09-18 排查时只有 npids 单字段，无法回答"哪台进程在写"）。
+- 事件四类：`tick` / `call` / `cal`（格式与排查方法见 [key-rules.md](key-rules.md) #6）与 `cal_reset`（手动/漂移自动重校准：`reason`=manual/auto、系数前后 `bpt_old`/`bpt_new`，auto 另附触发时的轮均值 `round_avg` 与 5 轮基线 `base_avg`）。另有 `net` 事件（netio.rs，见"网络流量与上传监控"节）：`ev`=ckpt_accepted / ckpt_upload_start / ckpt_upload_end，附工作区 `ws`、工件大小 `mb` 与是否回补 `backfill`。
+- `tick` 另含**多任务排查三件套**：`infl`（进行中会话数）、`pids`（每台被跟踪进程的探测窗清洗速率，KB/s）、`attr`（进行中会话尾 4 位 → 归属 pid 列表）。多任务显示异常时先对账这三项：`pids` 里哪台在写、`attr` 是否把两会话挤到同一 pid、`infl` 与门控是否一致（2026-09-18 排查时只有 npids 单字段，无法回答"哪台进程在写"）。`tick` 另含**网络监控五件套**：`net_up`/`net_dn`（整机上传/下载速率，KB/s）、`cli_conn`/`app_conn`（会话组/桌面端组连接数）、`ckpt_up`（快照上传进行中）。
 
 ## 持久化文件
 
@@ -87,6 +142,7 @@
 |---|---|
 | `~/.zcode/speed-panel-mode.txt` | JSON：mode/style/full_pos/float_pos/pet_size（旧格式纯文本兼容） |
 | `~/.zcode/speed-panel-cal.json` | 系数样本队列（updated_ms + samples，超 14 天过期回先验；见"实时速度"节） |
+| `~/.zcode/speed-panel-net.json` | 网络当日累计（day/up/down/ckpt/ckpt_count，跨天清零；见"网络流量与上传监控"节） |
 | `~/.zcode/speed-panel-debug.jsonl` | 调试日志（8MB 轮转 + 7 天清理） |
 
 ## 应用内更新（updater.rs）
@@ -112,6 +168,7 @@
 - 管道静默调用（实测约半数）实时读数走 ≈ 回退，属预期行为而非 bug（此类调用启动期先显示 20s "…" 提示再切换）。
 - 多任务并发（多窗口/子代理并行）时实时读数为**进行中会话归属进程的聚合总吞吐**（任一会话尚无归属记录时触发全进程求和兜底）；完整面板同时显示分任务明细（见"实时速度"节）。同进程内并行的多个子代理在字节层不可拆分，显示为该进程合计。
 - 冷启动后系数需 1~2 个达标调用收敛，此前读数可能有偏差。
+- 网络监控的口径边界（详见"网络流量与上传监控"节）：**会话流量是 token×系数的量级估算**（± 数倍，带 ≈ 标注）；**快照工件是面板观测期的真实下界**（面板未运行期间的接受仅当日首次启动回补一次）；**整机数字混合其他应用流量**，走本地代理时还含隧道加密开销；连接归属仅 Windows。checkpoints 目录被 ACL 封锁时显示"不可读"，监控不到新上传（封锁本身就是用户侧防护）。
 - 硬崩溃（CLI 进程被杀、assistant 行无人补写 `completed`）最多残留 10 分钟门控（兜底上限）；已归属会话的进程退出会被进程守卫立即判停，未归属的新会话只能等兜底。
 - mac 的 CleanParams（burst 禁用/无静态底噪/系数先验 700/延迟落盘宽限 15s/离群拒绝 3 倍）中，先验与宽限已按 2026-09-17 的 6 条 cal 事件真值对账修正（归因正确时 pred/true 完全一致 62.1=62.1），尚未做 Windows 侧同等长度的对账回归；读数异常时先跑 `python scripts/live_vs_true.py` 对账、看 cal 事件 `attr_pid`/`top_pid` 归因再调参（key-rules #10）。
 - 应用内更新能力**随版本生效**：只有装了含 updater.rs 版本的用户才会收到后续更新提示，存量旧版本需手动升级一次铺底；dev 实例（`npm run tauri dev`）同样做真实检查与下载——版本等于最新 Release tag 时显示"已是最新"，属预期（热重启每次都会触发一次启动检查，量级远低于 API 限流）。

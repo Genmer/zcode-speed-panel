@@ -11,6 +11,15 @@ export interface TaskStat {
   streaming: boolean;
 }
 
+/** 快照上传记录行（与后端 CkptStat 同形） */
+export interface CkptStat {
+  workspace: string;
+  bytes: number;
+  recordedMs: number;
+  accepted: boolean;
+  uploading: boolean;
+}
+
 export interface Snapshot {
   currentTps: number;
   avgTps: number;
@@ -38,6 +47,25 @@ export interface Snapshot {
   spark: number[];
   /** 并发任务分进程明细（≥2 个时前端显示任务列表） */
   tasks: TaskStat[];
+  // ---- 网络流量监控（netio.rs；浏览器预览为模拟值） ----
+  netAvailable: boolean;
+  netUpBps: number;
+  netDownBps: number;
+  netUpToday: number;
+  netDownToday: number;
+  netSessUpToday: number;
+  netSessDownToday: number;
+  netCkptToday: number;
+  netCkptTodayCount: number;
+  netCkptUploading: boolean;
+  netCkptStatus: string;
+  /** 快照上传记录（每工作区最近一次工件实况） */
+  netCkptList: CkptStat[];
+  netConnsAvailable: boolean;
+  netCliConns: number;
+  netAppConns: number;
+  netCliRemotes: string[];
+  netAppRemotes: string[];
 }
 
 interface MockCall {
@@ -62,6 +90,11 @@ const rnd = (a: number, b: number) => a + Math.random() * (b - a);
 
 let calls: MockCall[] = [];
 let sessionNo = 1;
+// 网络监控模拟状态：当日累计单调累加；偶发一段"快照上传"演示警示行
+let netUpToday = rnd(2e8, 6e8);
+let netDownToday = rnd(1e9, 4e9);
+let mockCkptUploading = false;
+let ckptNextToggle = Date.now() + rnd(15_000, 40_000);
 
 function newCall(now: number): MockCall {
   if (Math.random() < 0.18) sessionNo++;
@@ -199,6 +232,31 @@ function snapshot(now: number, pending: MockCall | null): Snapshot {
     rolloutDir: "（浏览器预览 · 模拟数据）",
     spark,
     tasks,
+    // 网络监控模拟：速度随调用活动起伏，当日累计单调累加
+    netAvailable: true,
+    netUpBps: isLive ? rnd(20_000, 90_000) : rnd(0, 3_000),
+    netDownBps: isLive ? rnd(80_000, 400_000) : rnd(0, 8_000),
+    netUpToday: netUpToday,
+    netDownToday: netDownToday,
+    // 与后端同口径：上传按未缓存提示（input−cache_read）×5，下载按输出 ×400
+    netSessUpToday: Math.max(0, input - cache) * 5,
+    netSessDownToday: out * 400,
+    netCkptToday: 549.2 * 1048576,
+    netCkptTodayCount: 1,
+    netCkptUploading: mockCkptUploading,
+    netCkptStatus: "ok",
+    // 快照上传记录模拟：上传中 > 待传 > 已接受（含跨天记录演示月日显示）
+    netCkptList: [
+      { workspace: "GenePad", bytes: 549.2 * 1048576, recordedMs: now - 3600_000, accepted: !mockCkptUploading, uploading: mockCkptUploading },
+      { workspace: "GenePad-free", bytes: 1024.0 * 1048576, recordedMs: now - 7 * 3600_000, accepted: true, uploading: false },
+      { workspace: "zcode-speed-panel", bytes: 990, recordedMs: now - 4 * 3600_000, accepted: true, uploading: false },
+      { workspace: "Gene_Editor-master", bytes: 522.5 * 1048576, recordedMs: now - 13 * 86400_000, accepted: true, uploading: false },
+    ],
+    netConnsAvailable: true,
+    netCliConns: isLive ? 2 : 1,
+    netAppConns: mockCkptUploading ? 3 : 1,
+    netCliRemotes: ["61.170.79.24:443"],
+    netAppRemotes: ["61.151.230.245:443", "oss-cn-hangzhou.aliyuncs.com:443"],
   };
 }
 
@@ -220,6 +278,13 @@ export function startMock(onData: (s: Snapshot) => void) {
     }
     if (!pending && t >= nextStart) {
       pending = newCall(t);
+    }
+    // 网络监控模拟：累计按模拟速度推进；快照上传段偶发启停
+    netUpToday += rnd(500, 120_000) * 0.4;
+    netDownToday += rnd(2_000, 500_000) * 0.4;
+    if (t >= ckptNextToggle) {
+      mockCkptUploading = !mockCkptUploading;
+      ckptNextToggle = t + (mockCkptUploading ? rnd(20_000, 50_000) : rnd(40_000, 120_000));
     }
     onData(snapshot(t, pending));
   };
