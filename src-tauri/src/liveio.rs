@@ -7,10 +7,11 @@
 //! - 进程发现：Windows 过滤 `zcode.exe` 且命令行含 `zcode.cjs`；macOS 按
 //!   KERN_PROCARGS2 命令行参数精确匹配 `zcode-cli`（均可多进程并存）
 //! - 落盘扣除（仅 Windows）：rollout/日志/WAL 的增长从字节增量中减去（完成/flush
-//!   瞬间的尖峰来源）。扣除允许单拍为负（flush 与写入错位时由区间总和收敛），
-//!   只在窗口汇总时钳非负——若逐拍钳 0，错位的落盘增量会被永久吞掉（实测读数
-//!   塌缩到真值的 1/5 就是这个原因）。macOS 不做该扣除（rollout 目录净变化可为
-//!   负，方向性反噬清洗流，见 platform::mac 的 tracked_files_total）
+//!   瞬间的尖峰来源），在**聚合流**上整体只扣一次（多进程求和时逐进程各扣一遍
+//!   会把全局文件增量扣 N 倍）。扣除允许单拍为负（flush 与写入错位时由区间总和
+//!   收敛），只在窗口汇总时钳非负——若逐拍钳 0，错位的落盘增量会被永久吞掉
+//!   （实测读数塌缩到真值的 1/5 就是这个原因）。macOS 不做该扣除（rollout 目录
+//!   净变化可为负，方向性反噬清洗流，见 platform::mac 的 tracked_files_total）
 //! - 噪声底：BASE_NOISE + 每进程自适应心跳底（封顶，防止持续流式期间分位数被
 //!   流式增量"毒化"，把自己的输出当噪声扣掉）；两平台参数不同（mac idle 实测
 //!   严格 0 字节，静态底噪为 0）
@@ -21,7 +22,9 @@
 //!   在 [first_token, completed] 区间的积分字节 ÷ 真实 output_tokens 做滑动自校准。
 //!   校准分子与显示分子同源，任何系统性扣除（噪声底/落盘/错位）都会被系数抵消，
 //!   显示值收敛到真实 t/s。历史教训：校准用未清洗的总字节流、显示用清洗后的流，
-//!   两条链路口径不一致曾导致系数被抬高 2~3 倍、读数系统性偏低。
+//!   两条链路口径不一致曾导致系数被抬高 2~3 倍、读数系统性偏低。样本准入另带
+//!   跨进程守卫：窗口内其他进程字节占比过高（对方窗口并发流式）时拒收，防止
+//!   归因进程的积分混入外来字节污染系数。
 //!   mac 的磁盘写字节为页缓存异步落盘计数（滞后 write() 数秒~数十秒），校准
 //!   窗口延长到 completed + cal_grace_ms（延迟落盘宽限，Windows=0 当拍处理），
 //!   并对偏离生效系数超倍的样本做离群拒绝（Windows 禁用）。
@@ -40,6 +43,13 @@ const REFRESH_EVERY: Duration = Duration::from_secs(30);
 const STREAMING_BPS: f64 = 4_000.0;
 /// 启停由调用门控决定；该短窗仅用于定位幅度锚点（首字节拍）
 const DETECT_MS: i64 = 2_500;
+
+/// 判停兜底宽限：门控开着（message 行 completed 未补写落盘，CLI 侧可延迟
+/// 数秒~分钟）但流式锚点出现后清洗流速持续低于流式阈值达该时长 → 判定生成
+/// 实际已停，读数归零不再显示"生成中/估算"。锚点未建立的管道静默调用不受
+/// 影响（全程无字节是其常态，由 window 回退服务）；正常流式的字节间歇远短
+/// 于该值，误判时字节恢复当拍自愈
+const SILENT_STOP_MS: i64 = 15_000;
 /// 启动提示窗口：门控已开但尚未观测到流式字节（TTFT）的时长上限。
 /// 窗口内显示"统计中…"提示（不显示误导性的估算值）；超窗仍无字节则视为
 /// 管道静默调用，回退到近期真值估算（≈）
@@ -61,6 +71,25 @@ const CAL_MIN: f64 = 100.0;
 const CAL_MAX: f64 = 6_000.0;
 /// 校准样本的调用规模下限：小调用的 UI 固定帧开销占比大，禁止入样本
 const CAL_MIN_TOKENS: u64 = 300;
+/// 轮均速漂移自动重校准：一轮 = 门控"进行中"信号连续的一段，轮内显示速度
+/// （io 实测拍）取算术平均；上轮均值与之前连续 DRIFT_ROUNDS 轮的均值差异
+/// ≥ DRIFT_RATIO 倍（双向）判定量级突变（换模型/分词器，旧系数大概率过期）
+const DRIFT_ROUNDS: usize = 5;
+const DRIFT_RATIO: f64 = 3.0;
+/// 会话→进程归属的切换迟滞：已有归属的会话，仅当候选进程在调用窗口内的原始
+/// 字节 ≥ 现归属进程的该倍数才切换。两个 CLI 窗口并发流式时 top-writer 会逐
+/// 调用翻转（2026-09-18 现场：同会话相邻两次调用归属在两个 pid 间摆动，校准
+/// 样本被对方窗口的字节污染，系数在 262~764 间摆动、读数偏差 2~3 倍）
+const ATTR_SWITCH_RATIO: f64 = 2.0;
+/// 并发归属去重阈值：top 进程已被另一个进行中会话占用时，次高进程窗口字节
+/// 达到 top 的该比例才改归次高。两路并发流式速率相近（比例 ~1），空闲进程
+/// 的底噪泄漏 ~0.1；0.5 居中——纠正平局错归，又不把共享进程的会话推给
+/// 空闲进程（2026-09-18 现场：同一 ZCode 窗口新开任务复用同一 app-server
+/// 进程，两会话字节全走同一 pid，次高只有 ~0.17 比例的噪声）
+const ATTR_DEDUP_RATIO: f64 = 0.5;
+/// 校准样本跨进程守卫：调用窗口内**其他**进程的原始字节超过归属进程的该比例
+/// 即拒收样本——此时归属进程的清洗积分必然混入对方窗口的流式语义，样本失真
+const CROSS_PID_RATIO: f64 = 0.2;
 
 /// 清洗/校准参数（平台参数化）。Windows 列为长期实测调优值（上方原常量，
 /// 禁改）；macOS 列基于 120s 探针 + 2026-09-17 真值对账（6 条 cal 事件，
@@ -164,6 +193,28 @@ pub struct LiveNow {
     pub tps: f64,
     /// 清洗后的管道字节率（B/s），调试日志/对账用
     pub pipe_bps: f64,
+    /// 本拍聚合窗口内贡献达到流式量级的进程数（1 = 单任务；>1 = 多任务聚合；
+    /// 空闲进程的底噪泄漏不计入）。轮漂移检测只采单进程轮——任务数变化带来
+    /// 的天然吞吐差不是系数漂移
+    pub n_pids: usize,
+    /// 分任务明细：显示集合内每个进程的实时速度（明细之和 = 聚合读数）
+    pub tasks: Vec<TaskLive>,
+    /// 诊断：每台被跟踪进程的探测窗清洗速率（KB/s）。多任务排查对账用
+    ///（2026-09-18 排查时 tick 只有 npids 单字段，无法回答"哪台进程在写"）
+    pub proc_bps: Vec<(u32, f64)>,
+}
+
+/// 分任务实时明细（`LiveNow::tasks` 元素）：一个 CLI 进程 = 一个任务行。
+/// 同进程内并行的多个子代理在字节层不可拆分，如实显示为该进程合计
+#[derive(Clone, Debug, Default)]
+pub struct TaskLive {
+    pub pid: u32,
+    /// 归属的进行中会话（尚无归属记录的流式进程为 None）
+    pub session: Option<String>,
+    /// 该进程承载的进行中会话数（≥2 = 同进程多任务，速度为合计，标签见 n_sessions）
+    pub n_sessions: usize,
+    pub tps: f64,
+    pub streaming: bool,
 }
 
 /// 一次调用完成后的校准与对账事件（调试日志用）
@@ -191,6 +242,9 @@ pub struct CalEvent {
     /// raw_by_pid 中原始字节最大的进程（归因异常定位：attr 与 top 不一致
     /// 且 clean 远小于 raw 即归属错了进程）
     pub top_pid: Option<u32>,
+    /// 调用窗口内其他进程的原始字节（跨进程守卫诊断：占比超过归属进程的
+    /// CROSS_PID_RATIO 时样本被拒收）
+    pub others_bytes: f64,
 }
 
 // ============ 纯计算部分（跨平台，可单测）：拍清洗 / 区间积分 / 中位数 ============
@@ -207,14 +261,10 @@ pub(crate) struct TickRow {
     pub end_ms: i64,
 }
 
-/// 由累计写字节序列与 tracked 文件总量序列构建清洗后的拍序列。
-/// samples / files 均为 (时刻 ms, 累计值)，通常同一轮询循环成对采样（时间戳一致）。
-pub(crate) fn build_rows(
-    samples: &[(i64, u64)],
-    files: &[(i64, u64)],
-    min_delta: f64,
-    p: &CleanParams,
-) -> Vec<TickRow> {
+/// 由累计写字节序列构建清洗后的拍序列（仅扣逐进程噪声底；tracked 文件增长
+/// 由 [`merge_streams`] 在聚合流上统一扣除——多进程求和时逐进程各扣一遍会把
+/// 全局文件增量扣 N 倍）。bytes 可为负（落盘错位由区间积分对消）
+pub(crate) fn build_rows(samples: &[(i64, u64)], min_delta: f64, p: &CleanParams) -> Vec<TickRow> {
     let floor_static = min_delta.min(p.floor_cap_bytes);
     let mut rows = Vec::with_capacity(samples.len());
     for w in samples.windows(2) {
@@ -230,23 +280,72 @@ pub(crate) fn build_rows(
         if raw > p.burst_tick_bytes {
             continue;
         }
-        // [t0, t1) 区间内 tracked 文件的落盘增长（边界半开，避免相邻区间重复计入）
-        let mut fg = 0f64;
-        for f in files.windows(2) {
-            let (ft0, fv0) = f[0];
-            let (ft1, fv1) = f[1];
-            if ft1 > t0 && ft0 < t1 {
-                fg += fv1.saturating_sub(fv0) as f64;
-            }
-        }
         let dt_s = dt_ms as f64 / 1000.0;
         rows.push(TickRow {
             dt_ms,
-            bytes: raw - fg - floor_static - p.base_noise_bps * dt_s,
+            bytes: raw - floor_static - p.base_noise_bps * dt_s,
             end_ms: t1,
         });
     }
     rows
+}
+
+/// 把多条进程清洗流合并为一条聚合流：同拍字节求和、墙钟时长只计一次
+/// （逐进程分别积分会把时长也求和，速率被摊薄成跨进程均值）、tracked 文件
+/// 增长整体只扣一次。行按 end_ms 对齐（同一轮询循环成对采样，时间戳一致；
+/// 某进程缺拍的区间其字节贡献自然为 0）。单条流输入时与逐行扣文件的
+/// 历史算术完全等价
+pub(crate) fn merge_streams(streams: &[&[TickRow]], files: &[(i64, u64)]) -> Vec<TickRow> {
+    use std::collections::BTreeMap;
+    let mut merged: BTreeMap<i64, (i64, f64)> = BTreeMap::new();
+    for rows in streams {
+        for r in rows.iter() {
+            let e = merged.entry(r.end_ms).or_insert((r.dt_ms, 0.0));
+            // 同拍 dt 必须一致（同一轮询循环成对采样）——一旦将来采样时刻分化，
+            // 按 end_ms 合并会静默分裂成两行导致时长双计，这里让它尽早炸出来
+            debug_assert_eq!(e.0, r.dt_ms);
+            e.1 += r.bytes;
+        }
+    }
+    let mut out = Vec::with_capacity(merged.len());
+    for (end_ms, (dt_ms, bytes)) in merged {
+        // [t0, end) 区间内 tracked 文件的落盘增长（边界半开，避免相邻区间重复计入）
+        let t0 = end_ms - dt_ms;
+        let mut fg = 0f64;
+        for f in files.windows(2) {
+            let (ft0, fv0) = f[0];
+            let (ft1, fv1) = f[1];
+            if ft1 > t0 && ft0 < end_ms {
+                fg += fv1.saturating_sub(fv0) as f64;
+            }
+        }
+        out.push(TickRow {
+            dt_ms,
+            bytes: bytes - fg,
+            end_ms,
+        });
+    }
+    out
+}
+
+/// tracked 文件总量序列 → 增长拍序列（供分任务明细按窗口分摊扣除）
+pub(crate) fn file_growth_rows(files: &[(i64, u64)]) -> Vec<TickRow> {
+    files
+        .windows(2)
+        .filter_map(|w| {
+            let (t0, v0) = w[0];
+            let (t1, v1) = w[1];
+            let dt_ms = t1 - t0;
+            if dt_ms <= 0 {
+                return None;
+            }
+            Some(TickRow {
+                dt_ms,
+                bytes: v1.saturating_sub(v0) as f64,
+                end_ms: t1,
+            })
+        })
+        .collect()
 }
 
 /// 按时间比例积分 [from_ms, to_ms] 区间：跨界拍按重叠时长分摊。
@@ -276,6 +375,112 @@ pub(crate) fn median_bpt(samples: &mut VecDeque<f64>, sample: f64, cap: usize) -
     let mut sorted: Vec<f64> = samples.iter().copied().collect();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     sorted[sorted.len() / 2]
+}
+
+/// 实时显示的进程集合选择（纯函数便于测试）：
+/// - 进行中会话全部有存活归属 → 归属 pid 的并集：多任务并发时聚合为真实总吞吐，
+///   同时产出分任务明细；
+/// - 任一进行中会话无归属（新会话/子代理的首个调用尚未完成过）→ None =
+///   全进程求和兜底：该会话自己的进程还没有归属记录，只按并集算会漏掉它、
+///   显示成别的窗口的速度；空闲进程经底噪清洗后贡献 ≈ 0，代价可忽略；
+/// - 无进行中会话 → None（门控关闭，读数归零，走哪条分支不影响）
+pub(crate) fn pick_pid_set(
+    inflight: &[(String, i64)],
+    session_pid: &HashMap<String, u32>,
+    active_pids: &HashSet<u32>,
+) -> Option<Vec<u32>> {
+    if inflight.is_empty() {
+        return None;
+    }
+    let mut set = Vec::with_capacity(inflight.len());
+    for (s, _) in inflight {
+        match session_pid.get(s) {
+            Some(pid) if active_pids.contains(pid) => set.push(*pid),
+            // 无归属或归属进程已死 → 求和兜底（session_pid 每拍按存活 pid 淘汰，
+            // 这里遇到的"已死"只会是本拍内竞态，兜底同样安全）
+            _ => return None,
+        }
+    }
+    set.sort_unstable();
+    set.dedup();
+    Some(set)
+}
+
+/// 会话→进程归属切换判定（纯函数便于测试）：返回本次应写入的归属 pid。
+/// 已有归属时带迟滞——仅当候选 top 进程窗口内原始字节 ≥ 现归属的
+/// ATTR_SWITCH_RATIO 倍才切换，杜绝并发窗口间逐调用翻转；无现归属或
+/// 现归属窗口内零字节（归属过期的自愈路径）时直接采信 top
+pub(crate) fn should_reattribute(
+    cur: Option<u32>,
+    top: Option<u32>,
+    raw_by_pid: &HashMap<u32, u64>,
+) -> Option<u32> {
+    let top = top?;
+    match cur {
+        Some(c) if c != top => {
+            let cur_raw = *raw_by_pid.get(&c).unwrap_or(&0) as f64;
+            let top_raw = *raw_by_pid.get(&top).unwrap_or(&0) as f64;
+            if top_raw >= cur_raw * ATTR_SWITCH_RATIO && top_raw > cur_raw {
+                Some(top)
+            } else {
+                Some(c)
+            }
+        }
+        _ => Some(top),
+    }
+}
+
+/// 会话→进程归属判定（纯函数便于测试）：返回本次应写入的归属 pid。
+/// `owned` = 其他**进行中**会话已归属的 pid 集合。三个分支：
+/// - 首次归属：top 已被占用且次高字节达 top 的 ATTR_DEDUP_RATIO → 改归次高
+///   （并发平局下 max_by 取 top 是随机的，两会话会一起挤到同一台进程上，
+///   显示集合随之塌缩成单进程）；次高只有噪声比例则维持 top（真实共享）
+/// - 现归属被另一个进行中会话占用：top 未被占用且字节达现归属的一半即可
+///   切换——被占用场景下 2 倍迟滞会把历史错归锁死
+/// - 现归属未被占用：维持 2 倍迟滞原语义（should_reattribute）
+pub(crate) fn pick_attribution(
+    cur: Option<u32>,
+    raw_by_pid: &HashMap<u32, u64>,
+    owned: &HashSet<u32>,
+) -> Option<u32> {
+    // 候选按窗口字节降序、平局按 pid 升序——遍历序确定，不再依赖 HashMap 顺序
+    let mut cands: Vec<(u32, u64)> = raw_by_pid.iter().map(|(p, b)| (*p, *b)).collect();
+    cands.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let top = cands.first().copied()?;
+    match cur {
+        None => {
+            if owned.contains(&top.0) {
+                if let Some((pid, bytes)) = cands.get(1) {
+                    if !owned.contains(pid)
+                        && *bytes as f64 >= (top.1 as f64) * ATTR_DEDUP_RATIO
+                        && *bytes >= 20_000
+                    {
+                        return Some(*pid);
+                    }
+                }
+            }
+            Some(top.0)
+        }
+        Some(c) if c != top.0 && owned.contains(&c) => {
+            // 现归属被占用：top 未被占用且字节达现归属的一半即可切换
+            //（被占用场景 2 倍迟滞会把历史错归锁死；top 也被占用则无处可去）
+            if !owned.contains(&top.0)
+                && top.1 as f64 >= (*raw_by_pid.get(&c).unwrap_or(&0) as f64) * ATTR_DEDUP_RATIO
+            {
+                Some(top.0)
+            } else {
+                Some(c)
+            }
+        }
+        Some(c) => should_reattribute(Some(c), Some(top.0), raw_by_pid),
+    }
+}
+
+/// 校准样本跨进程守卫（纯函数便于测试）：调用窗口内其他进程的原始字节
+/// 不超过归属进程的 CROSS_PID_RATIO 才允许入样。对方窗口并发流式时，
+/// 归属进程的清洗积分窗口内必然混入外来字节，B/token 样本失真
+pub(crate) fn cross_pid_ok(others_raw: f64, attr_raw: f64) -> bool {
+    attr_raw > 0.0 && others_raw <= attr_raw * CROSS_PID_RATIO
 }
 
 /// 校准样本准入：管道积分须有实质贡献（≥原始字节的 20%），且 B/token 未钳位
@@ -310,6 +515,9 @@ pub(crate) fn cal_sample(
     (in_range, ratio)
 }
 
+/// 校准样本队列容量（滑动窗口，含预置先验占位）
+const CAL_QUEUE_CAP: usize = 5;
+
 /// 启动提示判定（纯函数）：门控开启、尚无流式锚点（首字节未到）且距调用开始
 /// 仍在提示窗口内。窗口外保持无锚点 = 管道静默调用，由上层回退到估算显示
 pub(crate) fn awaiting_hint(
@@ -320,6 +528,56 @@ pub(crate) fn awaiting_hint(
     match (inflight_started, anchor) {
         (Some(started), None) => now_ms - started <= TTFT_HINT_MS,
         _ => false,
+    }
+}
+
+/// 判停兜底（纯函数）：门控开着且流式锚点已建立，但最近一次达到流式阈值的
+/// 时刻距今超过宽限 → 生成实际已停（等 completed 落盘期间不再挂着"生成中"）
+pub(crate) fn stale_stop(anchor: Option<i64>, last_stream_ms: Option<i64>, now_ms: i64) -> bool {
+    anchor.is_some()
+        && last_stream_ms.map_or(false, |t| now_ms - t > SILENT_STOP_MS)
+}
+
+/// 轮均速漂移检测（纯函数便于测试）：逐轮喂入显示速度均值，与之前连续
+/// DRIFT_ROUNDS 轮的均值比较，双向差异 ≥ DRIFT_RATIO 倍即判定速度量级突变，
+/// 应触发重新校准（`LiveIo::reset_calibration`）。触发后清空历史，
+/// 新量级重新积累基线，避免同一突变反复触发
+#[derive(Default)]
+pub struct RoundDrift {
+    history: VecDeque<f64>,
+}
+
+impl RoundDrift {
+    pub fn new() -> Self {
+        Self {
+            history: VecDeque::with_capacity(DRIFT_ROUNDS),
+        }
+    }
+
+    /// 观测一轮的显示均值。返回 Some(基线均值) = 触发重校准（基线供日志）；
+    /// 均值 ≤0 的轮（管道静默、无实测拍）不参与也不入历史
+    pub fn observe(&mut self, round_avg: f64) -> Option<f64> {
+        if round_avg <= 0.0 {
+            return None;
+        }
+        let base = (self.history.len() == DRIFT_ROUNDS)
+            .then(|| self.history.iter().sum::<f64>() / DRIFT_ROUNDS as f64);
+        if let Some(b) = base {
+            if round_avg / b >= DRIFT_RATIO || b / round_avg >= DRIFT_RATIO {
+                self.history.clear();
+                return Some(b);
+            }
+        }
+        self.history.push_back(round_avg);
+        while self.history.len() > DRIFT_ROUNDS {
+            self.history.pop_front();
+        }
+        None
+    }
+
+    /// 清空历史（手动重校准后同步复位，新基线从零积累）
+    pub fn reset(&mut self) {
+        self.history.clear();
     }
 }
 
@@ -798,16 +1056,17 @@ pub struct LiveIo {
     last_result: LiveNow,
     /// 会话 → 最近一次为其生成输出的 CLI 进程
     session_pid: HashMap<String, u32>,
-    /// 当前关注的会话 = 最近完成调用的会话
+    /// 最近一次清洗流速达到流式阈值的时刻（判停兜底的计时起点）
+    last_stream_ms: Option<i64>,
+    /// 当前关注的会话 = 最近完成调用的会话（仅作门控无调用基线时的判据种子）
     current_session: Option<String>,
     attributed: HashSet<String>,
     history_done: bool,
-    /// 进行中的调用（Engine 由 message 表判定）：(会话, 调用开始时刻)
-    inflight: Option<(String, i64)>,
+    /// 全部进行中的调用（Engine 由 message 表判定）：(会话, 调用开始时刻)，
+    /// 多任务并发时实时速度按归属进程并集聚合
+    inflight: Vec<(String, i64)>,
     /// 本段调用的幅度锚点（首个达到流式阈值的时刻，墙钟 ms）
     active_since: Option<i64>,
-    /// 锚点所属的会话进程（变化时重置）
-    active_pid: Option<u32>,
     /// 最近一次校准事件（供调试日志取用）
     pending_cal: Option<CalEvent>,
     /// 本进程生命周期内是否发现过 CLI 进程（区分"从未可用"与"已退出"）
@@ -831,12 +1090,12 @@ impl LiveIo {
             bytes_per_token: params.default_bpt,
             last_result: LiveNow::default(),
             session_pid: HashMap::new(),
+            last_stream_ms: None,
             current_session: None,
             attributed: HashSet::new(),
             history_done: false,
-            inflight: None,
+            inflight: Vec::new(),
             active_since: None,
-            active_pid: None,
             pending_cal: None,
             ever_saw_procs: false,
         }
@@ -865,9 +1124,18 @@ impl LiveIo {
         }
     }
 
-    /// 每拍更新"调用进行中"信号（Engine 由 message 表与完成行比较得出）
-    pub fn set_inflight(&mut self, inflight: Option<(String, i64)>) {
+    /// 每拍更新"调用进行中"信号（Engine 由 message 表与完成行比较得出；
+    /// 多任务并发时为全部进行中会话）
+    pub fn set_inflight(&mut self, inflight: Vec<(String, i64)>) {
         self.inflight = inflight;
+    }
+
+    /// 调试日志用：进行中会话的归属映射（会话 id → pid；无归属的会话省略）
+    pub fn inflight_attr(&self) -> Vec<(String, u32)> {
+        self.inflight
+            .iter()
+            .filter_map(|(s, _)| self.session_pid.get(s).map(|p| (s.clone(), *p)))
+            .collect()
     }
 
     /// 当前生效的字节→token 系数（调试日志用）
@@ -886,18 +1154,62 @@ impl LiveIo {
         self.pending_cal.take()
     }
 
+    /// 重新校准（当前速度卡手动按钮 / 轮均速漂移自动触发）：丢弃已学习的
+    /// 系数样本，回到平台先验的冷启动状态（先验占位防单样本独占），由后续
+    /// 完成调用的样本重新收敛。pending 调用保留——会话→进程归属仍需处理，
+    /// 其携带的旧量级样本在滑动窗口下 1~2 轮即被新样本挤出。返回重置后系数
+    pub fn reset_calibration(&mut self) -> f64 {
+        self.cal.clear();
+        self.cal.push_back(self.params.default_bpt);
+        self.bytes_per_token = self.params.default_bpt;
+        self.bytes_per_token
+    }
+
+    /// 导出系数样本队列（供持久化；重校准后为 [先验]，随队列变化落盘即可
+    /// 让"重校准意图"跨重启保留）
+    pub fn cal_state(&self) -> Vec<f64> {
+        self.cal.iter().copied().collect()
+    }
+
+    /// 从持久化恢复系数样本：只收值域内的有限值，注入队列（容量与实时校准
+    /// 一致，超出丢最旧），生效系数取恢复后队列的上中位数（与校准路径同
+    /// 口径）。空/全非法时保持先验不动，返回实际接受数
+    pub fn restore_cal(&mut self, samples: Vec<f64>) -> usize {
+        let valid: Vec<f64> = samples
+            .into_iter()
+            .filter(|v| v.is_finite() && *v >= self.params.cal_min && *v <= self.params.cal_max)
+            .collect();
+        let n = valid.len();
+        for v in valid {
+            self.cal.push_back(v);
+        }
+        while self.cal.len() > CAL_QUEUE_CAP {
+            self.cal.pop_front();
+        }
+        let mut sorted: Vec<f64> = self.cal.iter().copied().collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        self.bytes_per_token = sorted[sorted.len() / 2];
+        n
+    }
+
     /// 每个轮询周期调用一次。now_ms 为墙钟毫秒（与 Engine 快照同源）
     pub fn measure(&mut self, now_ms: i64) -> LiveNow {
         let now = Instant::now();
-        // 周期性刷新 CLI 进程集合；未发现任何进程时缩短到 2s——
-        // 新启动的 CLI（新会话开聊）最长 2s 即可被观测到，而不是等满 30s
+        // 周期性刷新 CLI 进程集合；未发现任何进程、存在尚无归属记录的进行中
+        // 会话（新开的第二个窗口——此时显示走全进程求和兜底，新进程没被发现
+        // 的话读的是别的窗口的速度）、或 ≥2 个进行中会话（多任务并发，归属
+        // 去重需要尽快看到新进程的字节分布）时缩短到 2s，而不是等满 30s
+        let unattributed_inflight =
+            !self.inflight.is_empty() && self.inflight.iter().any(|(s, _)| !self.session_pid.contains_key(s));
         let refresh_due = self
             .last_refresh
             .map_or(true, |t| now.duration_since(t) > REFRESH_EVERY);
         let quick_due = self
             .last_refresh
             .map_or(true, |t| now.duration_since(t) > Duration::from_secs(2));
-        if refresh_due || (self.procs.is_empty() && quick_due) {
+        if refresh_due
+            || ((self.procs.is_empty() || unattributed_inflight || self.inflight.len() >= 2) && quick_due)
+        {
             self.last_refresh = Some(now);
             let found = platform::discover_cli_pids();
             self.procs.retain(|pid, _| found.contains(pid));
@@ -960,7 +1272,7 @@ impl LiveIo {
                     0.0
                 };
             }
-            rows_by_pid.insert(*pid, build_rows(&samples, &files, ring.min_delta, &self.params));
+            rows_by_pid.insert(*pid, build_rows(&samples, ring.min_delta, &self.params));
         }
 
         // ---- 校准 + 会话→进程归属（调用完成后处理）----
@@ -994,39 +1306,75 @@ impl LiveIo {
                 raw_by_pid.insert(*pid, acc);
             }
             let raw_total = raw_by_pid.values().sum::<u64>() as f64;
-            let top_pid = raw_by_pid
-                .iter()
-                .max_by(|a, b| a.1.cmp(b.1))
-                .map(|(pid, _)| *pid);
+            // 候选按字节降序、平局按 pid 升序（确定性），归属与事件记录共用
+            let mut cands: Vec<(u32, u64)> = raw_by_pid.iter().map(|(p, b)| (*p, *b)).collect();
+            cands.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            let top_pid = cands.first().map(|(p, _)| *p);
             if !self.attributed.contains(&call.id) {
                 self.attributed.insert(call.id.clone());
                 if self.attributed.len() > 4_000 {
                     self.attributed.clear();
                 }
                 if raw_total > 20_000.0 {
-                    if let Some(pid) = top_pid {
+                    // 其他进行中会话已占用的 pid（并发去重：平局时别往同一台挤；
+                    // 两会话真实共享一台进程时次高只有噪声比例，不受影响）
+                    let owned: HashSet<u32> = self
+                        .inflight
+                        .iter()
+                        .filter(|(s, _)| s != &call.session)
+                        .filter_map(|(s, _)| self.session_pid.get(s).copied())
+                        .collect();
+                    if let Some(pid) =
+                        pick_attribution(self.session_pid.get(&call.session).copied(), &raw_by_pid, &owned)
+                    {
                         self.session_pid.insert(call.session.clone(), pid);
                     }
                 }
             }
-            // 清洗积分：优先归属进程（与显示路径一致），未归属时退化为全进程求和
+            // 清洗积分：优先归属进程（与显示路径同一条聚合流，tracked 文件
+            // 增长同样只扣一次），未归属时退化为全进程聚合
             let mut attr_pid = None;
             let clean_bytes = match self.session_pid.get(&call.session) {
                 Some(pid) if rows_by_pid.contains_key(pid) => {
                     attr_pid = Some(*pid);
-                    integrate(&rows_by_pid[pid], stream_start_ms, window_end_ms).0
+                    let streams = [&rows_by_pid[pid][..]];
+                    integrate(
+                        &merge_streams(&streams, &files),
+                        stream_start_ms,
+                        window_end_ms,
+                    )
+                    .0
                 }
-                _ => rows_by_pid
-                    .values()
-                    .map(|r| integrate(r, stream_start_ms, window_end_ms).0)
-                    .sum::<f64>(),
+                _ => {
+                    let streams: Vec<&[TickRow]> =
+                        rows_by_pid.values().map(|v| &v[..]).collect();
+                    integrate(
+                        &merge_streams(&streams, &files),
+                        stream_start_ms,
+                        window_end_ms,
+                    )
+                    .0
+                }
             };
+            // 分子分母配对：clean 来自归属进程时，raw 基线也用归属进程的
+            // （全进程 raw 会把他窗字节算进分母，clean/raw 守卫误判）。
+            // 跨进程守卫基准：归属进程字节；无归属的全进程求和分支以 top 进程
+            // 为基准——该分支的积分同样会混入他窗字节，不能放行
+            let top_raw = top_pid
+                .map_or(0.0, |p| *raw_by_pid.get(&p).unwrap_or(&0) as f64);
+            let attr_raw = attr_pid
+                .map_or(raw_total, |p| *raw_by_pid.get(&p).unwrap_or(&0) as f64);
+            let guard_ref = attr_pid.map_or(top_raw, |_| attr_raw);
+            let others_raw = (raw_total - guard_ref).max(0.0);
             let eff = call.effective_out();
             let true_tps = eff as f64 / (call.gen_ms.max(50) as f64 / 1000.0);
-            let (in_cal, bpt_sample) =
-                cal_sample(eff, clean_bytes, raw_total, self.bytes_per_token, &self.params);
+            let (mut in_cal, bpt_sample) =
+                cal_sample(eff, clean_bytes, attr_raw, self.bytes_per_token, &self.params);
+            if in_cal && !cross_pid_ok(others_raw, guard_ref) {
+                in_cal = false;
+            }
             if in_cal {
-                self.bytes_per_token = median_bpt(&mut self.cal, bpt_sample, 5);
+                self.bytes_per_token = median_bpt(&mut self.cal, bpt_sample, CAL_QUEUE_CAP);
             }
             self.pending_cal = Some(CalEvent {
                 id: call.id.clone(),
@@ -1042,72 +1390,66 @@ impl LiveIo {
                 cal_skipped: !in_cal,
                 attr_pid,
                 top_pid,
+                others_bytes: others_raw,
             });
             self.pending.pop_front();
         }
 
-        // 只统计当前活跃会话对应进程的写字节流，避免后台会话污染状态。
-        // 优先取进行中调用（message 门控）的会话归属：新开对话首个调用尚无
-        // 完成行、无归属记录时退化为全进程求和；无进行中调用时退回最近
-        // 完成调用的会话（与归属维护同源）
-        let live_pid = self
-            .inflight
-            .as_ref()
-            .and_then(|(s, _)| self.session_pid.get(s))
-            .copied()
-            .or_else(|| {
-                self.current_session
-                    .as_ref()
-                    .and_then(|s| self.session_pid.get(s))
-                    .copied()
-            });
-        // 会话进程变化时重置幅度锚点，避免跨会话残留
-        if live_pid != self.active_pid {
-            self.active_pid = live_pid;
-            self.active_since = None;
-        }
-
-        // 区间积分辅助：归属进程的流，或全部进程的流（时间轴相同，分子分母分别求和）
-        let span = |from_ms: i64| -> (f64, f64) {
-            match live_pid {
-                Some(pid) => integrate(
-                    rows_by_pid.get(&pid).map(|v| &v[..]).unwrap_or(&[]),
-                    from_ms,
-                    now_ms,
-                ),
-                None => rows_by_pid
-                    .values()
-                    .map(|r| integrate(r, from_ms, now_ms))
-                    .fold((0.0, 0.0), |(b, s), (bb, ss)| (b + bb, s + ss)),
-            }
+        // 显示进程集合：进行中会话全部有存活归属 → 归属 pid 并集（多任务并发
+        // 聚合为真实总吞吐）；任一会话尚无归属（新会话/子代理首个调用未完成过）
+        // → 全进程求和兜底，避免漏掉尚无归属记录的新进程、显示成别的窗口的速度
+        let pid_set = pick_pid_set(&self.inflight, &self.session_pid, &active_pids);
+        // 聚合流：集合上逐拍字节求和 + tracked 文件增长整体只扣一次（时长也只
+        // 计一次——逐进程分别积分会把墙钟求和，速率被摊薄为跨进程均值）
+        let display_rows: Vec<TickRow> = {
+            let streams: Vec<&[TickRow]> = match &pid_set {
+                Some(set) => set
+                    .iter()
+                    .filter_map(|p| rows_by_pid.get(p).map(|v| &v[..]))
+                    .collect(),
+                None => rows_by_pid.values().map(|v| &v[..]).collect(),
+            };
+            merge_streams(&streams, &files)
         };
+        let span = |from_ms: i64| -> (f64, f64) { integrate(&display_rows, from_ms, now_ms) };
 
         // 启停判定（调用门控）：message 表的 assistant 行在调用开始瞬间提交，
         // 行内 data 的 time.completed 在结束（含取消/出错）瞬间补写——门控直接
         // 信任该信号且不限会话（新开对话的首个调用当拍即亮，无需等首个完成行），
         // 结束/取消当拍归零。工具执行/待机期间管道同样有 UI 状态突发，门控
-        // 将其可靠排除。进程守卫：已归属的会话进程退出（崩溃/关终端后
-        // completed 无人补写）时强制判停，不留僵尸"生成中"。
+        // 将其可靠排除。进程守卫：进行中会话的归属进程全部退出（崩溃/关终端后
+        // completed 无人补写）时强制判停，不留僵尸"生成中"；无归属的会话不判死。
         // 门控不可用时（尚无任何调用做基线）退化为纯字节判定。
-        let proc_gone = self
-            .inflight
-            .as_ref()
-            .and_then(|(s, _)| self.session_pid.get(s).copied())
-            .map_or(false, |pid| !self.procs.contains_key(&pid));
-            let (det_b, det_s) = span(now_ms - self.params.detect_ms);
+        let proc_gone = {
+            let mut any_alive = false;
+            for (s, _) in &self.inflight {
+                match self.session_pid.get(s) {
+                    Some(pid) if self.procs.contains_key(pid) => any_alive = true,
+                    Some(_) => {}
+                    None => any_alive = true,
+                }
+            }
+            !self.inflight.is_empty() && !any_alive
+        };
+        let (det_b, det_s) = span(now_ms - self.params.detect_ms);
         let detect_bps = if det_s > 0.0 { det_b / det_s } else { 0.0 };
         let gate_on = !proc_gone
-            && match &self.inflight {
-                Some(_) => true,
-                None => self.current_session.is_none() && detect_bps > STREAMING_BPS,
-            };
+            && (!self.inflight.is_empty()
+                || (self.current_session.is_none() && detect_bps > STREAMING_BPS));
         if gate_on {
-            // 幅度锚点：本段调用内首个清洗流速达到流式阈值的时刻
-            if self.active_since.is_none() && detect_bps > STREAMING_BPS {
-                self.active_since = Some(now_ms);
+            // 幅度锚点：本段流式内首个清洗流速达到流式阈值的时刻。断流后复流
+            // （判停兜底触发过/聚合段切换）重新起锚——30s 滑窗从新一段起算，
+            // 不把静默段摊进来稀释读数
+            if detect_bps > STREAMING_BPS {
+                if !self.last_result.streaming || self.active_since.is_none() {
+                    self.active_since = Some(now_ms);
+                }
+                // 判停兜底计时：清洗流速仍在流式阈值上时持续续期
+                self.last_stream_ms = Some(now_ms);
             }
         } else {
             self.active_since = None;
+            self.last_stream_ms = None;
         }
 
         // 幅度：30s 滑窗 ∩ [首字节拍, now] 的清洗流积分。首字节当拍即有真实读数
@@ -1129,16 +1471,102 @@ impl LiveIo {
         } else {
             0.0
         };
-        let streaming = gate_on;
+        // 判停兜底：门控仍开（completed 未落盘）但锚点后清洗流断绝超过宽限 →
+        // 生成实际已停，归零显示；上层 streaming=false 走 idle 分支，不再用
+        // window 回退挂着"生成中"。字节恢复当拍自愈（计时随流刷新）
+        let streaming =
+            gate_on && !stale_stop(self.active_since, self.last_stream_ms, now_ms);
         let ramping = streaming
             && (self.active_since.is_none()
                 || self
                     .active_since
                     .map_or(false, |a| now_ms - a < WINDOW_MS));
-        // 启动提示：门控已开但首字节未到（TTFT），限制在提示窗口内——
-        // 窗口内显示"统计中…"，超窗仍无字节则由上层回退到估算（管道静默调用）
-        let awaiting =
-            streaming && awaiting_hint(self.inflight.as_ref().map(|(_, t)| *t), self.active_since, now_ms);
+        // 启动提示：门控已开但首字节未到（TTFT，取最新开始的会话），限制在
+        // 提示窗口内——窗口内显示"统计中…"，超窗仍无字节则由上层回退到估算
+        // （管道静默调用）
+        let awaiting = streaming
+            && awaiting_hint(
+                self.inflight.iter().map(|(_, t)| *t).max(),
+                self.active_since,
+                now_ms,
+            );
+
+        // 分任务明细：显示集合内每个进程在聚合窗口内的清洗速率。文件增长按
+        // 各进程**正**字节占比分摊（负拍进程不参与分摊，其自身数值被钳 0，
+        // 否则明细之和会大于聚合读数）；门控关闭/未流式/启动期（TTFT）为空
+        let mut tasks: Vec<TaskLive> = Vec::new();
+        let mut active_pid_count = 0usize;
+        if streaming && !awaiting {
+            let from = self
+                .active_since
+                .map_or(now_ms, |a| a.max(now_ms - WINDOW_MS));
+            let (_, wall_s) = integrate(&display_rows, from, now_ms);
+            let fg_w = integrate(&file_growth_rows(&files), from, now_ms).0;
+            let pids: Vec<u32> = match &pid_set {
+                Some(set) => set.clone(),
+                None => rows_by_pid.keys().copied().collect(),
+            };
+            let mut per: Vec<(u32, f64, bool)> = Vec::with_capacity(pids.len());
+            let mut sum_pos = 0.0;
+            for pid in &pids {
+                let Some(rows) = rows_by_pid.get(pid) else { continue };
+                let (b, _) = integrate(rows, from, now_ms);
+                sum_pos += b.max(0.0);
+                let (db, ds) = integrate(rows, now_ms - self.params.detect_ms, now_ms);
+                let dbps = if ds > 0.0 { db / ds } else { 0.0 };
+                per.push((*pid, b, dbps > STREAMING_BPS));
+            }
+            // 窗口内贡献达到流式量级的进程数（漂移检测的"单进程轮"判据；
+            // 空闲进程的底噪泄漏不计入）
+            active_pid_count = per
+                .iter()
+                .filter(|(_, b, _)| *b > STREAMING_BPS * wall_s)
+                .count();
+            for (pid, b, is_stream) in per {
+                let share = if sum_pos > 0.0 { b.max(0.0) / sum_pos } else { 0.0 };
+                let tps = if wall_s > 0.0 && self.bytes_per_token > 0.0 {
+                    ((b - fg_w * share) / wall_s).max(0.0) / self.bytes_per_token
+                } else {
+                    0.0
+                };
+                tasks.push(TaskLive {
+                    pid,
+                    session: None,
+                    n_sessions: 0,
+                    tps,
+                    streaming: is_stream,
+                });
+            }
+            // 会话标签与计数：进行中会话按归属填到对应进程；同进程多会话
+            // （同一 ZCode 窗口新开任务复用 app-server）如实计为 n_sessions，
+            // 速度为该进程合计——字节层无法拆分，标签取首个会话
+            for (s, _) in &self.inflight {
+                if let Some(pid) = self.session_pid.get(s) {
+                    if let Some(t) = tasks.iter_mut().find(|t| t.pid == *pid) {
+                        t.n_sessions += 1;
+                        if t.session.is_none() {
+                            t.session = Some(s.clone());
+                        }
+                    }
+                }
+            }
+            // 空闲且无归属会话的进程不占明细位；按速度降序稳定排列
+            tasks.retain(|t| t.streaming || t.session.is_some());
+            tasks.sort_by(|a, b| b.tps.partial_cmp(&a.tps).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        let n_pids = if streaming && !awaiting {
+            active_pid_count
+        } else {
+            0
+        };
+        // 诊断：每台被跟踪进程的探测窗清洗速率（KB/s，tick 调试日志用）
+        let proc_bps: Vec<(u32, f64)> = rows_by_pid
+            .iter()
+            .map(|(pid, rows)| {
+                let (db, ds) = integrate(rows, now_ms - self.params.detect_ms, now_ms);
+                (*pid, if ds > 0.0 { (db / ds / 1024.0 * 10.0).round() / 10.0 } else { 0.0 })
+            })
+            .collect();
 
         let result = LiveNow {
             available: !self.procs.is_empty(),
@@ -1151,6 +1579,9 @@ impl LiveIo {
                 0.0
             },
             pipe_bps,
+            n_pids,
+            tasks,
+            proc_bps,
         };
         self.last_result = result.clone();
         result
@@ -1180,8 +1611,7 @@ mod tests {
     fn burst_tick_dropped_entirely() {
         // 190KB 请求体突发拍被整拍丢弃（字节与时长都不进积分）；52KB 真实流式拍保留
         let s = series(0, &[190_000.0, 52_000.0, 52_000.0]);
-        let files = s.iter().map(|(t, _)| (*t, 0u64)).collect::<Vec<_>>();
-        let rows = build_rows(&s, &files, 0.0, &CleanParams::windows());
+        let rows = build_rows(&s, 0.0, &CleanParams::windows());
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.bytes < 52_000.0));
         // 突发拍连时长都不贡献：两个保留拍的 dt 合计 1.4s
@@ -1194,32 +1624,175 @@ mod tests {
         // 自适应底噪被毒化到 50KB/拍（持续流式期间分位数抬高），
         // 封顶后每拍最多扣 FLOOR_CAP + BASE_NOISE×dt，52KB 流式拍仍保留大头
         let s = series(0, &[52_000.0; 4]);
-        let files = s.iter().map(|(t, _)| (*t, 0u64)).collect::<Vec<_>>();
-        let rows = build_rows(&s, &files, 50_000.0, &CleanParams::windows());
+        let rows = build_rows(&s, 50_000.0, &CleanParams::windows());
         let floor = FLOOR_CAP_BYTES + BASE_NOISE_BPS * (TICK as f64 / 1000.0);
         for r in &rows {
             assert!((r.bytes - (52_000.0 - floor)).abs() < 1e-6);
         }
     }
 
+    /// 聚合流：文件增长整体只扣一次（多进程求和时逐进程各扣一遍会扣 N 倍），
+    /// 墙钟时长也只计一次（逐进程分别积分会把时长求和，速率被摊薄为均值）
     #[test]
-    fn flush_mismatch_yields_negative_not_clamped() {
-        // 落盘 flush 与 IO 计数错位：本拍只写了 20KB 但文件可见增长 60KB
-        // → 该拍为负（-40KB），由前后正拍在区间总和中对消，而不是被钳成 0 丢失
+    fn merge_streams_deducts_file_growth_once_and_counts_secs_once() {
+        // 两进程同拍各写 52KB、文件每拍增长 10KB
+        let a = series(0, &[52_000.0; 4]);
+        let b = series(0, &[52_000.0; 4]);
+        let files: Vec<(i64, u64)> = (0..5)
+            .map(|i| (a[0].0 + i as i64 * TICK, i as u64 * 10_000))
+            .collect();
+        let rows_a = build_rows(&a, 0.0, &CleanParams::windows());
+        let rows_b = build_rows(&b, 0.0, &CleanParams::windows());
+        let merged = merge_streams(&[&rows_a, &rows_b], &files);
+        let floor = BASE_NOISE_BPS * (TICK as f64 / 1000.0);
+        // 单拍 = 2×(52_000 − floor) − 10_000（文件只扣一次），而不是
+        // 2×(52_000 − floor − 10_000)
+        for r in &merged {
+            assert!((r.bytes - (2.0 * (52_000.0 - floor) - 10_000.0)).abs() < 1e-6);
+        }
+        // 时长只计一次：4 拍 = 2.8s（逐进程分别积分再求和会得到 5.6s）
+        let (b_sum, secs) = integrate(&merged, i64::MIN, i64::MAX);
+        assert!((secs - 2.8).abs() < 1e-9, "墙钟时长应只计一次: {secs}");
+        // 字节总和 = 2 进程 × 4 拍 × (52_000−floor) − 4 拍文件增长（各扣一次）
+        assert!((b_sum - (8.0 * (52_000.0 - floor) - 40_000.0)).abs() < 1e-6);
+        // 单条流输入与"逐行扣文件"的历史算术等价：flush 错位拍为负、区间对消
         let s = series(0, &[20_000.0, 60_000.0, 20_000.0]);
-        // 文件增长集中在第二拍：0, 0, 60_000, 60_000
-        let files = vec![
+        let flush_files = vec![
             (s[0].0, 0u64),
             (s[1].0, 0u64),
             (s[2].0, 60_000u64),
             (s[3].0, 60_000u64),
         ];
-        let rows = build_rows(&s, &files, 0.0, &CleanParams::windows());
-        let floor = BASE_NOISE_BPS * (TICK as f64 / 1000.0);
-        assert!(rows[1].bytes < 0.0, "flush 拍应为负: {}", rows[1].bytes);
-        // 区间总和 = Σraw − Σfg − Σfloor = 100_000 − 60_000 − 3×floor
-        let (b, _) = integrate(&rows, i64::MIN, i64::MAX);
-        assert!((b - (100_000.0 - 60_000.0 - 3.0 * floor)).abs() < 1e-6);
+        let single = merge_streams(&[&build_rows(&s, 0.0, &CleanParams::windows())], &flush_files);
+        assert!(single[1].bytes < 0.0, "flush 拍应为负: {}", single[1].bytes);
+        let (b2, _) = integrate(&single, i64::MIN, i64::MAX);
+        assert!((b2 - (100_000.0 - 60_000.0 - 3.0 * floor)).abs() < 1e-6);
+    }
+
+    /// 显示进程集合：全部进行中会话有存活归属 → 归属 pid 并集；
+    /// 任一会话无归属（新会话/子代理首个调用未完成过）→ None = 全进程求和兜底
+    #[test]
+    fn pick_pid_set_union_and_fallback() {
+        let mut sp = HashMap::new();
+        sp.insert("a".to_string(), 1u32);
+        sp.insert("b".to_string(), 2u32);
+        let active: HashSet<u32> = [1u32, 2u32, 3u32].into_iter().collect();
+        // 两会话各自归属 → 并集（去重、升序）
+        let inflight = vec![("b".to_string(), 5i64), ("a".to_string(), 3i64)];
+        assert_eq!(
+            pick_pid_set(&inflight, &sp, &active),
+            Some(vec![1u32, 2u32])
+        );
+        // 两会话归属同一进程（主会话与其子代理）→ 单元素集合
+        sp.insert("c".to_string(), 1u32);
+        let inflight = vec![("a".to_string(), 3i64), ("c".to_string(), 9i64)];
+        assert_eq!(pick_pid_set(&inflight, &sp, &active), Some(vec![1u32]));
+        // 新会话无归属 → 兜底全进程求和（不能漏掉它自己的进程）
+        let inflight = vec![("a".to_string(), 3i64), ("new".to_string(), 9i64)];
+        assert_eq!(pick_pid_set(&inflight, &sp, &active), None);
+        // 归属进程已死 → 同样兜底
+        let dead: HashSet<u32> = [2u32].into_iter().collect();
+        let inflight = vec![("a".to_string(), 3i64)];
+        assert_eq!(pick_pid_set(&inflight, &sp, &dead), None);
+        // 无进行中会话 → None（门控关闭）
+        assert_eq!(pick_pid_set(&[], &sp, &active), None);
+    }
+
+    /// 归属切换迟滞：已有归属时仅当候选进程窗口内字节 ≥ 2 倍才切换，
+    /// 杜绝并发窗口间逐调用翻转（2026-09-18 现场：同会话相邻调用归属摆动，
+    /// 系数被污染在 262~764 间跳、读数偏差 2~3 倍）
+    #[test]
+    fn should_reattribute_hysteresis() {
+        let raws: HashMap<u32, u64> = [(1u32, 100_000u64), (2u32, 150_000u64), (3u32, 300_000u64)]
+            .into_iter()
+            .collect();
+        // 无现归属 → 直接采信 top
+        assert_eq!(should_reattribute(None, Some(2), &raws), Some(2));
+        // top 与现归属相同 → 不变
+        assert_eq!(should_reattribute(Some(1), Some(1), &raws), Some(1));
+        // top 只有 1.5 倍（不足迟滞）→ 保持现归属，不翻转
+        assert_eq!(should_reattribute(Some(1), Some(2), &raws), Some(1));
+        // top 达 3 倍（≥2 倍迟滞）→ 切换
+        assert_eq!(should_reattribute(Some(1), Some(3), &raws), Some(3));
+        // 现归属窗口内零字节（归属过期）→ 自愈切换到 top
+        let raws0: HashMap<u32, u64> = [(9u32, 0u64), (3u32, 300_000u64)].into_iter().collect();
+        assert_eq!(should_reattribute(Some(9), Some(3), &raws0), Some(3));
+        // 无 top（全零字节）→ 不动
+        assert_eq!(should_reattribute(Some(1), None, &raws), None);
+    }
+
+    /// 归属去重（并发平局）：首次归属时 top 已被另一进行中会话占用、次高
+    /// 字节达一半 → 改归次高，两会话不挤到同一台进程（显示集合塌缩成单进程）；
+    /// 次高只有噪声比例（真实共享一台 app-server 进程）→ 维持 top。
+    /// 2026-09-18 现场：同一 ZCode 窗口新开任务复用同一 app-server（others 仅
+    /// ~0.17 比例噪声），跨项目任务分到不同 app-server（并发平局 ~1）
+    #[test]
+    fn pick_attribution_dedup_on_tie() {
+        // 首次归属，top(1) 被占用，次高(2) 字节 95% → 归 2
+        let raws: HashMap<u32, u64> = [(1u32, 4_000_000u64), (2u32, 3_800_000u64)]
+            .into_iter()
+            .collect();
+        let owned: HashSet<u32> = [1u32].into_iter().collect();
+        assert_eq!(pick_attribution(None, &raws, &owned), Some(2));
+        // 次高只有噪声比例（~0.17）→ 维持共享 top
+        let raws: HashMap<u32, u64> = [(1u32, 4_000_000u64), (2u32, 700_000u64)]
+            .into_iter()
+            .collect();
+        assert_eq!(pick_attribution(None, &raws, &owned), Some(1));
+        // 平局且字节相同 → 字节降序平局按 pid 升序，top=1 被占用 → 归 2
+        let raws: HashMap<u32, u64> = [(2u32, 4_000_000u64), (1u32, 4_000_000u64)]
+            .into_iter()
+            .collect();
+        assert_eq!(pick_attribution(None, &raws, &owned), Some(2));
+        // top 未被占用 → 直接归 top（无去重介入）
+        let no_owned: HashSet<u32> = HashSet::new();
+        assert_eq!(pick_attribution(None, &raws, &no_owned), Some(1));
+        // 次高字节太小（<20KB 门槛）→ 维持 top
+        let raws: HashMap<u32, u64> = [(1u32, 4_000_000u64), (2u32, 30_000u64)]
+            .into_iter()
+            .collect();
+        assert_eq!(pick_attribution(None, &raws, &owned), Some(1));
+    }
+
+    /// 归属去重（占用自愈）：现归属被另一进行中会话占用时，top 未被占用且
+    /// 字节达现归属一半即可切换（被占用场景 2 倍迟滞会把历史错归锁死）；
+    /// 现归属未被占用 → 维持 2 倍迟滞原语义
+    #[test]
+    fn pick_attribution_relaxed_switch_when_owned() {
+        let owned: HashSet<u32> = [1u32].into_iter().collect();
+        // 现归属 1 被占用，top 2（窗口内字节最高）未被占用且达 95% → 切换
+        //（原 2 倍迟滞会把这类历史错归锁死）
+        let raws: HashMap<u32, u64> = [(2u32, 4_000_000u64), (1u32, 3_800_000u64)]
+            .into_iter()
+            .collect();
+        assert_eq!(pick_attribution(Some(1), &raws, &owned), Some(2));
+        // top 不足现归属的一半 → 维持
+        let raws: HashMap<u32, u64> = [(2u32, 1_900_000u64), (1u32, 4_000_000u64)]
+            .into_iter()
+            .collect();
+        assert_eq!(pick_attribution(Some(1), &raws, &owned), Some(1));
+        // 现归属未被占用 → 原 2 倍迟滞（top 95% 不足 2 倍，不切换）
+        let no_owned: HashSet<u32> = HashSet::new();
+        let raws: HashMap<u32, u64> = [(2u32, 4_000_000u64), (1u32, 3_800_000u64)]
+            .into_iter()
+            .collect();
+        assert_eq!(pick_attribution(Some(1), &raws, &no_owned), Some(1));
+        // top 也被占用（两个 pid 都有主）→ 无处可去，维持现归属
+        let both_owned: HashSet<u32> = [1u32, 2u32].into_iter().collect();
+        assert_eq!(pick_attribution(Some(1), &raws, &both_owned), Some(1));
+    }
+
+    /// 校准样本跨进程守卫：窗口内其他进程字节 ≤ 归属进程的 20% 才入样
+    #[test]
+    fn cross_pid_guard_thresholds() {
+        // 只有归属进程写字节 → 通过
+        assert!(cross_pid_ok(0.0, 500_000.0));
+        // 其他进程恰好 20% → 通过（边界含）
+        assert!(cross_pid_ok(100_000.0, 500_000.0));
+        // 超过 20% → 拒收（对方窗口并发流式）
+        assert!(!cross_pid_ok(100_001.0, 500_000.0));
+        // 归属进程零字节 → 拒收（无基准可配对）
+        assert!(!cross_pid_ok(0.0, 0.0));
     }
 
     #[test]
@@ -1269,6 +1842,123 @@ mod tests {
         // 无进行中调用 → 不提示
         assert!(!awaiting_hint(None, None, 5_000));
         assert!(!awaiting_hint(None, Some(1_000), 5_000));
+    }
+
+    /// 判停兜底：门控开着（completed 未落盘）但锚点后清洗流断绝超宽限 → 判停。
+    /// 现场实例（2026-09-17 日志）：调用已停、completed 落盘前窗口回退持续
+    /// 挂"生成中 + ≈上轮速度"，用户观感"停了还在生成、慢慢降"
+    #[test]
+    fn stale_stop_after_silent_window() {
+        // 锚点已建立、最近流时刻距今未超宽限 → 仍流式
+        assert!(!stale_stop(Some(1_000), Some(16_000), 16_000));
+        // 断绝恰好 15s → 未超（> 判定），仍流式
+        assert!(!stale_stop(Some(1_000), Some(1_000), 16_000));
+        // 断绝超 15s → 判停
+        assert!(stale_stop(Some(1_000), Some(1_000), 16_001));
+        // 锚点未建立（管道静默调用，全程无字节）→ 永不判停，由 window 回退服务
+        assert!(!stale_stop(None, None, 100_000));
+        assert!(!stale_stop(None, Some(1_000), 100_000));
+        // 锚点在但从未记录到流时刻（理论不达：锚点建立即有流）→ 不判停
+        assert!(!stale_stop(Some(1_000), None, 100_000));
+    }
+
+    /// 轮均速漂移：上轮均值 vs 之前连续 5 轮均值，双向 ≥3 倍触发重校准
+    #[test]
+    fn round_drift_triggers_on_threefold_jump() {
+        let mut d = RoundDrift::new();
+        for v in [40.0, 42.0, 38.0, 41.0, 39.0] {
+            assert!(d.observe(v).is_none(), "基线积累期不应触发");
+        }
+        // 上轮 120 = 基线均值 40 的整 3 倍 → 触发，返回基线供日志
+        let base = d.observe(120.0).expect("3 倍上跳应触发");
+        assert!((base - 40.0).abs() < 1e-9);
+        // 触发后历史清空：同量级下一轮不再触发
+        assert!(d.observe(120.0).is_none());
+    }
+
+    #[test]
+    fn round_drift_needs_five_round_history() {
+        let mut d = RoundDrift::new();
+        for _ in 0..4 {
+            assert!(d.observe(40.0).is_none());
+        }
+        // 历史不足 5 轮：再极端的上跳也不触发，该轮照常入历史
+        assert!(d.observe(4_000.0).is_none());
+        // 凑满 5 轮后，混合基线（4×40 + 4000 = 832）与旧量级 40 差异仍超 3 倍
+        assert!(d.observe(40.0).is_some());
+    }
+
+    /// 反向（换更快模型后回看，或快→慢）：基线 90 vs 上轮 30 = 1/3 → 同样触发
+    #[test]
+    fn round_drift_downward_jump_triggers() {
+        let mut d = RoundDrift::new();
+        for _ in 0..5 {
+            assert!(d.observe(90.0).is_none());
+        }
+        assert!(d.observe(30.0).is_some());
+    }
+
+    /// 2.5 倍以内的正常波动不触发；滑窗只保留最近 5 轮，旧量级被自然挤出
+    #[test]
+    fn round_drift_moderate_change_and_window_cap() {
+        let mut d = RoundDrift::new();
+        for _ in 0..5 {
+            assert!(d.observe(40.0).is_none());
+        }
+        assert!(d.observe(100.0).is_none(), "2.5 倍上跳不应触发");
+        for _ in 0..5 {
+            assert!(d.observe(100.0).is_none());
+        }
+        // 基线已全为 100，回跳 40 恰 2.5 倍 → 不触发
+        assert!(d.observe(40.0).is_none());
+    }
+
+    /// 无实测拍的静默轮（均值 0）不参与检测、不污染基线
+    #[test]
+    fn round_drift_ignores_zero_round() {
+        let mut d = RoundDrift::new();
+        for v in [50.0, 0.0, 50.0, 0.0, 50.0, 0.0, 50.0] {
+            assert!(d.observe(v).is_none());
+        }
+        // 4 个 50 入历史（0 全被忽略），第 5 个 50 凑满基线不触发
+        assert!(d.observe(50.0).is_none());
+        assert!(d.observe(200.0).is_some());
+    }
+
+    /// 重新校准：系数与样本队列回到平台先验（冷启动状态）
+    #[test]
+    fn reset_calibration_restores_prior() {
+        let mut io = LiveIo::new();
+        io.cal.clear();
+        io.cal.extend([420.0, 380.0, 455.0]);
+        io.bytes_per_token = 420.0;
+        let bpt = io.reset_calibration();
+        assert!((bpt - io.params.default_bpt).abs() < 1e-9);
+        assert_eq!(io.cal.len(), 1, "队列应只余先验占位");
+        assert!((io.bytes_per_token - io.params.default_bpt).abs() < 1e-9);
+    }
+
+    /// 重启恢复：越界/非有限值拒收，生效系数按恢复后队列的上中位数重算
+    /// （与校准路径同口径）；空恢复不动先验
+    #[test]
+    fn restore_cal_filters_and_recomputes_median() {
+        let mut io = LiveIo::new();
+        // 30 越下界、99999 越上界（两平台 CAL_MAX 上界之上）、NaN 非有限 → 拒；
+        // 500/540 入队得 [先验,500,540]
+        let n = io.restore_cal(vec![500.0, 540.0, 30.0, 99_999.0, f64::NAN]);
+        assert_eq!(n, 2);
+        assert!((io.bytes_per_token() - 540.0).abs() < 1e-9);
+        // 空恢复不动状态
+        assert_eq!(io.restore_cal(vec![]), 0);
+        assert!((io.bytes_per_token() - 540.0).abs() < 1e-9);
+        // 容量挤出：再注入 5 个合法值，队列保最新 5 个（600/500/540 被挤出）
+        let q0 = io.cal_state();
+        assert_eq!(q0.len(), 3);
+        io.restore_cal(vec![450.0, 460.0, 470.0, 480.0, 490.0]);
+        assert_eq!(io.cal_state().len(), CAL_QUEUE_CAP);
+        assert!(!io.cal_state().contains(&io.params.default_bpt));
+        // [450,460,470,480,490] 上中位 = 470
+        assert!((io.bytes_per_token() - 470.0).abs() < 1e-9);
     }
 
     /// 样本准入用例取自真实调试日志（2026-09-17 现场）：
@@ -1371,7 +2061,7 @@ mod tests {
         let samples = series(t0, &deltas);
         // mac 不做 files 扣除（tracked_files_total 恒 0）
         let files = samples.iter().map(|(t, _)| (*t, 0u64)).collect::<Vec<_>>();
-        let rows = build_rows(&samples, &files, 0.0, &mac_params());
+        let rows = merge_streams(&[&build_rows(&samples, 0.0, &mac_params())], &files);
         let call_end = t0 + (n as i64) * TICK;
         let stream_start = call_end - gen_ms;
         let eff = (TRUE_TPS * (gen_ms as f64 / 1000.0)) as u64; // 1500 tok
@@ -1420,7 +2110,10 @@ mod tests {
             files.push((samples[i + 1].0, prev + (*d * FLUSH_RATIO) as u64));
         }
 
-        let rows = build_rows(&samples, &files, 40_000.0 /* 毒化的底噪 */, &CleanParams::windows());
+        let rows = merge_streams(
+            &[&build_rows(&samples, 40_000.0 /* 毒化的底噪 */, &CleanParams::windows())],
+            &files,
+        );
         let call_end = t0 + (deltas.len() as i64) * TICK;
         let stream_start = call_end - gen_ms;
 
@@ -1464,7 +2157,7 @@ mod tests {
             let v = if i == samples.len() - 1 { total_flush } else { 0 };
             files.push((*t, v));
         }
-        let rows = build_rows(&samples, &files, 0.0, &CleanParams::windows());
+        let rows = merge_streams(&[&build_rows(&samples, 0.0, &CleanParams::windows())], &files);
         let call_end = t0 + (deltas.len() as i64) * TICK;
         let (clean, _) = integrate(&rows, call_end - gen_ms, call_end);
         let eff = (TRUE_TPS * (gen_ms as f64 / 1000.0)) as u64;

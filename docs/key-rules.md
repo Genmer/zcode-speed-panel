@@ -34,10 +34,11 @@
 
 ## 6. 调试日志是排查的第一手数据
 
-`~/.zcode/speed-panel-debug.jsonl`（JSONL 追加，8MB 轮转保留一代 `.jsonl.1`，轮转旧文件超 7 天启动时自动清理）记录三类事件：
-- `tick`：显示值 `tps`、来源 `src`（io/window/idle）、启动期 `start`、清洗管道字节率 `pipe`、生效系数 `bpt`、曲线尾桶；
+`~/.zcode/speed-panel-debug.jsonl`（JSONL 追加，8MB 轮转保留一代 `.jsonl.1`，轮转旧文件超 7 天启动时自动清理）记录四类事件：
+- `tick`：显示值 `tps`、来源 `src`（io/window/idle）、启动期 `start`、清洗管道字节率 `pipe`、生效系数 `bpt`、曲线尾桶、窗口内达流式量级的进程数 `npids`；
 - `call`：调用完成真值（`eff`/`gen_ms`/`true_tps`）；
-- `cal`：校准对账（`true_tps` vs `pred_tps`、`raw_kb`/`clean_kb`、`bpt_sample`/`bpt_now`、`skipped`、归因诊断 `attr_pid`/`top_pid`）。
+- `cal`：校准对账（`true_tps` vs `pred_tps`、`raw_kb`/`clean_kb`、`bpt_sample`/`bpt_now`、`skipped`、归因诊断 `attr_pid`/`top_pid`、跨进程守卫诊断 `others_kb`——窗口内其他进程原始字节，与归属进程占比大时样本被拒收）；
+- `cal_reset`：重新校准（`reason`=manual/auto、系数前后 `bpt_old`/`bpt_new`；auto 附触发时的轮均值 `round_avg` 与 5 轮基线 `base_avg`——排查"为什么系数突然回先验"看这里）。
 
 实时准确性评估口径：`pred_tps / true_tps` → 1.00 为准。用 `python scripts/live_vs_true.py` 一键对账（≥300 token 且入校准的调用为达标样本）。诊断实时读数问题先看这里，不要靠猜。
 
@@ -47,15 +48,16 @@
 
 ## 8. WebView2 原生 `<select>` 弹层跟随系统主题，深色 UI 里不可读
 
-原生 select 的**下拉弹层**由 WebView2 按系统主题渲染：系统浅色时弹层白底，option 又继承了页面里的灰字样式，深色界面下几乎看不见；实测 `:root { color-scheme: dark }` 与 option 显式着色在 WebView2 弹层里均不生效。
-- 事故案例：悬浮窗样式下拉"看不见字"（已修：整个替换为自绘 `.dropdown`/`.dropdown-list`，与右键菜单同风格深色弹层）。
-- 规则：本项目 UI 需要下拉一律自绘，不再新增原生 `<select>`；新增顶栏交互组件时，同步把它加入 enableDrag 拖动与双击最大化的排除选择器（`button, select, input, .dropdown`），否则会误触窗口拖动/最大化。
+原生 select 的**下拉弹层**由 WebView2 按系统主题渲染：系统浅色时弹层白底，option 又继承了页面里的灰字样式，深色界面下几乎看不见；实测 `:root { color-scheme: dark }` 与 option 显式着色在 WebView2 弹层里均不生效。原生 checkbox/radio 同理（框体按系统浅色主题绘制），深色 UI 里一律自绘。
+- 事故案例：悬浮窗样式下拉"看不见字"（已修：整个替换为自绘 `.dropdown`/`.dropdown-list`，与右键菜单同风格深色弹层）；桌宠"常显上轮均速"勾选框错位——`#float-menu button { all: unset; display: block }` 是"ID+元素"选择器（特异性 (1,0,1)），单 ID 的 `#float-menu-pet-last { display: flex }`（(1,0,0)）压不过它，flex 失效后勾选小方框退化为行内零尺寸（已修：改双 ID 选择器 `#float-menu #float-menu-pet-last`，隐藏规则同理再加权）。
+- 规则：本项目 UI 需要下拉/勾选框一律自绘，不再新增原生 `<select>`/`<input type=checkbox>`；给带 `all: unset` 的复合选择器规则定义的控件改布局时，覆盖规则的选择器特异性必须高于它（双 ID 或 `#id button#id` 形态）；新增顶栏交互组件时，同步把它加入 enableDrag 拖动与双击最大化的排除选择器（`button, select, input, .dropdown`），否则会误触窗口拖动/最大化（用 `<button>` 承载新控件则天然命中）。
 
 ## 9. 启停门控必须用 message 行的 `completed` 字段，不能用 model_usage 完成行
 
 调用启停判定以 usage 库 message 表 assistant 消息行为准：**行在调用开始瞬间提交（≤200ms），行内 data 的 `time.completed` 在结束瞬间补写（取消/出错也会补）**。`model_usage` 行只记 `status='completed'`——cancelled/error 的调用（实测库中 97+119 条）**永远没有完成行**，用完成行判停会卡"生成中"直到 10 分钟兜底；且它不区分会话，新开对话首个调用要等首个完成行落盘才可见（长调用可达数分钟）。
 - 事故案例：旧口径"最新 assistant 创建时间 > 最新完成调用的 completed_at 且限最新完成调用的会话"——用户取消生成后面板持续显示"生成中 + 估算值"最长 10 分钟；新会话开聊全程无反应。
 - 查询约束：message 表**没有 time_created 单列索引**（全局 `ORDER BY time_created DESC` 实测 ~200ms/次，700ms 轮询不可承受）——必须先取 `session.time_updated` 倒序前几个会话，再走 `(session_id, time_created)` 复合索引按会话查最新 assistant 行。
+- 判停兜底（`liveio::stale_stop`）：`completed` 补写落盘可延迟数秒~分钟，期间门控仍开、window 回退持续挂"生成中 + ≈ 上轮速度"（2026-09-17 用户报告"对话停了还显示生成中、慢慢降"）。锚点出现后清洗流断绝 >15s（`SILENT_STOP_MS`）即强制判停；锚点未建立（管道静默调用）不受影响。纯函数测试 `stale_stop_after_silent_window` 守护。
 - 守护：`inflight_from_rows`（metrics.rs）为门控纯函数单测（僵尸行/多会话/超龄）；`awaiting_hint`（liveio.rs）守护启动期提示窗口。改门控相关代码时这两个测试必须保持通过。
 
 ## 10. mac 平台差异（照搬 Windows 参数会静默失效）
@@ -79,3 +81,26 @@
 
 - **外观原生化**：macOS 标志性的红黄绿交通灯位于顶栏最左侧（左起：红 `#ff5f56` 折叠悬浮窗、黄 `#ffbd2e` 最小化、绿 `#27c93f` 最大化），悬停显现微小符号（`✕`、`—`、`▢`）；Windows 环境保持右侧 `— ▢ ✕` 自绘按钮不变。前端通过 `navigator.userAgent.includes("Mac")` 为 `body` 注入 `platform-mac` class。
 - **副屏最大化防跳屏（`toggle_maximize_safe`）**：无边框窗口（`decorations:false`）在 macOS 下直接调用系统 `toggleMaximize()` 会因为系统 `zoom:` 动作强行跳回主屏。解决方式为 Rust 端 `toggle_maximize_safe`：取窗口中心点所在显示器（`monitor_from_point`），按该显示器物理尺寸铺满（预留顶部系统菜单栏 28pt 避让高度 `(28.0 * scale) as i32`），并在 `AppState.saved_max_rect` 暂存最大化前的物理矩形；再次触发或双击顶栏时还原；在切换到悬浮窗（`switch_mode(Mode::Float)`）时清空暂存，保证状态干净。
+
+## 13. 应用内更新：CI 产物命名即匹配协议，且失效是静默的
+
+- **产物名即协议**：`updater::pick_asset` 按 Release 资产名后缀匹配本平台安装包：`*_x64-setup.exe`（win-x64，portable 版不参与自动安装）、`*_x64.dmg`（mac-x64）、`*_aarch64.dmg`（mac-aarch64）。改产物命名、加新架构而不同步 `pick_asset` 的后果是**静默的**——检查正常返回但找不到安装包，用户永远收不到更新且没有任何报错（更新模块按设计宁可漏报不打扰，见 updater.rs 模块注释）。改名/加架构必须同一提交内同步 `asset_picking` 测试。
+- **版本号三处同步**：`tauri.conf.json`（运行时权威：`package_info().version` 用于显示与比较）、`Cargo.toml`、`package.json`。发版漏 bump `tauri.conf.json` 时新 Release 的 tag 与旧版本号相等 → 判"已是最新"，更新功能同样静默失效。
+- **GitHub API 必带 User-Agent**（无 UA 直接拒绝）；403 限流与断网同按"无更新"处理。HTTP 客户端为 ureq（同步阻塞 + rustls，无 OpenSSL，mac 交叉构建友好），全部网络操作在后台线程，失败不触碰 UI。
+
+## 14. 多任务并发的实时链路：单选会话、归因盲区/翻转、求和口径都是坑
+
+多 CLI 进程并发（多窗口、子代理并行）时实时链路曾经的四个静默缺口（2026-09-18 定位，证据为当日 debuglog：主/子代理调用块、attr_pid 翻转、bpt 262~764 摆动）：
+
+- **门控单选**：`inflight_from_rows` 曾只取"最新未完成行"的**一个**会话（`max_by_key`），其余并发任务的流量不进读数——用户观感"sub-agent 没统计进来 / 分不清多个任务"。
+- **归因盲区**：会话→进程归属在首个调用完成时才建立（top-writer + raw>20KB）。新会话（含子代理首调用）在归属建立前，显示退回"最近完成调用的会话"的进程——多窗口时那是**别的窗口**的速度。
+- **归因翻转污染系数**：归属按调用窗口内 top-writer 更新，两窗口并发流式时逐调用翻转（现场：同会话相邻两次调用归属在两个 pid 间摆动，系数被对方窗口字节污染，读数偏差 2~3 倍）。
+- **求和分支双重失真**（存量 bug）：全进程求和曾把 tracked 文件增量**逐进程各扣一遍**（N 倍过度扣除），且把各进程积分的**墙钟时长也求和**（速率被摊薄成跨进程均值而非总吞吐；一进程流式另一进程待机时读数直接减半）。
+
+现行方案与守护（改并发相关代码前必读）：
+
+- 门控返回**全部**进行中会话（`inflight_from_rows` 纯函数测试守护）；显示进程集合 = 归属 pid 并集，任一会话无归属 → None = 全进程求和兜底（`pick_pid_set` 纯函数测试守护，不能漏掉尚无归属的新进程）。
+- 聚合流 `merge_streams`：同拍字节求和、**墙钟时长只计一次、tracked 文件增量只扣一次**；单条流输入与"逐行扣文件"的历史算术逐字节等价（`merge_streams_deducts_file_growth_once_and_counts_secs_once` 守护）。校准积分走同一条聚合流（key-rules #3 同源原则在多进程下的延伸）。
+- 归属切换迟滞 `should_reattribute`（已有归属时候选进程窗口内字节 ≥ 现归属 2 倍才切，测试守护）；**归属去重 `pick_attribution`**（2026-09-18 二次事故：同一 ZCode 窗口新开任务复用**同一 app-server 进程**、跨项目才分进程——并发平局下 `max_by` 取 top 依赖 HashMap 遍历序，两会话挤到同一 pid 后显示集合塌缩成单进程、任务卡不出。修法：首次归属时 top 已被另一进行中会话占用且次高字节达 top 一半（`ATTR_DEDUP_RATIO=0.5`，并发流 ~1 vs 空闲进程噪声 ~0.1）改归次高；现归属被占用时切换迟滞放宽到一半。测试 `pick_attribution_dedup_on_tie` / `pick_attribution_relaxed_switch_when_owned` 守护）；校准样本跨进程守卫 `cross_pid_ok`（他窗字节 > 基准进程 20% 拒收——基准 = 归属进程；**无归属的全进程求和分支以 top 进程为基准，该分支的积分同样会混入他窗字节，不能放行**；cal 日志 `others_kb` 诊断）；`cal_sample` 的 clean/raw 守卫分子分母**配对**（clean 来自归属进程时 raw 也用归属进程的）。
+- **同进程多会话如实合计**：同一 app-server 进程承载的多个会话（同窗口新开任务）在字节层不可拆分——任务行计为一行、`n_sessions` 标注会话数计入任务总数（前端按 Σ会话数 ≥2 触发显示），速度为该进程合计。排查多任务问题直接看 tick 日志的 `pids`（每台被跟踪进程探测窗 KB/s）/`infl`（进行中会话数）/`attr`（会话→pid 映射）三件套，不要只看 npids。
+- 轮漂移只吃**单进程轮**（main.rs `round_tps` 第三位记录 saw_multi，任一实测拍 npids>1 整轮跳过；npids = 窗口内贡献达流式量级的进程数，空闲进程的底噪泄漏不计入）——任务数变化带来的吞吐差不是系数漂移，1 任务 40 t/s 与 3 任务 120 t/s 是同一系数，误触发会把好系数重置回先验。

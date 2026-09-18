@@ -2,9 +2,11 @@
 
 mod liveio;
 mod metrics;
+mod updater;
 
-use liveio::LiveIo;
+use liveio::{LiveIo, RoundDrift};
 use metrics::{home_dir, Engine, ModelStatsPayload, Snapshot};
+use updater::Release;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -97,6 +99,37 @@ struct AppState {
     tray_hint_pending: Mutex<bool>,
     /// macOS 无边框多屏安全最大化记忆：(还原物理坐标, 还原物理尺寸)
     saved_max_rect: Mutex<Option<(PhysicalPosition<i32>, PhysicalSize<u32>)>>,
+    /// 当前轮（门控"进行中"连续段）显示速度累计：(Σtps, 实测拍数, 是否见过多进程聚合拍)
+    round_tps: Mutex<(f64, u32, bool)>,
+    /// 上一拍是否有进行中调用（true→false 沿 = 一轮结束，结算均值喂漂移检测）
+    round_was_inflight: Mutex<bool>,
+    /// 轮均速漂移检测：上轮均值 vs 之前连续 5 轮均值 ≥3 倍（双向）→ 自动重校准
+    drift: Mutex<RoundDrift>,
+    /// 上次已落盘的系数样本队列（变化才写 speed-panel-cal.json）
+    cal_saved: Mutex<Vec<f64>>,
+    /// 桌宠多任务加高的防抖计数（≥2 任务 +1 / <2 任务 -1，3 拍确认）
+    pet_task_streak: Mutex<u32>,
+    /// 桌宠窗口当前应有的多任务加高（0 或 PET_TASK_EXTRA；与实际窗口尺寸
+    /// 的差值由 poller 每拍对比修正，模式/样式切换后也能自动补齐）
+    pet_task_extra: Mutex<f64>,
+    /// 应用内更新（updater.rs）：最新 Release、预下载产物与并发门旗。
+    /// 网络操作全在后台线程；自动检查路径失败一律静默（见 updater.rs 模块注释）
+    update: Mutex<UpdateMem>,
+}
+
+/// 更新流程的内存态（不落盘：每次启动都检查一次，无需跨启动记忆检查时间）
+#[derive(Default)]
+struct UpdateMem {
+    /// 上次成功查到 Release 的时间（网络失败不记，下个小时仍会重试）
+    last_check_ms: i64,
+    checking: bool,
+    downloading: bool,
+    /// 发现的新版本（Some 即有更新）
+    latest: Option<Release>,
+    /// 预下载完成的安装包 (tag, 路径)
+    downloaded: Option<(String, PathBuf)>,
+    /// 下载完成即自动启动安装（用户已点过"立即更新"，等下载就位）
+    install_when_ready: bool,
 }
 
 /// 调试日志：记录实时显示值、统计值与每轮调用完成后的真值，
@@ -169,15 +202,73 @@ impl DebugLog {
 }
 
 const FULL_SIZE: (f64, f64) = (1000.0, 700.0);
-const FLOAT_GAUGE_SIZE: (f64, f64) = (116.0, 116.0);
-const FLOAT_PILL_SIZE: (f64, f64) = (224.0, 78.0);
+/// 仪表悬浮窗：正方形（加"上轮"小环时曾被拉宽到 140×116，已收回）
+const FLOAT_GAUGE_SIZE: (f64, f64) = (128.0, 128.0);
+const FLOAT_PILL_SIZE: (f64, f64) = (172.0, 72.0);
 /// 桌宠默认边长（逻辑像素），滚轮缩放范围 [100, 480]
 const FLOAT_PET_SIZE: f64 = 200.0;
 const PET_SIZE_MIN: f64 = 100.0;
 const PET_SIZE_MAX: f64 = 480.0;
+/// 桌宠窗口顶部气泡预留高度（逻辑像素）：两行气泡最大 ~51px（fs=15 时
+/// 10 + 18×2 + 3）+ 余量。窗口 = 边长 ×（边长 + 预留），气泡底边锚在精灵
+/// 头顶附近、向上生长，精灵不再为气泡让位缩小（pet.ts 按底部正方形区排版，
+/// 改此值须同步两处 set_size 与 pet.ts 排版逻辑）
+const PET_BUBBLE_RESERVE: f64 = 56.0;
+/// 桌宠多任务加高（逻辑像素）：≥2 个进行中任务（连续 3 拍防抖）时窗口向上
+/// 加高这么多给气泡的分任务行让位（底边不动：加高多少上移多少）。96px 在
+/// 默认 200 尺寸下可容纳 6 行气泡（实时 + 6 任务 + 上轮）。回落同样防抖
+const PET_TASK_EXTRA: f64 = 96.0;
 
 fn mode_file() -> Option<PathBuf> {
     home_dir().map(|h| h.join(".zcode").join("speed-panel-mode.txt"))
+}
+
+/// 系数样本持久化：重启后热启动，不再每次从先验 600 重新收敛（实测高速
+/// 会话真值系数 ~160 时，冷启动读数偏低 2~3 倍、收敛需 ~25 分钟）
+fn cal_file() -> Option<PathBuf> {
+    home_dir().map(|h| h.join(".zcode").join("speed-panel-cal.json"))
+}
+
+/// 恢复有效期：模型/分词器换代后旧样本即过期噪声，超期回先验重新收敛
+const CAL_STALE_MS: i64 = 14 * 24 * 3600 * 1000;
+
+fn load_cal_samples() -> Vec<f64> {
+    let raw = cal_file().and_then(|p| fs::read_to_string(p).ok());
+    let Some(s) = raw else { return Vec::new() };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
+        eprintln!("[zcode-speed-panel] cal 样本文件损坏，回先验");
+        return Vec::new();
+    };
+    let updated = v.get("updated_ms").and_then(|x| x.as_i64()).unwrap_or(0);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    if now_ms - updated > CAL_STALE_MS {
+        eprintln!("[zcode-speed-panel] cal 样本超 14 天过期，回先验");
+        return Vec::new();
+    }
+    v.get("samples")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_f64())
+                .collect::<Vec<f64>>()
+        })
+        .unwrap_or_default()
+}
+
+fn save_cal_samples(samples: &[f64]) {
+    if let Some(path) = cal_file() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let json = serde_json::json!({ "updated_ms": now_ms, "samples": samples });
+        if let Err(e) = fs::write(path, json.to_string()) {
+            eprintln!("[zcode-speed-panel] cal 样本落盘失败: {e}");
+        }
+    }
 }
 
 fn load_persisted() -> Persisted {
@@ -230,7 +321,7 @@ fn clamp_to_screen(window: &tauri::WebviewWindow, x: i32, y: i32, w: u32, h: u32
     (x.clamp(mp.x, max_x), y.clamp(mp.y, max_y))
 }
 
-fn apply_mode(window: &tauri::WebviewWindow, mode: Mode, style: FloatStyle, p: &Persisted) {
+fn apply_mode(window: &tauri::WebviewWindow, mode: Mode, style: FloatStyle, p: &Persisted, pet_extra: f64) {
     let scale = window.scale_factor().unwrap_or(1.0);
     match mode {
         Mode::Full => {
@@ -260,7 +351,9 @@ fn apply_mode(window: &tauri::WebviewWindow, mode: Mode, style: FloatStyle, p: &
                 FloatStyle::Pill => FLOAT_PILL_SIZE,
                 FloatStyle::Pet => {
                     let s = p.pet_size.unwrap_or(FLOAT_PET_SIZE).clamp(PET_SIZE_MIN, PET_SIZE_MAX);
-                    (s, s)
+                    // 顶部预留带给两行气泡：精灵不缩小，气泡向上生长；
+                    // 多任务加高（pet_task_extra）让分任务行也有处可长
+                    (s, s + PET_BUBBLE_RESERVE + pet_extra)
                 }
             };
             let _ = window.set_min_size(None::<LogicalSize<f64>>);
@@ -309,8 +402,9 @@ fn switch_mode(app: &AppHandle, mode: Mode) {
     // 先更新模式再应用新尺寸/位置：应用过程触发的 Moved 事件按新模式回写
     *state.mode.lock().unwrap() = mode;
     let p = state.persist.lock().unwrap().clone();
+    let pet_extra = *state.pet_task_extra.lock().unwrap();
     if let Some(window) = app.get_webview_window("main") {
-        apply_mode(&window, mode, style, &p);
+        apply_mode(&window, mode, style, &p, pet_extra);
     }
     save_all(app);
     let _ = app.emit("mode", mode.as_str());
@@ -343,7 +437,7 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
     let rollout_dir;
     let new_calls;
     let engine_calls: Vec<metrics::Call>;
-    let inflight: Option<(String, i64)>;
+    let inflight: Vec<(String, i64)>;
     let mut snapshot;
     {
         let mut engine = state.engine.lock().unwrap();
@@ -353,11 +447,15 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
         engine_calls = engine.calls().to_vec();
         inflight = engine.call_in_flight();
     }
-    // 实时实测：进程 IO 写字节流（真实值），只统计当前活跃会话对应的 CLI 进程
+    // 实时实测：进程 IO 写字节流（真实值）。多任务并发（多窗口/子代理）时
+    // 按进行中会话的归属进程并集聚合，当前速度 = 真实总吞吐
     let now_ms = snapshot.now_ms;
     let cal_event;
     let bpt_now;
     let pipe_bps;
+    let npids;
+    let proc_bps_log: Vec<(u32, f64)>;
+    let infl_attr_log: Vec<(String, u32)>;
     {
         let mut live = state.live.lock().unwrap();
         if !live.history_done() {
@@ -369,6 +467,29 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
         cal_event = live.take_calibration();
         bpt_now = live.bytes_per_token();
         pipe_bps = live_now.pipe_bps;
+        npids = live_now.n_pids;
+        proc_bps_log = live_now.proc_bps.clone();
+        infl_attr_log = live.inflight_attr();
+        snapshot.tasks = live_now
+            .tasks
+            .iter()
+            .map(|t| metrics::TaskStat {
+                pid: t.pid,
+                session: t.session.clone().unwrap_or_default(),
+                n_sessions: t.n_sessions as u32,
+                tps: t.tps,
+                streaming: t.streaming,
+            })
+            .collect();
+        // 系数样本队列变化（新样本入样/手动或漂移重校准）即落盘，重启热启动
+        {
+            let q = live.cal_state();
+            let mut saved = state.cal_saved.lock().unwrap();
+            if *saved != q {
+                save_cal_samples(&q);
+                *saved = q;
+            }
+        }
         let ever_saw = live.ever_saw_procs();
         if live_now.available {
             if live_now.streaming {
@@ -383,10 +504,12 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
                     snapshot.current_tps = 0.0;
                 } else if live_now.tps < 1.0 && snapshot.window_tps > 0.0 {
                     // 部分调用期间 UI 管道无增量字节（IO 实测为 0）：回退到近期
-                    // 已完成调用的真实速度（与速度曲线同口径），标记 ≈ 估算
+                    // 已完成调用的真实速度（与速度曲线同口径），标记 ≈ 估算。
+                    // ≈ 是落盘口径的全局值，没有可拆的分任务实测，明细清空
                     snapshot.current_tps = snapshot.window_tps;
                     snapshot.is_estimating = true;
                     snapshot.live_source = "window".into();
+                    snapshot.tasks.clear();
                 } else {
                     snapshot.current_tps = live_now.tps;
                 }
@@ -403,7 +526,7 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
                     *last = 0.0;
                 }
             }
-        } else if inflight.is_some() && !ever_saw {
+        } else if !inflight.is_empty() && !ever_saw {
             // IO 从未可用（IO 探测环境不可用 / 面板刚启动进程未发现）：
             // 按 message 门控决定，而不是按调用间隔盲估——有调用进行中才显示
             // （近期有真值则估算 ≈，否则"统计中…"提示），门控已停立即归零。
@@ -464,6 +587,7 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
                 "clean_kb": (cal.clean_bytes / 1024.0 * 10.0).round() / 10.0,
                 "attr_pid": cal.attr_pid,
                 "top_pid": cal.top_pid,
+                "others_kb": (cal.others_bytes / 1024.0 * 10.0).round() / 10.0,
                 "bpt_sample": (cal.bpt_sample * 10.0).round() / 10.0,
                 "bpt_now": (cal.bpt_now * 10.0).round() / 10.0,
                 "pred_tps": (pred_tps * 10.0).round() / 10.0,
@@ -482,6 +606,15 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
                 .rev()
                 .map(|v| (v * 10.0).round() / 10.0)
                 .collect();
+            // 多任务排查三件套：被跟踪进程的探测窗速率 / 进行中会话数 / 会话归属映射
+            let pids_json: serde_json::Map<String, serde_json::Value> = proc_bps_log
+                .iter()
+                .map(|(pid, kbps)| (pid.to_string(), serde_json::json!(kbps)))
+                .collect();
+            let attr_json: Vec<String> = infl_attr_log
+                .iter()
+                .map(|(s, pid)| format!("{}…{}", &s[s.len().saturating_sub(4)..], pid))
+                .collect();
             log.write(serde_json::json!({
                 "kind": "tick",
                 "t": now_ms,
@@ -496,10 +629,65 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
                 "avg": (snapshot.avg_tps * 10.0).round() / 10.0,
                 "spark_tail": tail,
                 "calls": snapshot.calls_today,
+                "npids": npids,
+                "infl": inflight.len(),
+                "pids": pids_json,
+                "attr": attr_json,
             }));
         }
     }
 
+    }
+
+    // ---- 轮均速漂移自动重校准：一轮 = 门控"进行中"连续的一段，轮内显示速度
+    //      （io 实测拍）取均值；上轮均值 vs 之前连续 5 轮均值 ≥3 倍（双向）
+    //      判定量级突变（换模型/分词器，旧系数过期）→ 丢弃系数样本回先验。
+    //      多进程聚合轮（多任务并发）不参与：任务数变化带来的吞吐差不是系数漂移 ----
+    {
+        let state = app.state::<AppState>();
+        let now_inflight = !inflight.is_empty();
+        let was_inflight = {
+            let mut flag = state.round_was_inflight.lock().unwrap();
+            std::mem::replace(&mut *flag, now_inflight)
+        };
+        if snapshot.is_live && snapshot.current_tps > 0.0 {
+            let mut acc = state.round_tps.lock().unwrap();
+            acc.0 += snapshot.current_tps;
+            acc.1 += 1;
+            if npids != 1 {
+                acc.2 = true;
+            }
+        }
+        if was_inflight && !now_inflight {
+            // 一轮结束：结算均值。静默/估算轮（无实测拍）与多进程聚合轮不参与漂移检测
+            let (sum, n, saw_multi) = {
+                let mut acc = state.round_tps.lock().unwrap();
+                std::mem::take(&mut *acc)
+            };
+            if n > 0 && !saw_multi {
+                let avg = sum / n as f64;
+                let mut drift = state.drift.lock().unwrap();
+                if let Some(base) = drift.observe(avg) {
+                    let (bpt_old, bpt_new) = {
+                        let mut live = state.live.lock().unwrap();
+                        let old = live.bytes_per_token();
+                        (old, live.reset_calibration())
+                    };
+                    state.debug.lock().unwrap().write(serde_json::json!({
+                        "kind": "cal_reset",
+                        "t": now_ms,
+                        "reason": "auto",
+                        "round_avg": (avg * 10.0).round() / 10.0,
+                        "base_avg": (base * 10.0).round() / 10.0,
+                        "bpt_old": (bpt_old * 10.0).round() / 10.0,
+                        "bpt_new": (bpt_new * 10.0).round() / 10.0,
+                    }));
+                    // 与手动触发同款反馈（⟳ 按钮闪 ✓）：自动触发伴随系数大幅
+                    // 偏离，用户恰恰需要这个提示
+                    let _ = app.emit("recalibrated", ());
+                }
+            }
+        }
     }
     SnapshotPayload {
         rollout_dir,
@@ -539,12 +727,13 @@ fn set_float_style(app: AppHandle, style: String) {
         let state = app.state::<AppState>();
         *state.style.lock().unwrap() = st;
         let mode = *state.mode.lock().unwrap();
-        if mode == Mode::Float {
-            if let Some(window) = app.get_webview_window("main") {
-                let p = state.persist.lock().unwrap().clone();
-                apply_mode(&window, mode, st, &p);
-            }
+    if mode == Mode::Float {
+        if let Some(window) = app.get_webview_window("main") {
+            let p = state.persist.lock().unwrap().clone();
+            let pet_extra = *state.pet_task_extra.lock().unwrap();
+            apply_mode(&window, mode, st, &p, pet_extra);
         }
+    }
     }
     save_all(&app);
     let _ = app.emit("float-style", st.as_str());
@@ -561,11 +750,69 @@ fn set_float_size(app: AppHandle, size: f64) {
         let style = *state.style.lock().unwrap();
         if mode == Mode::Float && style == FloatStyle::Pet {
             if let Some(window) = app.get_webview_window("main") {
-                let _ = window.set_size(LogicalSize::new(size, size));
+                // 高度含顶部气泡预留带与多任务加高（与 apply_mode 同口径）
+                let extra = *state.pet_task_extra.lock().unwrap();
+                let _ = window.set_size(LogicalSize::new(size, size + PET_BUBBLE_RESERVE + extra));
             }
         }
     }
     save_all(&app);
+}
+
+/// 桌宠多任务加高的防抖与差值应用：≥2 个进行中任务连续 3 拍 → 加高
+/// PET_TASK_EXTRA，回落连续 3 拍 → 收回（与完整面板任务卡同款 3 拍防抖）。
+/// want 与已应用值一致时直接返回，不 churn 窗口尺寸
+fn update_pet_task_extra(app: &AppHandle, multi_now: bool) {
+    let state = app.state::<AppState>();
+    let streak = {
+        let mut s = state.pet_task_streak.lock().unwrap();
+        *s = if multi_now {
+            (*s + 1).min(3)
+        } else {
+            s.saturating_sub(1)
+        };
+        *s
+    };
+    let want = if streak >= 3 { PET_TASK_EXTRA } else { 0.0 };
+    let cur = *state.pet_task_extra.lock().unwrap();
+    if (want - cur).abs() < f64::EPSILON {
+        return;
+    }
+    *state.pet_task_extra.lock().unwrap() = want;
+    apply_pet_size(app);
+}
+
+/// 按当前桌宠边长 + 气泡预留带 + 多任务加高设置窗口尺寸，并按高度差整体
+/// 上移/下移保持底边（精灵脚部）在屏幕上不动；仅桌宠悬浮窗模式下生效，
+/// 其他模式/样式只更新状态值，切回来时由 apply_mode / 本函数补齐
+fn apply_pet_size(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let mode = *state.mode.lock().unwrap();
+    let style = *state.style.lock().unwrap();
+    if mode != Mode::Float || style != FloatStyle::Pet {
+        return;
+    }
+    let extra = *state.pet_task_extra.lock().unwrap();
+    let size = state
+        .persist
+        .lock()
+        .unwrap()
+        .pet_size
+        .unwrap_or(FLOAT_PET_SIZE)
+        .clamp(PET_SIZE_MIN, PET_SIZE_MAX);
+    let Some(w) = app.get_webview_window("main") else {
+        return;
+    };
+    let scale = w.scale_factor().unwrap_or(1.0);
+    let Ok(outer) = w.outer_size() else {
+        return;
+    };
+    let new_h = size + PET_BUBBLE_RESERVE + extra;
+    let dy = ((new_h - outer.height as f64 / scale) * scale).round() as i32;
+    let pos = w.outer_position().unwrap_or_default();
+    let (nx, ny) = clamp_to_screen(&w, pos.x, pos.y - dy, outer.width, (new_h * scale) as u32);
+    let _ = w.set_size(LogicalSize::new(size, new_h));
+    let _ = w.set_position(PhysicalPosition::new(nx, ny));
 }
 
 /// 悬浮窗右键菜单"退出"：保存状态后退出应用
@@ -575,8 +822,33 @@ fn quit_app(app: AppHandle) {
     app.exit(0);
 }
 
+/// 手动重新校准（完整面板当前速度卡左上角 ⟳ 按钮）：丢弃已学习的系数样本
+/// 回到平台先验，由后续调用重新收敛；漂移检测历史同步复位
+#[tauri::command]
+fn recalibrate(app: AppHandle) {
+    let state = app.state::<AppState>();
+    let (bpt_old, bpt_new) = {
+        let mut live = state.live.lock().unwrap();
+        let old = live.bytes_per_token();
+        (old, live.reset_calibration())
+    };
+    state.drift.lock().unwrap().reset();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    state.debug.lock().unwrap().write(serde_json::json!({
+        "kind": "cal_reset",
+        "t": now,
+        "reason": "manual",
+        "bpt_old": (bpt_old * 10.0).round() / 10.0,
+        "bpt_new": (bpt_new * 10.0).round() / 10.0,
+    }));
+    let _ = app.emit("recalibrated", ());
+}
+
 /// mac 启动引导提示（一次性）：由前端页面就绪后主动 invoke 领取——
-/// setup 内 emit 会早于 WKWebView 加载被丢弃。非 mac 恒返回 false
+/// setup 内 emit 必然早于页面加载被丢弃，改为前端就绪后 invoke 领取。非 mac 恒返回 false
 #[tauri::command]
 fn tray_hint_once(app: AppHandle) -> bool {
     let state = app.state::<AppState>();
@@ -645,6 +917,293 @@ fn toggle_maximize_safe(window: tauri::WebviewWindow, state: tauri::State<'_, Ap
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         toggle_window_maximize(&window);
+    }
+}
+
+// ---- 应用内更新（updater.rs）：检查 / 预下载 / 安装编排，事件驱动前端卡片 ----
+
+/// 前端 "update" 事件载荷：扁平结构按 state 分支（available / downloading /
+/// ready / launching / error），不需要的字段留空
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateEvent {
+    state: &'static str,
+    current_version: String,
+    new_version: String,
+    release_url: String,
+    notes: String,
+    downloaded_bytes: u64,
+    total_bytes: u64,
+    message: String,
+}
+
+/// 手动检查（check_update 命令）的同步返回：前端据此弹轻提示
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(tag = "kind")]
+enum CheckOutcome {
+    UpToDate { current: String },
+    Available { current: String, new_version: String },
+    Failed { message: String },
+}
+
+fn current_version(app: &AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
+/// Release 说明截断（按字符计，防超长 body 撑爆前端卡片；前端另有 max-height）
+fn truncate_chars(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(n).collect::<String>())
+    }
+}
+
+fn update_event(state: &'static str, current: &str, rel: Option<&Release>) -> UpdateEvent {
+    UpdateEvent {
+        state,
+        current_version: current.to_string(),
+        new_version: rel.map(|r| r.version.clone()).unwrap_or_default(),
+        release_url: rel.map(|r| r.url.clone()).unwrap_or_default(),
+        notes: rel.map(|r| truncate_chars(&r.notes, 400)).unwrap_or_default(),
+        downloaded_bytes: 0,
+        total_bytes: rel.map(|r| r.asset_size).unwrap_or(0),
+        message: String::new(),
+    }
+}
+
+/// 执行一次检查（手动/自动共用）：取到 Release 才记 last_check（网络失败
+/// 不记，下个小时重试）；有新版本时 emit + 静默预下载（装时免等）。
+/// 失败结果只返回给手动调用方提示，自动路径直接丢弃
+fn do_check(app: &AppHandle) -> CheckOutcome {
+    let state = app.state::<AppState>();
+    {
+        let mut u = state.update.lock().unwrap();
+        if u.checking {
+            return CheckOutcome::Failed { message: "已有检查正在进行".into() };
+        }
+        u.checking = true;
+    }
+    let current = current_version(app);
+    let outcome = match updater::fetch_latest(&format!("zcode-speed-panel/{current}")) {
+        None => CheckOutcome::Failed { message: "网络异常或 Release 信息不可用".into() },
+        Some(rel) => {
+            {
+                let mut u = state.update.lock().unwrap();
+                u.last_check_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+            }
+            if updater::is_newer(&rel.tag, &current) {
+                let ev = update_event("available", &current, Some(&rel));
+                state.update.lock().unwrap().latest = Some(rel.clone());
+                let _ = app.emit("update", ev);
+                let new_version = rel.version.clone();
+                spawn_download(app.clone(), rel);
+                CheckOutcome::Available { current, new_version }
+            } else {
+                CheckOutcome::UpToDate { current }
+            }
+        }
+    };
+    state.update.lock().unwrap().checking = false;
+    outcome
+}
+
+/// 后台预下载安装包：进度以 "update" 事件推送（250ms 节流），完成 emit
+/// ready；用户已点"立即更新"（install_when_ready）则顺势启动安装。
+/// 自动预下载失败完全静默（安装时再试）；等待安装时失败才 emit error
+fn spawn_download(app: AppHandle, rel: Release) {
+    let current = current_version(&app);
+    {
+        let state = app.state::<AppState>();
+        let mut u = state.update.lock().unwrap();
+        if let Some((tag, _)) = &u.downloaded {
+            if *tag == rel.tag {
+                // 该版本已预下载过（前端刷新后恢复状态也走这里）
+                drop(u);
+                let _ = app.emit("update", update_event("ready", &current, Some(&rel)));
+                return;
+            }
+        }
+        if u.downloading {
+            return;
+        }
+        u.downloading = true;
+    }
+    std::thread::spawn(move || {
+        let mut ev = update_event("downloading", &current, Some(&rel));
+        let mut last_emit = std::time::Instant::now();
+        let progress_app = app.clone();
+        let result = updater::download(&rel, &format!("zcode-speed-panel/{current}"), &mut |done, total| {
+            if last_emit.elapsed() >= Duration::from_millis(250) {
+                last_emit = std::time::Instant::now();
+                ev.downloaded_bytes = done;
+                ev.total_bytes = total;
+                let _ = progress_app.emit("update", ev.clone());
+            }
+        });
+        match result {
+            Ok(path) => {
+                let mut ev_ready = update_event("ready", &current, Some(&rel));
+                ev_ready.downloaded_bytes = rel.asset_size;
+                let launch = {
+                    let state = app.state::<AppState>();
+                    let mut u = state.update.lock().unwrap();
+                    u.downloading = false;
+                    u.downloaded = Some((rel.tag.clone(), path));
+                    u.install_when_ready
+                };
+                let _ = app.emit("update", ev_ready);
+                if launch {
+                    launch_update(&app);
+                }
+            }
+            Err(msg) => {
+                let wait = {
+                    let state = app.state::<AppState>();
+                    let mut u = state.update.lock().unwrap();
+                    u.downloading = false;
+                    let wait = u.install_when_ready;
+                    u.install_when_ready = false; // 失败后等用户再点，不自动重试
+                    wait
+                };
+                if wait {
+                    // 用户已在等安装却装不上：如实告知（唯一打扰的场景，
+                    // 静默会让"立即更新"按钮看起来失灵）
+                    let mut ev = update_event("error", &current, Some(&rel));
+                    ev.message = msg;
+                    let _ = app.emit("update", ev);
+                }
+            }
+        }
+    });
+}
+
+/// 启动安装：Windows 运行 NSIS 安装包后退出应用（安装器接管，等 600ms
+/// 再退避免安装器撞上尚在退出的进程锁）；macOS 打开 dmg 由用户拖入
+/// Applications（应用不退出，旧版本跑到用户重启）
+fn launch_update(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let rel = state.update.lock().unwrap().latest.clone();
+    let downloaded = state.update.lock().unwrap().downloaded.clone();
+    let (Some(rel), Some((tag, path))) = (rel, downloaded) else {
+        return;
+    };
+    if tag != rel.tag {
+        return; // 陈旧产物不装（latest 变更时预下载会重新拉新包）
+    }
+    let mut ev = update_event("launching", &current_version(app), Some(&rel));
+    #[cfg(target_os = "windows")]
+    let msg = "安装程序已启动，应用即将退出…".to_string();
+    #[cfg(target_os = "macos")]
+    let msg = "已打开安装镜像：请将 zcode-speed-panel 拖入 Applications 覆盖安装".to_string();
+    ev.message = msg;
+    let _ = app.emit("update", ev);
+    if updater::launch_installer(&path).is_err() {
+        let mut ev = update_event("error", &current_version(app), Some(&rel));
+        ev.message = "启动安装程序失败".into();
+        let _ = app.emit("update", ev);
+        return;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        save_all(app);
+        let handle = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(600));
+            handle.exit(0);
+        });
+    }
+}
+
+/// 手动检查（footer 右下角版本号点击）：同步返回结果给前端做轻提示；
+/// 有更新时卡片由 "update" 事件渲染（本命令只负责结果提示）
+#[tauri::command]
+fn check_update(app: AppHandle) -> CheckOutcome {
+    do_check(&app)
+}
+
+/// 前端"立即更新"按钮：已预下载 → 直接启动安装；否则标记待装并确保
+/// 下载线程在跑（就绪后自动安装，无需再点一次）
+#[tauri::command]
+fn install_update(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let rel = state.update.lock().unwrap().latest.clone().ok_or("没有可用更新")?;
+    let ready = {
+        let u = state.update.lock().unwrap();
+        matches!(&u.downloaded, Some((tag, _)) if *tag == rel.tag)
+    };
+    if ready {
+        launch_update(&app);
+        return Ok(());
+    }
+    state.update.lock().unwrap().install_when_ready = true;
+    spawn_download(app.clone(), rel); // 已在下载则内部 no-op
+    Ok(())
+}
+
+/// 当前版本号（footer 右下角显示，来源 tauri.conf.json）
+#[tauri::command]
+fn app_version(app: AppHandle) -> String {
+    current_version(&app)
+}
+
+/// 用系统默认浏览器打开链接（更新说明页）。WebView 内 <a> 导航行为不可控，
+/// 统一由后端代开；仅接受 https，防前端注入 file:// 一类协议
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err("仅支持 https 链接".into());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW：cmd 窗口一闪而过的问题
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &url])
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("打开链接失败: {e}"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("打开链接失败: {e}"))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = url;
+        Err("当前平台不支持".into())
+    }
+}
+
+/// 后台更新检查线程：启动延迟 8s（避开启动期 SQLite/IO 高峰）先查一次；
+/// 之后每小时醒一次，距上次成功检查 ≥24h 才真正发请求（每天一次）。
+/// 失败在 fetch_latest 内部吞掉，线程永不打扰用户
+fn update_loop(app: AppHandle) {
+    std::thread::sleep(Duration::from_secs(8));
+    let _ = do_check(&app);
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+        let due = {
+            let state = app.state::<AppState>();
+            let u = state.update.lock().unwrap();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            now - u.last_check_ms >= 24 * 3600 * 1000
+        };
+        if due {
+            let _ = do_check(&app);
+        }
     }
 }
 
@@ -742,6 +1301,8 @@ fn poller(app: AppHandle) {
     loop {
         let payload = build_payload(&app);
         update_tray_status(&app, &payload.snapshot);
+        // 多任务（≥2 进程）防抖后为桌宠窗口加高/收回分任务行空间
+        update_pet_task_extra(&app, payload.snapshot.tasks.len() >= 2);
         let _ = app.emit("metrics", &payload);
         std::thread::sleep(Duration::from_millis(700));
     }
@@ -765,6 +1326,13 @@ fn main() {
             tray_status_last: Mutex::new(String::new()),
             tray_hint_pending: Mutex::new(cfg!(target_os = "macos")),
             saved_max_rect: Mutex::new(None),
+            round_tps: Mutex::new((0.0, 0, false)),
+            round_was_inflight: Mutex::new(false),
+            drift: Mutex::new(RoundDrift::new()),
+            cal_saved: Mutex::new(Vec::new()),
+            pet_task_streak: Mutex::new(0),
+            pet_task_extra: Mutex::new(0.0),
+            update: Mutex::new(UpdateMem::default()),
         })
         .invoke_handler(tauri::generate_handler![
             snapshot,
@@ -773,8 +1341,13 @@ fn main() {
             set_float_style,
             set_float_size,
             quit_app,
+            toggle_maximize_safe,
+            recalibrate,
             tray_hint_once,
-            toggle_maximize_safe
+            check_update,
+            install_update,
+            app_version,
+            open_url
         ])
         .setup(|app| {
             // mac：Accessory 模式——无 Dock 图标、不进 Cmd+Tab，常驻菜单栏托盘；
@@ -865,9 +1438,21 @@ fn main() {
                 *state.style.lock().unwrap() = style;
                 *state.persist.lock().unwrap() = persisted;
             }
+            // 恢复上次学习的系数样本（无文件/损坏/超 14 天 → 保持先验 600）：
+            // dev 热重启或开机后读数立即可用，不再每次冷启动重新收敛
+            {
+                let state = app.state::<AppState>();
+                let samples = load_cal_samples();
+                if !samples.is_empty() {
+                    let n = state.live.lock().unwrap().restore_cal(samples);
+                    eprintln!("[zcode-speed-panel] 校准样本恢复 {n} 个");
+                }
+                *state.cal_saved.lock().unwrap() = state.live.lock().unwrap().cal_state();
+            }
             let window = app.get_webview_window("main").unwrap();
             let p = app.state::<AppState>().persist.lock().unwrap().clone();
-            apply_mode(&window, mode, style, &p);
+            let pet_extra = *app.state::<AppState>().pet_task_extra.lock().unwrap();
+            apply_mode(&window, mode, style, &p, pet_extra);
             let _ = window.show();
             // mac 启动引导提示不在此 emit：setup 早于事件循环/WKWebView 加载，
             // 发即被弃——改为前端就绪后 invoke `tray_hint_once` 领取（一次性）
@@ -875,6 +1460,10 @@ fn main() {
             // ---- 启动轮询线程 ----
             let poll_handle = app.handle().clone();
             std::thread::spawn(move || poller(poll_handle));
+
+            // ---- 启动更新检查线程（启动+8s 一次、常驻期间每天一次，静默） ----
+            let update_handle = app.handle().clone();
+            std::thread::spawn(move || update_loop(update_handle));
             Ok(())
         })
         .build(tauri::generate_context!())

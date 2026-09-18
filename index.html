@@ -28,6 +28,12 @@
               <button type="button" role="option" data-value="pill">胶囊悬浮窗</button>
             </div>
           </div>
+          <button
+            id="pet-last-toggle"
+            class="ghost-btn pet-last-toggle"
+            type="button"
+            title="桌宠气泡常驻显示两行（实时速度 / 上轮均速），待机时也显示，无需鼠标悬停；与桌宠右键菜单里的勾选是同一开关"
+          ><span class="pet-chk" aria-hidden="true"></span>常显上轮均速</button>
           <button id="btn-float" class="ghost-btn accent-btn" title="收起为悬浮窗（置顶、可拖动；点窗口关闭按钮效果相同）">⧉ 收起为悬浮窗</button>
         </div>
         <span id="win-controls" title="拖动顶栏移动窗口；双击顶栏最大化/还原">
@@ -40,7 +46,27 @@
       <main>
         <section class="cards">
           <div class="card gauge-card">
+            <button
+              id="btn-recal"
+              class="ghost-btn recal-btn"
+              type="button"
+              aria-label="重新校准"
+              title="重新校准：丢弃已学习的字节→token 系数样本，回到默认先验由后续调用重新收敛（换模型后实时读数异常时用；轮均速突变 3 倍以上会自动触发）"
+            >
+              <!-- 图标用内联 SVG：⟳ 一类符号字形在字体里墨迹相对字宽偏心，文字渲染无法可靠居中；
+                   取左右对称的双箭头循环（autorenew）而非单箭头 refresh——后者右侧实心箭头
+                   与左侧细弧墨迹失衡，几何包围盒虽居中、视觉仍偏右贴边 -->
+              <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="currentColor">
+                <path class="recal-refresh" d="M12 6V3L8 7l4 4V8c2.21 0 4 1.79 4 4 0 .58-.13 1.13-.33 1.64l1.49 1.49C17.68 14.87 18 13.97 18 12c0-3.31-2.69-6-6-6zm0 10c-2.21 0-4-1.79-4-4 0-.58.13-1.13.33-1.64L6.84 8.87C6.32 9.73 6 10.63 6 11.6c0 3.31 2.69 6 6 6v3l4-4-4-4v3z"/>
+                <path class="recal-done" d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
+              </svg>
+            </button>
             <canvas id="g-current"></canvas>
+            <canvas
+              id="g-last"
+              class="corner-gauge"
+              title="上一轮调用速度：最近一次已完成调用（输出+思考 ÷ 纯生成时长，落盘口径）"
+            ></canvas>
             <div class="sub" id="sub-current">等待数据…</div>
           </div>
           <div class="card gauge-card">
@@ -51,6 +77,17 @@
             <canvas id="g-total"></canvas>
             <div class="sub" id="sub-total">等待数据…</div>
           </div>
+        </section>
+
+        <!-- 并发任务明细：≥2 个任务时出现（单任务时不占位）。
+             一个 CLI 进程 = 一行；同进程内并行的多个会话/子代理在字节层不可拆分，
+             计为一行合计（标注会话数），按会话数计入任务总数 -->
+        <section class="card task-card" id="task-card" hidden>
+          <div class="chart-head">
+            <span>并发任务（按 CLI 进程实测）</span>
+            <span class="dim">各行合计 = 当前速度表 · 同进程多会话计为一行</span>
+          </div>
+          <div id="task-list"></div>
         </section>
 
         <section class="card chart-card">
@@ -64,12 +101,13 @@
           <canvas id="spark"></canvas>
         </section>
 
-        <footer class="dim" id="statusbar">
-          <span id="st-dir">监控目录：…</span>
-          <span id="st-calls"></span>
-          <span id="st-sessions"></span>
-          <span id="st-last"></span>
-        </footer>
+      <footer class="dim" id="statusbar">
+        <span id="st-dir">监控目录：…</span>
+        <span id="st-calls"></span>
+        <span id="st-sessions"></span>
+        <span id="st-last"></span>
+        <span id="st-version" title="点击检查更新">v…</span>
+      </footer>
       </main>
 
       <!-- 悬浮窗·桌宠样式（默认）：精灵动画 + 头顶速度气泡，整块可拖动，右键出菜单 -->
@@ -79,25 +117,41 @@
         <button id="float-pet-expand" class="float-expand ghost-btn" title="展开完整面板">⤢</button>
       </div>
 
-      <!-- 悬浮窗·仪表样式 -->
+      <!-- 悬浮窗·仪表样式：主环（实时）+ 右上角"上轮"小环（最近一轮已完成调用） -->
       <div id="float-gauge">
         <canvas id="mini-gauge"></canvas>
+        <canvas
+          id="mini-last"
+          class="float-badge"
+          title="上轮均速：最近一次已完成调用（输出+思考 ÷ 纯生成时长，落盘口径）"
+        ></canvas>
         <button id="float-gauge-expand" class="float-expand ghost-btn" title="展开完整面板">⤢</button>
       </div>
 
-      <!-- 悬浮窗·胶囊样式：整块可拖动，⤢ 展开 -->
+      <!-- 悬浮窗·胶囊样式：整块可拖动，⤢ 展开；第二行为上轮均速 -->
       <div id="float-pill">
         <span id="float-dot" class="dot idle"></span>
         <div id="float-val">
-          <span id="float-approx">≈</span>
-          <span id="float-tps">0.0</span>
-          <span class="float-unit">t/s</span>
+          <div class="float-val">
+            <span id="float-approx">≈</span>
+            <span id="float-tps">0.0</span>
+            <span class="float-unit">t/s</span>
+          </div>
+          <div class="float-sub">
+            <span class="float-sub-label">上轮均速</span>
+            <span id="float-last">--</span>
+            <span class="float-unit">t/s</span>
+          </div>
         </div>
         <button id="float-pill-expand" class="float-expand ghost-btn" title="展开完整面板">⤢</button>
       </div>
 
-      <!-- 悬浮窗右键菜单：恢复窗体 / 退出 -->
+      <!-- 悬浮窗右键菜单：恢复窗体 / 退出；桌宠样式下多一项"常显上轮均速"勾选（CSS 按样式门控） -->
       <div id="float-menu">
+        <button
+          id="float-menu-pet-last"
+          title="勾选后气泡常驻显示两行（实时速度 / 上轮均速），待机时也显示，无需鼠标悬停"
+        ><span class="pet-chk" aria-hidden="true"></span>常显上轮均速</button>
         <button id="float-menu-restore">⤢ 恢复窗体</button>
         <button id="float-menu-quit">✕ 退出程序</button>
       </div>
@@ -131,6 +185,29 @@
           <div id="model-summary"></div>
         </div>
       </div>
+
+      <!-- 应用内更新：发现新版本时的提示卡片（右下角，版本号在 footer 最右、点击即检查）；
+           下载进度与安装状态都在这张卡上 -->
+      <div id="update-card" role="dialog" aria-label="应用更新">
+        <div class="update-head">
+          <span>🆕 发现新版本 <b id="update-version"></b></span>
+          <button id="update-close" title="暂不更新（下次检查到更新仍会提醒）">✕</button>
+        </div>
+        <div class="update-sub">当前 <span id="update-current"></span> · <a id="update-link" title="在浏览器中打开更新说明">更新内容 ↗</a></div>
+        <pre id="update-notes" class="update-notes"></pre>
+        <div id="update-progress" class="update-progress">
+          <div class="update-bar"><i id="update-bar-fill"></i></div>
+          <span id="update-progress-text"></span>
+        </div>
+        <div class="update-actions">
+          <button id="update-install" class="ghost-btn accent-btn" type="button">⤓ 立即更新</button>
+          <button id="update-manual" class="ghost-btn" type="button" title="在浏览器打开本版本页面，自行下载安装">手动下载 ↗</button>
+          <span id="update-status"></span>
+        </div>
+      </div>
+
+      <!-- 手动检查更新的轻提示（已是最新/失败），自动消失 -->
+      <div id="update-toast"></div>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>

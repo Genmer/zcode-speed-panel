@@ -1,5 +1,16 @@
 // 浏览器预览模式：模拟 ZCode 的 model-io 调用流，便于无 Tauri 环境下预览 UI
 
+/** 分任务实时明细（多任务并发时才有多个）：一个 CLI 进程 = 一行 */
+export interface TaskStat {
+  pid: number;
+  /** 归属的进行中会话 id（空 = 尚未归属的流式进程） */
+  session: string;
+  /** 该进程承载的进行中会话数（≥2 = 同进程多任务，速度为合计） */
+  nSessions: number;
+  tps: number;
+  streaming: boolean;
+}
+
 export interface Snapshot {
   currentTps: number;
   avgTps: number;
@@ -18,11 +29,15 @@ export interface Snapshot {
   ramping: boolean;
   /** 近 10 分钟已完成调用的真实速度（落盘口径） */
   windowTps: number;
+  /** 最近一次已完成调用的真实速度（落盘口径），当前速度卡右上角小表用 */
+  lastCallTps: number;
   liveSource: string;
   lastActivityMs: number;
   nowMs: number;
   rolloutDir: string;
   spark: number[];
+  /** 并发任务分进程明细（≥2 个时前端显示任务列表） */
+  tasks: TaskStat[];
 }
 
 interface MockCall {
@@ -34,6 +49,8 @@ interface MockCall {
   session: string;
   /** 管道静默调用：整段无增量字节，走 ≈ 估算显示 */
   silent: boolean;
+  /** 并发任务期间第二个进程的固定速度（0 = 单任务；按调用固定，不逐拍重抽） */
+  second: number;
 }
 
 const MIN_DUR = 50;
@@ -51,14 +68,17 @@ function newCall(now: number): MockCall {
   const duration = Math.exp(rnd(Math.log(12000), Math.log(180000)));
   const tps = rnd(18, 70);
   const output = Math.max(60, Math.round((duration / 1000) * tps));
+  // usage 库语义:cache_read 是 input 的子集,命中率常态 90%+
+  const input = Math.round(rnd(15000, 60000));
   return {
     completed: now + duration,
     duration,
     output,
-    input: Math.round(rnd(15000, 60000)),
-    cache: Math.round(rnd(10000, 250000)),
+    input,
+    cache: Math.round(input * rnd(0.8, 0.99)),
     session: `mock-sess-${sessionNo}`,
     silent: Math.random() < 0.22,
+    second: Math.random() < 0.3 ? rnd(15, 90) : 0,
   };
 }
 
@@ -88,7 +108,8 @@ function snapshot(now: number, pending: MockCall | null): Snapshot {
     dur = 0,
     wOut = 0,
     wDur = 0,
-    last = 0;
+    last = 0,
+    lastTps = 0;
   const sessions = new Set<string>();
   const buckets = new Array<number>(BUCKETS).fill(0);
   const bucketDur = new Array<number>(BUCKETS).fill(0);
@@ -99,7 +120,10 @@ function snapshot(now: number, pending: MockCall | null): Snapshot {
     input += c.input;
     cache += c.cache;
     dur += d;
-    last = Math.max(last, c.completed);
+    if (c.completed >= last) {
+      last = c.completed;
+      lastTps = c.output / (d / 1000); // 与后端一致：取完成时刻最晚一条的 eff ÷ 纯生成时长
+    }
     sessions.add(c.session);
     if (c.completed >= now - WINDOW) {
       wOut += c.output;
@@ -125,12 +149,36 @@ function snapshot(now: number, pending: MockCall | null): Snapshot {
         ? wOut / (wDur / 1000)
         : 0
       : 0;
+  // 模拟并发任务：部分调用期间另有第二个 CLI 进程在流式——当前速度为聚合
+  // 总吞吐，分任务列表显示两行（预览多任务 UI；第二任务速度按调用固定）
+  const ownTps = currentTps;
+  const secondTps = pending && pending.second > 0 && isLive ? pending.second : 0;
+  const currentAgg = currentTps + secondTps;
   const spark = buckets.map((o, i) => (bucketDur[i] > 0 ? o / (bucketDur[i] / 1000) : 0));
   if (isEstimating && spark[BUCKETS - 1] <= 0) {
     spark[BUCKETS - 1] = currentTps;
   }
+  const tasks: TaskStat[] = [];
+  if (pending && (isLive || isStarting)) {
+    tasks.push({
+      pid: 4000 + sessionNo,
+      session: pending.session,
+      nSessions: 1,
+      tps: ownTps,
+      streaming: isLive,
+    });
+    if (secondTps > 0) {
+      tasks.push({
+        pid: 7000 + sessionNo,
+        session: `mock-sess-${sessionNo + 1}`,
+        nSessions: 1,
+        tps: secondTps,
+        streaming: true,
+      });
+    }
+  }
   return {
-    currentTps,
+    currentTps: currentAgg,
     avgTps: dur > 0 ? out / (dur / 1000) : 0,
     totalTokens: out + input,
     outputTokens: out,
@@ -144,11 +192,13 @@ function snapshot(now: number, pending: MockCall | null): Snapshot {
     isStarting,
     ramping: isLive && ageSec < 30,
     windowTps: wDur > 0 ? wOut / (wDur / 1000) : 0,
+    lastCallTps: lastTps,
     liveSource: isStarting || isLive ? "io" : isEstimating ? "window" : "idle",
     lastActivityMs: last,
     nowMs: now,
     rolloutDir: "（浏览器预览 · 模拟数据）",
     spark,
+    tasks,
   };
 }
 

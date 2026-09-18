@@ -1,6 +1,6 @@
 import "./style.css";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { ArcGauge, MiniGauge, SPEED_TIERS, drawSpark, fmtClock, fmtTokens, fmtTps } from "./gauges";
+import { ArcGauge, BadgeGauge, MiniGauge, SPEED_TIERS, drawSpark, fmtClock, fmtTokens, fmtTps, speedColor } from "./gauges";
 import { PetWidget } from "./pet";
 import { startMock, type Snapshot } from "./mock";
 import { initModelStats } from "./model_stats";
@@ -38,7 +38,7 @@ const gCurrent = new ArcGauge($("g-current"), {
   color2: "#0ea5e9",
   kind: "speed",
   minScale: 60, // 最小量程 60 t/s，常见速度落在弧形中段更好读
-  tiers: SPEED_TIERS, // 0–30 绿 / 30–60 黄 / 60+ 红，随当前速度换色
+  tiers: SPEED_TIERS, // 六档（0–40/40–80/80–160/160–240/240–320/320+），随当前速度换色
 });
 
 const gAvg = new ArcGauge($("g-avg"), {
@@ -57,7 +57,12 @@ const gTotal = new ArcGauge($("g-total"), {
   kind: "tokens",
 });
 
+// 当前速度卡右上角小表：最近一轮已完成调用的速度（落盘口径，非实时）
+const gLast = new BadgeGauge($("g-last"), { tiers: SPEED_TIERS });
+
 const miniGauge = new MiniGauge($("mini-gauge"), { tiers: SPEED_TIERS });
+// 仪表悬浮窗右上角的上轮小环（与完整面板角标同款，只是尺寸更小）
+const miniLast = new BadgeGauge($("mini-last"), { tiers: SPEED_TIERS });
 // 存储键升级到 v2：让老用户也拿到一次新默认（鲸鱼女仆），之后的选择照常记住
 const PET_PACK_KEY = "petPack.v2";
 let currentPetPack = localStorage.getItem(PET_PACK_KEY) ?? "maid-deepseek-whale";
@@ -126,6 +131,26 @@ $("float-menu-quit").addEventListener("click", () => {
   tauriInvoke("quit_app");
 });
 
+// ---- 桌宠"常显上轮均速"：桌宠右键菜单勾选项 + 完整面板顶栏开关（同一状态）----
+// 勾选后气泡恒两行（生成中随实时速度一起展开显示，无需悬停）；显隐仍随生成状态，
+// 待机不显示。菜单点击后不收起，让勾选状态可见，点菜单外任意处照常关闭。
+// 顶栏开关仅桌宠样式时由 CSS 显示
+const PET_LAST_KEY = "petLastAlways.v1";
+let petLastAlways = localStorage.getItem(PET_LAST_KEY) === "1";
+const petLastControls = [$("float-menu-pet-last"), $("pet-last-toggle")];
+const applyPetLast = () => {
+  for (const el of petLastControls) el.classList.toggle("pet-last-on", petLastAlways);
+  petWidget.setAlwaysLast(petLastAlways);
+};
+applyPetLast();
+for (const el of petLastControls) {
+  el.addEventListener("click", () => {
+    petLastAlways = !petLastAlways;
+    localStorage.setItem(PET_LAST_KEY, petLastAlways ? "1" : "0");
+    applyPetLast();
+  });
+}
+
 const sparkCanvas = $<HTMLCanvasElement>("spark");
 const liveDot = $("live-dot");
 const liveText = $("live-text");
@@ -138,12 +163,18 @@ const stCalls = $("st-calls");
 const stSessions = $("st-sessions");
 const stLast = $("st-last");
 const chartMax = $("chart-max");
+const taskCard = $("task-card");
+const taskList = $("task-list");
 const floatTps = $("float-tps");
 const floatDot = $("float-dot");
+const floatLast = $("float-last");
 
 let lastSpark: number[] = [];
 let lastNowMs = 0;
 let sparkColor = "#22d3ee";
+// 任务卡隐藏迟滞：任务数在 1↔2 边界抖动（子代理起止、流式阈值边缘）时，
+// 连续 3 拍（~2s）不足 2 行才隐藏，避免下方曲线卡整块上下跳
+let taskHideStreak = 3;
 
 function redrawSpark() {
   if (lastSpark.length) drawSpark(sparkCanvas, lastSpark, sparkColor, lastNowMs);
@@ -155,9 +186,11 @@ function statusClass(s: Snapshot): string {
   return "dot idle";
 }
 
-/** 缓存命中率 = cache_read ÷ 全部提示 token（input + cache_creation + cache_read） */
+/** 缓存命中率 = cache_read ÷ input（usage 库的 input 本身就是全部提示 token，
+ *  缓存命中的部分已含其中，分母再加 cache_read 会重复计数；cache_creation 全库
+ *  恒为 0，防御性保留在分母以兼容将来单列它的 provider） */
 const cacheHitRate = (s: Snapshot): string => {
-  const prompt = s.inputTokens + s.cacheCreationTokens + s.cacheReadTokens;
+  const prompt = s.inputTokens + s.cacheCreationTokens;
   if (prompt <= 0) return "0%";
   return ((s.cacheReadTokens / prompt) * 100).toFixed(1) + "%";
 };
@@ -165,21 +198,57 @@ const cacheHitRate = (s: Snapshot): string => {
 function onSnapshot(s: Snapshot) {
   gCurrent.setTarget(s.currentTps, s.isEstimating, s.isStarting);
   gAvg.setTarget(s.avgTps);
+  gLast.setTarget(s.lastCallTps);
   gTotal.setTarget(s.totalTokens);
   miniGauge.setTarget(s.currentTps, s.isEstimating, s.isStarting);
+  miniLast.setTarget(s.lastCallTps);
+
+  // 并发任务明细：≥2 个任务时显示（单任务时隐藏，不占版面）。
+  // 一个 CLI 进程 = 一行，行值合计 = 当前速度表（文件增长按字节占比分摊）；
+  // 同一进程承载多个会话（同一 ZCode 窗口新开任务会复用 app-server 进程，
+  // 字节层不可拆分）计为一行合计，按 n_sessions 计入任务总数
+  const tasks = s.tasks ?? [];
+  const taskCount = tasks.reduce((n, t) => n + Math.max(1, t.nSessions || 0), 0);
+  if (taskCount >= 2) {
+    taskHideStreak = 0;
+    taskCard.hidden = false;
+    taskList.textContent = "";
+    for (const t of tasks) {
+      const row = document.createElement("div");
+      row.className = "task-row";
+      const dot = document.createElement("span");
+      dot.className = t.streaming ? "dot live" : "dot idle";
+      const label = document.createElement("span");
+      label.className = "task-sess";
+      label.textContent =
+        t.nSessions >= 2
+          ? `${t.nSessions} 会话（同进程合计） · 进程 ${t.pid}`
+          : t.session
+            ? `会话 …${t.session.slice(-6)} · 进程 ${t.pid}`
+            : `未归属进程 ${t.pid}`;
+      const tps = document.createElement("span");
+      tps.className = "task-tps";
+      tps.textContent = t.streaming ? `${fmtTps(t.tps)} t/s` : "待机";
+      if (t.streaming) tps.style.color = speedColor(t.tps, SPEED_TIERS);
+      row.append(dot, label, tps);
+      taskList.append(row);
+    }
+  } else if (taskHideStreak < 3) {
+    taskHideStreak++;
+    if (taskHideStreak >= 3) taskCard.hidden = true;
+  }
 
   subCurrent.textContent = s.isStarting
     ? "生成已启动 · 等待模型输出（统计中…）"
     : s.liveSource === "io"
       ? s.ramping
         ? "实时实测 · 统计中…（30s 滑窗建立中）"
-        : "实时实测 · 进程流式输出（30s 滑窗实测）"
+        : `实时实测 · 进程流式输出（30s 滑窗实测${taskCount >= 2 ? ` · ${taskCount} 任务聚合` : ""}）`
       : s.isEstimating
         ? "生成中 · 此段无增量字节，按近期真实速度估算 ≈"
         : "待机 · 已无生成任务";
   subAvg.textContent = `Σ输出 ÷ Σ生成时长 · 今日 ${s.callsToday} 次调用`;
   subTotal.textContent = `输出 ${fmtTokens(s.outputTokens)} · 输入 ${fmtTokens(s.inputTokens)} · 缓存命中率 ${cacheHitRate(s)}`;
-
   document.body.classList.toggle("live", s.isLive || s.isStarting);
   document.body.classList.toggle("est", s.isEstimating);
   const petState: "idle" | "running" | "estimating" | "starting" = s.isStarting
@@ -188,6 +257,22 @@ function onSnapshot(s: Snapshot) {
       ? "running"
       : "idle";
   petWidget.setLive(s.currentTps, petState);
+  // 多任务分进程明细：桌宠气泡 ≥2 任务时展开分任务行（与完整面板任务卡同口径；
+  // 单任务/回退/启动期传空，气泡只显示聚合值）
+  petWidget.setTasks(
+    taskCount >= 2
+      ? tasks.map((t) => ({
+          label:
+            t.nSessions >= 2
+              ? `${t.nSessions}会话·${t.pid}`
+              : t.session
+                ? `…${t.session.slice(-6)}`
+                : `进程 ${t.pid}`,
+          tps: t.tps,
+          streaming: t.streaming,
+        }))
+      : []
+  );
   liveDot.className = statusClass(s);
   liveText.textContent = s.isLive || s.isStarting ? "生成中" : s.isEstimating ? "估算中" : "待机";
   updatedAt.textContent = `更新于 ${fmtClock(s.nowMs)}`;
@@ -195,6 +280,10 @@ function onSnapshot(s: Snapshot) {
   floatTps.textContent = s.isStarting
     ? "…"
     : (s.isEstimating && s.liveSource !== "io" ? "≈" : "") + fmtTps(s.currentTps);
+  petWidget.setLast(s.lastCallTps);
+  // 胶囊第二行：上轮均速（落盘口径），按速度分档着色，无数据时显示 --
+  floatLast.textContent = s.lastCallTps > 0 ? fmtTps(s.lastCallTps) : "--";
+  floatLast.style.color = speedColor(s.lastCallTps, SPEED_TIERS);
 
   // 窗口标题同步实时速度，任务栏/Alt+Tab 可直接看到
   const title = `${s.isLive || s.isStarting ? "▶" : s.isEstimating ? "≈" : "⏸"} ${s.isStarting ? "…" : fmtTps(s.currentTps)} t/s · ${s.callsToday} 次 · ZCode 速度仪表盘`;
@@ -213,7 +302,7 @@ function onSnapshot(s: Snapshot) {
   lastSpark = s.spark;
   lastNowMs = s.nowMs;
   sparkColor = s.isLive ? "#22d3ee" : s.isEstimating ? "#fbbf24" : "#64748b";
-  const peak = Math.max(10, ...s.spark);
+  const peak = Math.max(10, ...s.spark, s.currentTps);
   chartMax.textContent = `峰值 ${fmtTps(peak)} t/s`;
   redrawSpark();
 }
@@ -279,6 +368,182 @@ $("float-pet-cycle").addEventListener("click", () => {
   localStorage.setItem(PET_PACK_KEY, currentPetPack);
 });
 
+// ---- 重新校准（当前速度卡左上角 ⟳）：丢弃字节→token 系数样本回到先验 ----
+const btnRecal = $<HTMLButtonElement>("btn-recal");
+if (!hasTauri) btnRecal.style.display = "none"; // 浏览器预览无真实校准
+let recalTimer = 0;
+const flashRecal = () => {
+  btnRecal.classList.add("done");
+  window.clearTimeout(recalTimer);
+  recalTimer = window.setTimeout(() => btnRecal.classList.remove("done"), 1500);
+};
+btnRecal.addEventListener("click", () => {
+  tauriInvoke("recalibrate").catch((err) => console.warn("recalibrate 失败:", err));
+});
+
+// ---- 应用内更新：footer 右下角版本号（点击=手动检查）；后端启动+每日静默检查，
+//      发现新版本自动预下载并弹此卡片；无更新/网络异常静默，不打扰 ----
+interface UpdateEvent {
+  state: "available" | "downloading" | "ready" | "launching" | "error";
+  currentVersion: string;
+  newVersion: string;
+  releaseUrl: string;
+  notes: string;
+  downloadedBytes: number;
+  totalBytes: number;
+  message: string;
+}
+type CheckOutcome =
+  | { kind: "upToDate"; current: string }
+  | { kind: "available"; current: string; newVersion: string }
+  | { kind: "failed"; message: string };
+
+const DISMISS_KEY = "updateDismissed.v1";
+const stVersion = $("st-version");
+const updateCard = $("update-card");
+const updateVersion = $("update-version");
+const updateCurrent = $("update-current");
+const updateNotes = $("update-notes");
+const updateLink = $("update-link");
+const updateProgress = $("update-progress");
+const updateBarFill = $("update-bar-fill");
+const updateProgressText = $("update-progress-text");
+const updateInstall = $<HTMLButtonElement>("update-install");
+const updateStatus = $("update-status");
+const updateToast = $("update-toast");
+let currentVersion = "";
+let updateDismissed = localStorage.getItem(DISMISS_KEY) ?? "";
+let toastTimer = 0;
+let checkingUpdate = false;
+
+if (!hasTauri) {
+  stVersion.style.display = "none"; // 浏览器预览无后端，隐藏入口
+} else {
+  tauriInvoke<string>("app_version").then((v) => {
+    if (v) {
+      currentVersion = v;
+      stVersion.textContent = `v${v}`;
+    }
+  });
+}
+
+const toast = (msg: string) => {
+  updateToast.textContent = msg;
+  updateToast.classList.add("show");
+  window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => updateToast.classList.remove("show"), 2600);
+};
+
+const setUpdateProgress = (done: number, total: number) => {
+  const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+  updateBarFill.style.width = `${pct}%`;
+  updateProgressText.textContent =
+    total > 0 ? `${pct}% · ${(done / 1048576).toFixed(1)}/${(total / 1048576).toFixed(1)} MB` : "下载中…";
+};
+
+/** 弹卡片（用户没关过这个版本的提示）；关过则只给版本号挂小圆点 */
+const maybeOpenCard = (e: UpdateEvent) => {
+  if (updateDismissed && updateDismissed === e.newVersion) {
+    stVersion.classList.add("has-update");
+  } else {
+    updateCard.classList.add("show");
+  }
+};
+
+function applyUpdateEvent(e: UpdateEvent) {
+  if (e.currentVersion) currentVersion = e.currentVersion;
+  if (e.newVersion) {
+    updateVersion.textContent = `v${e.newVersion}`;
+    updateCurrent.textContent = currentVersion ? `v${currentVersion}` : "";
+    updateNotes.textContent = e.notes;
+    updateLink.dataset.url = e.releaseUrl;
+  }
+  updateStatus.classList.toggle("error", e.state === "error");
+  updateStatus.textContent = e.message;
+  switch (e.state) {
+    case "available":
+      updateProgress.style.display = "none";
+      updateInstall.disabled = false;
+      updateInstall.textContent = "⤓ 立即更新";
+      maybeOpenCard(e);
+      break;
+    case "downloading":
+      updateProgress.style.display = "";
+      setUpdateProgress(e.downloadedBytes, e.totalBytes);
+      updateInstall.disabled = true;
+      updateInstall.textContent = "⤓ 下载中…";
+      maybeOpenCard(e);
+      break;
+    case "ready":
+      updateProgress.style.display = "none";
+      updateInstall.disabled = false;
+      updateInstall.textContent = "⤓ 立即安装";
+      maybeOpenCard(e);
+      break;
+    case "launching":
+      updateInstall.disabled = true;
+      updateInstall.textContent = "正在安装…";
+      updateCard.classList.add("show");
+      break;
+    case "error":
+      updateInstall.disabled = false;
+      updateInstall.textContent = "重试";
+      updateCard.classList.add("show");
+      break;
+  }
+}
+
+async function manualCheck() {
+  if (!hasTauri || checkingUpdate) return;
+  checkingUpdate = true;
+  // 先清"已关闭提示"再检查：手动检查视为重新关注，"available" 事件（可能先于
+  // invoke 返回到达）到达时能正常弹卡片
+  updateDismissed = "";
+  localStorage.removeItem(DISMISS_KEY);
+  stVersion.classList.remove("has-update");
+  stVersion.classList.add("checking");
+  try {
+    const r = await tauriInvoke<CheckOutcome>("check_update");
+    if (r?.kind === "upToDate") toast(`已是最新版本 v${r.current}`);
+    else if (r?.kind === "failed") toast("检查更新失败：网络异常，请稍后重试");
+    // available → 卡片由 "update" 事件渲染
+  } finally {
+    stVersion.classList.remove("checking");
+    checkingUpdate = false;
+  }
+}
+
+stVersion.addEventListener("click", () => manualCheck());
+updateInstall.addEventListener("click", () => {
+  updateInstall.disabled = true;
+  updateInstall.textContent = "准备中…";
+  tauriInvoke("install_update").catch((err) => {
+    updateStatus.classList.add("error");
+    updateStatus.textContent = String(err);
+    updateInstall.disabled = false;
+    updateInstall.textContent = "重试";
+  });
+});
+$("update-close").addEventListener("click", () => {
+  updateCard.classList.remove("show");
+  const v = updateVersion.textContent?.replace(/^v/, "") ?? "";
+  if (v) {
+    updateDismissed = v;
+    localStorage.setItem(DISMISS_KEY, v);
+  }
+});
+updateLink.addEventListener("click", (e) => {
+  e.preventDefault();
+  const url = updateLink.dataset.url;
+  if (url) tauriInvoke("open_url", { url }).catch(() => {});
+});
+// 手动下载：应用内安装之外的自助路径（安装失败/不想自动装时直达 Release 页）
+const RELEASES_URL = "https://github.com/Masterchiefm/zcode-speed-panel/releases";
+$("update-manual").addEventListener("click", () => {
+  const url = updateLink.dataset.url || RELEASES_URL;
+  tauriInvoke("open_url", { url }).catch(() => {});
+});
+
 $("float-style-btn").addEventListener("click", () => {
   setStyleDropdownOpen(!styleDropdown.classList.contains("open"));
 });
@@ -317,6 +582,15 @@ enableDrag($("float-gauge"));
 enableDrag($("float-pill"));
 enableDrag($("float-pet"));
 
+// 悬浮窗双击 = 恢复完整面板。桌宠不参与：双击已用于换宠物（pet.ts），
+// 其恢复走 ⤢ 按钮 / 右键菜单 / 托盘。按钮上的双击不触发（click 已处理）
+for (const id of ["float-gauge", "float-pill"]) {
+  $(id).addEventListener("dblclick", (e) => {
+    if ((e.target as HTMLElement).closest("button, select, input, .dropdown")) return;
+    requestMode("full");
+  });
+}
+
 // ---- 自绘标题栏：拖动移动、双击最大化，— / ▢ / ✕ 窗口控制 ----
 const currentWindow = () => import("@tauri-apps/api/window").then((m) => m.getCurrentWindow());
 $("app-header").addEventListener("dblclick", (e) => {
@@ -349,10 +623,13 @@ if (hasTauri) {
     });
     await listen<string>("mode", (e) => applyModeUi(e.payload));
     await listen("tray-hint", () => showTrayHint());
+    // 重新校准完成（手动或漂移自动触发）：按钮闪 ✓ 反馈
+    await listen("recalibrated", flashRecal);
     await listen<string>("float-style", (e) => {
       localStorage.setItem("floatStyle", e.payload);
       applyStyleUi(e.payload);
     });
+    await listen<UpdateEvent>("update", (e) => applyUpdateEvent(e.payload));
     const p = await tauriInvoke<SnapshotPayload>("snapshot");
     if (p) {
       applyModeUi(p.mode);

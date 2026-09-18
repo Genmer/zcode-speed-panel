@@ -194,6 +194,7 @@ main {
 }
 
 .gauge-card {
+  position: relative; /* 角标小表（#g-last）绝对定位到卡片右上角 */
   padding: 12px 10px 10px;
   display: flex;
   flex-direction: column;
@@ -205,6 +206,57 @@ main {
 .gauge-card canvas {
   width: 100%;
   height: 210px;
+}
+
+/* 当前速度卡右上角的"上一轮调用速度"小圆环：小而独立，不占主表布局；
+   尺寸受卡片顶角留白限制（窗口最小宽度 720 时主表弧线已贴近顶角） */
+.gauge-card canvas.corner-gauge {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  width: 56px;
+  height: 56px;
+}
+
+/* 当前速度卡左上角"重新校准"图标按钮（与右上角"上轮"角标呼应；宽度收窄，
+   避免压住画布顶部居中的表名文字，最小窗口宽 720 时表名左缘约 62px）。
+   图标为内联 SVG 精确居中——⟳ 一类符号字形在字体里墨迹相对字宽偏心。
+   选择器须带 .ghost-btn 提高特异性：后者在文件后部又声明了 padding，
+   同权重按源序会覆盖这里的 padding: 0——内容盒被 10px 水平内边距挤剩 4px 宽，
+   grid 轨道按图标宽 14px 向右溢出内容盒，图标整体右偏约 5 逻辑像素 */
+.ghost-btn.recal-btn {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  z-index: 2;
+}
+
+.recal-btn svg {
+  display: block;
+}
+
+/* 重校准完成反馈：⟳ 换成绿色 ✓（main.ts flashRecal 切 done 类），1.5s 后复原 */
+.recal-btn .recal-done {
+  display: none;
+}
+
+.recal-btn.done .recal-refresh {
+  display: none;
+}
+
+.recal-btn.done .recal-done {
+  display: block;
+}
+
+.recal-btn.done,
+.recal-btn.done:hover {
+  color: var(--emerald);
+  border-color: rgba(52, 211, 153, 0.4);
 }
 
 .sub {
@@ -243,6 +295,43 @@ main {
   width: 100%;
   flex: 1;
   min-height: 0;
+}
+
+/* 并发任务明细卡：多任务并发时出现在仪表行与曲线之间，单任务时隐藏 */
+.task-card {
+  padding: 10px 16px 8px;
+}
+
+#task-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.task-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.task-row .dot {
+  flex: none;
+}
+
+.task-sess {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dim);
+}
+
+.task-tps {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
 }
 
 footer {
@@ -377,6 +466,60 @@ footer span {
   background: rgba(248, 113, 113, 0.18);
 }
 
+/* "常显上轮均速"勾选小方框：桌宠右键菜单项与主窗口顶栏开关共用（.pet-last-on = 勾选态）。
+   原生 checkbox 与 select 一样由 WebView2 按浅色系统主题渲染，深色界面里不可读，须自绘 */
+.pet-chk {
+  flex: none;
+  box-sizing: border-box;
+  position: relative;
+  width: 12px;
+  height: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 3px;
+}
+
+.pet-last-on .pet-chk {
+  border-color: #22d3ee;
+  background: rgba(34, 211, 238, 0.22);
+}
+
+.pet-last-on .pet-chk::after {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 1px;
+  width: 4px;
+  height: 7px;
+  border: solid #22d3ee;
+  border-width: 0 2px 2px 0;
+  transform: rotate(40deg);
+}
+
+/* 菜单项横向排列。须用双 ID 压过 `#float-menu button` 的 all:unset + display:block
+   （单 ID 选择器特异性 (1,0,0) 打不过 (1,0,1)，flex 失效 → .pet-chk 退化行内零尺寸、勾选框错位）；
+   仅桌宠样式显示，隐藏规则同理要压过双 ID flex */
+#float-menu #float-menu-pet-last {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+body.float-mode:not(.style-pet) #float-menu #float-menu-pet-last {
+  display: none;
+}
+
+/* 主窗口顶栏开关：仅完整面板 + 悬浮窗样式为桌宠时出现（悬浮窗走右键菜单勾选）。
+   <button> 元素天然落在顶栏拖动/双击的排除选择器（button, select, input, .dropdown）里 */
+#pet-last-toggle {
+  display: none;
+  align-items: center;
+  gap: 6px;
+}
+
+body.style-pet:not(.float-mode) #pet-last-toggle {
+  display: inline-flex;
+}
+
 .dot.est {
   background: var(--amber);
   box-shadow: 0 0 10px rgba(251, 191, 36, 0.9);
@@ -425,13 +568,25 @@ body.float-mode.style-gauge #float-gauge {
 body.float-mode.style-pill #float-pill {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 0 10px 0 18px;
+  justify-content: center;
+  gap: 10px;
+  padding: 0 12px;
 }
 
+/* 主环占左侧 96px，右侧留给"上轮"小环（窗口 128×128 正方形，见 main.rs FLOAT_GAUGE_SIZE）；
+   主环半径由画布尺寸推出，收窄画布宽度即同时缩小主环与速度数字 */
 #mini-gauge {
-  width: 100%;
+  width: 96px;
   height: 100%;
+}
+
+/* 仪表悬浮窗右上角的上轮小环（与完整面板当前速度卡的角标同款，尺寸随窗口缩小） */
+.float-badge {
+  position: absolute;
+  top: 6px;
+  right: 4px;
+  width: 46px;
+  height: 46px;
 }
 
 #pet-canvas {
@@ -440,11 +595,39 @@ body.float-mode.style-pill #float-pill {
   display: block;
 }
 
+/* 胶囊数值区：第一行实时速度，第二行上轮均速（落盘口径）；
+   两行各自居中，整组随 justify-content 在胶囊内水平居中 */
+#float-val {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+}
+
 .float-val {
   display: flex;
   align-items: baseline;
   gap: 6px;
   user-select: none;
+}
+
+.float-sub {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  user-select: none;
+}
+
+.float-sub-label {
+  color: var(--dim);
+  font-size: 10px;
+}
+
+#float-last {
+  font-size: 14px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--dim); /* 有数据时按速度分档着色（main.ts） */
 }
 
 #float-approx {
@@ -459,7 +642,7 @@ body.est #float-approx {
 }
 
 #float-tps {
-  font-size: 30px;
+  font-size: 28px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   color: var(--cyan);
@@ -485,7 +668,7 @@ body.float-mode:not(.live):not(.est) #float-tps {
   position: absolute;
   right: 6px;
   bottom: 6px;
-  padding: 2px 7px;
+  padding: 2px 6px;
   opacity: 0.45;
 }
 
@@ -520,7 +703,7 @@ body.float-mode:not(.live):not(.est) #float-tps {
   pointer-events: auto;
 }
 
-/* 悬浮窗/桌宠模式窗口只有 78~200px 高，放不下提示且会被裁剪：不显示 */
+/* 悬浮窗/桌宠模式窗口只有 72~200px 高，放不下提示且会被裁剪：不显示 */
 body.float-mode #tray-hint {
   display: none;
 }
@@ -564,10 +747,178 @@ body.float-mode #tray-hint {
   max-height: 80vh;
   overflow: auto;
   padding: 14px 18px 14px;
-  border-radius: 10px;
+}
+/* ---- 应用内更新：footer 最右的版本号是检查入口，更新卡片与轻提示在其上方 ---- */
+
+#st-version {
+  margin-left: auto; /* footer 为 flex：把版本号推到整行最右 */
+  margin-right: -6px; /* 视觉上贴住 footer 右缘（补偿点击热区 padding） */
+  padding: 1px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: color 0.15s;
+}
+
+#st-version:hover {
+  color: var(--cyan);
+}
+
+#st-version.checking::before {
+  content: "↻ ";
+  display: inline-block;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* 用户关过提示、但该新版本还没处理：版本号旁挂小圆点持续提醒 */
+#st-version.has-update::after {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 5px;
+  border-radius: 50%;
+  background: var(--cyan);
+  vertical-align: middle;
+}
+
+#update-card {
+  display: none;
+  position: fixed;
+  right: 20px;
+  bottom: 46px; /* footer 状态栏上方 */
+  z-index: 110;
+  width: 320px;
+  padding: 12px 14px;
+  border-radius: 12px;
   border: 1px solid rgba(255, 255, 255, 0.14);
   background: rgba(13, 20, 36, 0.97);
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  font-size: 12px;
+}
+
+#update-card.show {
+  display: block;
+}
+
+.update-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.update-head b {
+  color: var(--cyan);
+}
+
+#update-close {
+  all: unset;
+  cursor: pointer;
+  color: var(--dim);
+  padding: 2px 5px;
+  border-radius: 6px;
+}
+
+#update-close:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.update-sub {
+  color: var(--dim);
+  margin-top: 2px;
+}
+
+#update-link {
+  color: var(--cyan);
+  cursor: pointer;
+}
+
+#update-link:hover {
+  text-decoration: underline;
+}
+
+.update-notes {
+  margin-top: 8px;
+  max-height: 108px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--dim);
+  font-size: 11px;
+  line-height: 1.5;
+  font-family: inherit;
+  user-select: text;
+}
+
+.update-notes:empty {
+  display: none;
+}
+
+.update-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.update-bar {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.update-bar i {
+  display: block;
+  height: 100%;
+  width: 0%;
+  border-radius: 3px;
+  background: linear-gradient(90deg, #22d3ee, #0ea5e9);
+  transition: width 0.2s;
+}
+
+#update-progress-text {
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+  min-width: 108px;
+  text-align: right;
+}
+
+.update-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap; /* 错误信息较长时允许折行，不挤爆按钮 */
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.update-actions button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+#update-status {
+  color: var(--dim);
+}
+
+#update-status.error {
+  color: #f87171;
+}
+
+#update-toast {
+  position: fixed;
+  right: 20px;
+  bottom: 46px;
+  z-index: 115;
+  padding: 8px 14px;
 }
 
 .model-modal-head {
@@ -652,5 +1003,199 @@ body.float-mode #tray-hint {
 
 /* 悬浮窗/桌宠模式窗口过小放不下弹窗：直接隐藏（JS 侧会同时停掉 5s 轮询） */
 body.float-mode #model-modal {
+  display: none !important;
+}
+
+/* ---- 应用内更新：footer 最右的版本号是检查入口，更新卡片与轻提示在其上方 ---- */
+
+#st-version {
+  margin-left: auto; /* footer 为 flex：把版本号推到整行最右 */
+  margin-right: -6px; /* 视觉上贴住 footer 右缘（补偿点击热区 padding） */
+  padding: 1px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: color 0.15s;
+}
+
+#st-version:hover {
+  color: var(--cyan);
+}
+
+#st-version.checking::before {
+  content: "↻ ";
+  display: inline-block;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* 用户关过提示、但该新版本还没处理：版本号旁挂小圆点持续提醒 */
+#st-version.has-update::after {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 5px;
+  border-radius: 50%;
+  background: var(--cyan);
+  vertical-align: middle;
+}
+
+#update-card {
+  display: none;
+  position: fixed;
+  right: 20px;
+  bottom: 46px; /* footer 状态栏上方 */
+  z-index: 110;
+  width: 320px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(13, 20, 36, 0.97);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  font-size: 12px;
+}
+
+#update-card.show {
+  display: block;
+}
+
+.update-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.update-head b {
+  color: var(--cyan);
+}
+
+#update-close {
+  all: unset;
+  cursor: pointer;
+  color: var(--dim);
+  padding: 2px 5px;
+  border-radius: 6px;
+}
+
+#update-close:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.update-sub {
+  color: var(--dim);
+  margin-top: 2px;
+}
+
+#update-link {
+  color: var(--cyan);
+  cursor: pointer;
+}
+
+#update-link:hover {
+  text-decoration: underline;
+}
+
+.update-notes {
+  margin-top: 8px;
+  max-height: 108px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--dim);
+  font-size: 11px;
+  line-height: 1.5;
+  font-family: inherit;
+  user-select: text;
+}
+
+.update-notes:empty {
+  display: none;
+}
+
+.update-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.update-bar {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.update-bar i {
+  display: block;
+  height: 100%;
+  width: 0%;
+  border-radius: 3px;
+  background: linear-gradient(90deg, #22d3ee, #0ea5e9);
+  transition: width 0.2s;
+}
+
+#update-progress-text {
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+  min-width: 108px;
+  text-align: right;
+}
+
+.update-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap; /* 错误信息较长时允许折行，不挤爆按钮 */
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.update-actions button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+#update-status {
+  color: var(--dim);
+}
+
+#update-status.error {
+  color: #f87171;
+}
+
+#update-toast {
+  position: fixed;
+  right: 20px;
+  bottom: 46px;
+  z-index: 115;
+  padding: 8px 14px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(13, 20, 36, 0.97);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  color: var(--text);
+  font-size: 12px;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 0.3s ease, visibility 0.3s;
+}
+
+#update-toast.show {
+  opacity: 1;
+  visibility: visible;
+}
+
+/* 悬浮窗/桌宠窗口太小放不下更新 UI：不显示（回到完整面板仍可见） */
+body.float-mode #update-card,
+body.float-mode #update-toast {
   display: none !important;
 }

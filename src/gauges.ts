@@ -48,14 +48,30 @@ export interface SpeedTier {
   color: string;
 }
 
+/** 六档覆盖到极速模型（实测部分模型远超 100 t/s）；色相沿绿→黄→红推进，320+ 品红标记极速 */
 export const SPEED_TIERS: readonly SpeedTier[] = [
-  { upTo: 30, color: "#34d399" }, // 0–30 低速 · 绿
-  { upTo: 60, color: "#fbbf24" }, // 30–60 中速 · 黄
-  { upTo: Infinity, color: "#f87171" }, // 60+ 高速 · 红
+  { upTo: 40, color: "#34d399" }, // 0–40 · 绿
+  { upTo: 80, color: "#a3e635" }, // 40–80 · 黄绿
+  { upTo: 160, color: "#fbbf24" }, // 80–160 · 黄
+  { upTo: 240, color: "#fb923c" }, // 160–240 · 橙
+  { upTo: 320, color: "#f87171" }, // 240–320 · 红
+  { upTo: Infinity, color: "#e879f9" }, // 320+ · 品红（极速）
 ];
 
 function speedTier(v: number): SpeedTier {
   return SPEED_TIERS.find((t) => v <= t.upTo) ?? SPEED_TIERS[SPEED_TIERS.length - 1];
+}
+
+/** 速度 → 档位序号 0..5（与 SPEED_TIERS 同序，0–40 为第 0 档）；供桌宠按档位切换动画 */
+export function speedTierIndex(v: number, tiers: readonly SpeedTier[] = SPEED_TIERS): number {
+  return Math.max(0, tiers.findIndex((t) => v <= t.upTo));
+}
+
+/** 速度 → 分档颜色；0（无数据/待机）或未配置分档时返回暗灰。
+ *  供表盘与 HTML 文本（胶囊悬浮窗的上轮读数）共用同一套配色 */
+const NO_SPEED_COLOR = "#8b93a7";
+export function speedColor(v: number, tiers?: readonly SpeedTier[]): string {
+  return v > 0 && tiers ? speedTier(v).color : NO_SPEED_COLOR;
 }
 
 function fitCanvas(
@@ -229,7 +245,7 @@ export class ArcGauge extends BaseGauge {
       ctx.stroke();
       ctx.restore();
     } else if (this.opts.tiers && !this.est) {
-      // 整条进度弧随当前速度所在档位整体换色：0–30 绿 / 30–60 黄 / 60+ 红
+      // 整条进度弧随当前速度所在档位整体换色（六档见 SPEED_TIERS）
       const tierColor = speedTier(this.value).color;
       ctx.save();
       ctx.shadowColor = tierColor;
@@ -369,13 +385,67 @@ export class MiniGauge extends BaseGauge {
         : this.opts.tiers && !this.est
           ? speedTier(this.value).color
           : "#e6e9f0";
-    ctx.font = `600 ${Math.round(r * 0.5)}px ${FONT}`;
+    ctx.font = `600 ${Math.round(r * 0.46)}px ${FONT}`;
     if (this.starting) ctx.globalAlpha = 0.45 + 0.55 * this.pulse();
     ctx.fillText(this.starting ? "…" : (this.est ? "≈" : "") + fmtTps(this.value), cx, cy + r * 0.12);
     ctx.globalAlpha = 1;
     ctx.fillStyle = "#8b93a7";
     ctx.font = `9px ${FONT}`;
     ctx.fillText("t/s", cx, cy + r * 0.55);
+  }
+}
+
+/** 卡片角标小圆环：显示最近一轮已完成调用的速度（落盘口径，非实时）。
+ *  画在"当前输出速度"卡右上角，尺寸约 56 CSS px，与主表共用分档配色。
+ *  今日无已完成调用时保持灰色 0（不做脉冲/估算态：落盘值没有"统计中"一说） */
+export class BadgeGauge extends BaseGauge {
+  constructor(canvas: HTMLCanvasElement, opts?: { tiers?: readonly SpeedTier[] }) {
+    super(canvas, { color: "#22d3ee", minScale: 60, tiers: opts?.tiers });
+  }
+
+  protected draw() {
+    const fit = fitCanvas(this.canvas);
+    if (!fit) return;
+    const { ctx, w, h } = fit;
+    const cx = w / 2;
+    const cy = h * 0.4;
+    const r = Math.min(w, h) * 0.34;
+
+    const frac = Math.max(0.0001, Math.min(1, this.value / this.max));
+    const tier = speedColor(this.value, this.opts.tiers);
+
+    ctx.lineCap = "round";
+    ctx.lineWidth = 5;
+    ctx.strokeStyle = "rgba(255,255,255,0.08)";
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, A0, A0 + SWEEP);
+    ctx.stroke();
+
+    if (this.value > 0) {
+      ctx.save();
+      ctx.shadowColor = tier;
+      ctx.shadowBlur = 8;
+      ctx.strokeStyle = tier;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, A0, A0 + SWEEP * frac);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    ctx.textAlign = "center";
+    ctx.textBaseline = "alphabetic";
+    const main = fmtTps(this.value);
+    let fs = Math.round(r * 0.68);
+    ctx.font = `600 ${fs}px ${FONT}`;
+    while (fs > 9 && ctx.measureText(main).width > r * 1.6) {
+      fs -= 1;
+      ctx.font = `600 ${fs}px ${FONT}`;
+    }
+    ctx.fillStyle = tier;
+    ctx.fillText(main, cx, cy + 1);
+    ctx.fillStyle = "#8b93a7";
+    ctx.font = `8px ${FONT}`;
+    ctx.fillText("上轮", cx, cy + r * 0.62);
   }
 }
 

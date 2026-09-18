@@ -31,6 +31,21 @@ impl Call {
     }
 }
 
+/// 分任务实时明细（多任务并发时才有多个）：一个 CLI 进程 = 一个任务行。
+/// 同进程内并行的多个子代理在字节层不可拆分，如实显示为该进程合计
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskStat {
+    pub pid: u32,
+    /// 归属的进行中会话 id（空 = 尚未归属的流式进程）
+    pub session: String,
+    /// 该进程承载的进行中会话数（≥2 = 同进程多任务，速度为合计）
+    pub n_sessions: u32,
+    pub tps: f64,
+    /// 该进程当前是否处于流式状态（探测窗速率超阈值）
+    pub streaming: bool,
+}
+
 /// 推送给前端的指标快照
 #[derive(Serialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
@@ -56,12 +71,17 @@ pub struct Snapshot {
     /// 近 10 分钟已完成调用的真实速度（落盘口径，与速度曲线同源）。
     /// 部分调用期间 UI 管道无增量字节（IO 实测不可用），用它做回退显示
     pub window_tps: f64,
+    /// 最近一次已完成调用的真实速度（落盘口径：输出+思考 ÷ 纯生成时长）。
+    /// 今日无已完成调用时为 0；当前速度卡右上角的小表用它显示"上一轮"
+    pub last_call_tps: f64,
     /// 当前速度来源："io"=进程流实测 / "window"=窗口回退 / "idle"=待机
     pub live_source: String,
     pub last_activity_ms: i64,
     pub now_ms: i64,
     pub rollout_dir: String,
     pub spark: Vec<f64>,
+    /// 并发任务分进程明细（实时链路填充；≥2 个时前端显示任务列表）
+    pub tasks: Vec<TaskStat>,
 }
 
 /// 当前速度统计窗口
@@ -148,6 +168,9 @@ impl Aggregator {
         let mut w_out = 0u64;
         let mut w_dur = 0i64;
         let mut last_completed = 0i64;
+        // 最近一次已完成调用的分子/分母，用于"上一轮调用速度"角标
+        let mut last_eff = 0u64;
+        let mut last_gen = 0i64;
         let mut sessions: HashSet<&str> = HashSet::new();
         // 桶对齐墙钟 10s 边界：桶序号 = 完成时刻所属槽 与 当前槽 的差
         let now_slot = now.div_euclid(SPARK_BUCKET_MS);
@@ -163,7 +186,11 @@ impl Aggregator {
             if !c.session.is_empty() {
                 sessions.insert(c.session.as_str());
             }
-            last_completed = last_completed.max(c.completed_ms);
+            if c.completed_ms >= last_completed {
+                last_completed = c.completed_ms;
+                last_eff = c.effective_out();
+                last_gen = c.gen_ms.max(MIN_DUR_MS);
+            }
             if c.completed_ms >= now - LIVE_WINDOW_MS {
                 w_out += c.effective_out();
                 w_dur += c.gen_ms.max(MIN_DUR_MS);
@@ -231,6 +258,11 @@ impl Aggregator {
         } else {
             0.0
         };
+        let last_call_tps = if last_gen > 0 {
+            last_eff as f64 / (last_gen as f64 / 1000.0)
+        } else {
+            0.0
+        };
 
         // 总量口径与 ZCode 官方统计一致：input + output + reasoning + cache_creation，
         // 缓存命中（cache_read）是提示复用、不是新增用量，单独展示不计入
@@ -250,6 +282,7 @@ impl Aggregator {
             ramping: false,
             is_starting: false,
             window_tps,
+            last_call_tps,
             live_source: if is_estimating {
                 "window".to_string()
             } else {
@@ -259,6 +292,7 @@ impl Aggregator {
             now_ms: now,
             rollout_dir: String::new(),
             spark,
+            tasks: Vec::new(),
         }
     }
 }
@@ -415,20 +449,25 @@ impl Engine {
     /// 调用结束（含取消/出错）时补写 completed 字段——比 model_usage 完成行更快、
     /// 且覆盖 status='cancelled'/'error'（这两种调用永远没有 completed 状态行，
     /// 旧口径下会卡"生成中"直到 10 分钟兜底）。
-    /// 返回 (会话, 调用开始时刻)。10 分钟上限兜底崩溃后无人补写 completed 的行。
-    pub fn call_in_flight(&self) -> Option<(String, i64)> {
-        let conn = self.conn.as_ref()?;
-        // 最近活跃会话（session 表 ~1k 行，按 time_updated 倒序小表扫描可接受）；
+    /// 返回全部进行中的 (会话, 调用开始时刻)，按开始时刻降序——多任务并发
+    /// （多窗口 / 子代理会话）时实时速度按进程集合聚合，不再单选最新一条。
+    /// 10 分钟上限兜底崩溃后无人补写 completed 的行。
+    pub fn call_in_flight(&self) -> Vec<(String, i64)> {
+        let Some(conn) = self.conn.as_ref() else {
+            return Vec::new();
+        };
+        // 最近活跃会话（session 表 ~1k 行，按 time_updated 倒序小表扫描可接受；
+        // 上限 16：多任务聚合要覆盖全部进行中会话，>6 个并发子代理不能漏计）；
         // message 表缺 time_created 单列索引，不能全局 ORDER BY（实测 ~200ms/次）
         let mut stmt = match conn.prepare_cached(
-            "SELECT id FROM session ORDER BY time_updated DESC LIMIT 6",
+            "SELECT id FROM session ORDER BY time_updated DESC LIMIT 16",
         ) {
             Ok(s) => s,
-            Err(_) => return None,
+            Err(_) => return Vec::new(),
         };
         let sessions: Vec<String> = match stmt.query_map([], |r| r.get::<_, String>(0)) {
             Ok(rows) => rows.flatten().collect(),
-            Err(_) => return None,
+            Err(_) => return Vec::new(),
         };
         drop(stmt);
 
@@ -508,11 +547,12 @@ impl Engine {
 
 /// message 门控纯判定：候选 (会话, assistant 行创建时刻, 是否已带 completed)。
 /// 每会话只认最新一条 assistant 行（更老的未完成行是崩溃残留，已被更新行覆盖），
-/// 其中任一会话的最新行未完成且新鲜 → 有调用进行中，取创建时刻最新的一条
+/// 其中最新行未完成且新鲜的会话**全部**视为进行中（多任务并发各自计入，
+/// 供实时链路按进程集合聚合），按创建时刻降序返回
 pub(crate) fn inflight_from_rows(
     cands: &[(String, i64, bool)],
     now_ms: i64,
-) -> Option<(String, i64)> {
+) -> Vec<(String, i64)> {
     let mut newest: HashMap<&str, &(String, i64, bool)> = HashMap::new();
     for row in cands {
         match newest.get(row.0.as_str()) {
@@ -522,11 +562,13 @@ pub(crate) fn inflight_from_rows(
             }
         }
     }
-    newest
+    let mut out: Vec<(String, i64)> = newest
         .values()
         .filter(|(_, created, done)| !done && now_ms - *created <= 600_000)
-        .max_by_key(|(_, created, _)| *created)
         .map(|(s, c, _)| (s.clone(), *c))
+        .collect();
+    out.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    out
 }
 
 // ============ 模型速度趋势（按模型 × 时间桶聚合，详情弹窗用，零本地存储） ============
@@ -704,13 +746,14 @@ mod tests {
     use super::*;
 
     /// message 门控：未带 completed 的最新 assistant 行 → 进行中；
-    /// 已完成的行、超龄的僵尸行（崩溃兜底）、以及"同会话更新的已完成行"都不算
+    /// 已完成的行、超龄的僵尸行（崩溃兜底）、以及"同会话更新的已完成行"都不算；
+    /// 多会话并发（多窗口/子代理）全部返回
     #[test]
     fn inflight_from_rows_gating() {
         let now = 1_000_000i64;
         // 新会话首条调用：行未完成 → 进行中
         let r = inflight_from_rows(&[("new".into(), now - 3_000, false)], now);
-        assert_eq!(r, Some(("new".to_string(), now - 3_000)));
+        assert_eq!(r, vec![("new".to_string(), now - 3_000)]);
         // 同会话有更新的已完成 assistant 行（旧僵尸行在上）→ 不算
         assert_eq!(
             inflight_from_rows(
@@ -720,23 +763,31 @@ mod tests {
                 ],
                 now
             ),
-            None
+            Vec::new()
         );
-        // 多会话并发：取最新未完成行（子 agent 会话 b 晚于主会话 a 开始）
+        // 多会话并发：全部进行中会话都返回，按开始时刻降序
+        // （子 agent 会话 b/c 晚于主会话 a 开始，a 的当轮已完成）
         let r = inflight_from_rows(
             &[
                 ("a".into(), now - 40_000, true),
                 ("b".into(), now - 5_000, false),
+                ("c".into(), now - 20_000, false),
             ],
             now,
         );
-        assert_eq!(r, Some(("b".to_string(), now - 5_000)));
+        assert_eq!(
+            r,
+            vec![
+                ("b".to_string(), now - 5_000),
+                ("c".to_string(), now - 20_000),
+            ]
+        );
         // 未完成但超过 10 分钟兜底 → 判停
         assert_eq!(
             inflight_from_rows(&[("z".into(), now - 601_000, false)], now),
-            None
+            Vec::new()
         );
-        assert_eq!(inflight_from_rows(&[], now), None);
+        assert_eq!(inflight_from_rows(&[], now), Vec::new());
     }
 
     fn call(completed: i64, gen_ms: i64, out: u64, reason: u64, input: u64, session: &str) -> Call {
@@ -773,6 +824,22 @@ mod tests {
         assert_eq!(s.sessions_today, 1);
         assert_eq!(s.spark.len(), SPARK_BUCKETS);
         assert_eq!(s.live_source, "window"); // 无 IO 探测时 is_live=false → 窗口回退
+        // 上一轮调用速度 = 最近一次完成调用（now-1s）的 eff/gen = 300 / 8s
+        assert!((s.last_call_tps - 37.5).abs() < 1e-9);
+    }
+
+    /// "上一轮调用速度"取完成时刻最晚的那条，与 ingest 顺序无关（DB 查询排序可能变化）
+    #[test]
+    fn last_call_tps_uses_latest_completed() {
+        let now = now_ms();
+        let mut agg = Aggregator::new();
+        agg.ingest(call(now - 1_000, 4_000, 400, 0, 0, "a")); // 100 t/s
+        agg.ingest(call(now - 30_000, 2_000, 100, 0, 0, "b")); // 50 t/s，更早完成
+        agg.ingest(call(now - 20_000, 5_000, 250, 50, 0, "c")); // 60 t/s，仍早于 now-1s
+        let s = agg.snapshot();
+        assert!((s.last_call_tps - 100.0).abs() < 1e-9);
+        // 平均速度与"上一轮"是两个口径：总 eff 800 / 总 11s ≠ 100
+        assert!((s.avg_tps - 800.0 / 11.0).abs() < 1e-9);
     }
 
     #[test]
