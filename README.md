@@ -7,7 +7,15 @@
 
 <p><img src="app-icon.png" width="96" alt="应用图标" /></p>
 
-**[⬇ 下载最新版 Release](https://github.com/Masterchiefm/zcode-speed-panel/releases/latest)**
+**手动安装**：[⬇ 下载最新版 Release](https://github.com/Masterchiefm/zcode-speed-panel/releases/latest)
+
+**让 ZCode 自动安装**：
+
+```text
+请自行阅读https://github.com/Masterchiefm/zcode-speed-panel ，为用户安装。如果网络不好，善用代理或者ghproxy镜像。
+```
+
+复制以上内容让 ZCode 帮你直接安装。
 
 ## 截图
 
@@ -20,6 +28,10 @@
 | 桌宠（悬停气泡：实时速度 / 上轮均速） | 迷你仪表（弧线随速度分档变色） |
 |---|---|
 | ![桌宠](docs/images/pet.png) | ![迷你仪表](docs/images/mini-gauge.png) |
+
+实机场景：ZCode 桌面端工作中，桌宠悬浮在窗口旁，气泡实时显示当前速度与上轮均速（t/s 按六档变色）：
+
+![桌宠实机场景](docs/images/pet-in-action.png)
 
 ## 下载与安装
 
