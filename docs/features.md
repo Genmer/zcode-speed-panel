@@ -82,13 +82,13 @@
 
 轮询 `~/.zcode/v2/checkpoints/*/state.json`（2s 一拍）：
 
-- **接受事件**：`lastAcceptedManifestHash` 变化 = 快照工件被服务端接受，按 `lastCompressedSize.encryptedSizeBytes`（加密压缩后字节）计入当日累计；`recordedAt` 早于本地今日 0 点的不计（跨天去重守卫——同一哈希永远归属其记录当天）。**当日已接受工件带名单**（workspace/字节/记录时刻，封顶 100 条随 `speed-panel-net.json` 持久化、跨重启/回补保留）——状态行"今日 N 个"后直接列出工作区名（>4 个折叠为"等 N 个"），悬停看逐条明细，复制/导出报告同样包含。
+- **接受事件**：`lastAcceptedManifestHash` 变化 = 快照工件被服务端接受，按 `lastCompressedSize.encryptedSizeBytes`（加密压缩后字节）计入当日累计；`recordedAt` 早于本地今日 0 点的不计（跨天去重守卫——同一哈希永远归属其记录当天）。**当日已接受工件带名单**（workspace/字节/记录时刻，封顶 100 条随 `speed-panel-net.json` 持久化、跨重启/回补保留）——状态行「今日 N 个」下方逐行列出工作区名单（按工作区聚合，件数 >1 时附「n 个 · 字节小计」；该工作区最新工件越近排越前——回补扫描顺序不保证按时间，取组内最大 recordedMs 排序；悬停名单行看该工作区今日逐条明细），复制/导出报告同样包含。
 - **上传进行中**：任一 workspace 的 `activeUpload` 非空 → 状态行脉冲提示「快照上传进行中」。
 - **回补**：当日首次启动时，把 recordedAt 在今天、但面板未在场观测到的接受按当前 `lastCompressedSize` 回补计入（面板今天已运行过则只建基线不回补）。
 - **口径为面板观测期**：面板未运行期间的接受只在上述回补时计入；两拍之间的多次跳变按末态计（下界）。
 - **目录状态**：`ok` / `missing`（无目录）/ `blocked`（不可读——用户用 ACL 封锁 checkpoints 后的如实显示，此时监控不到新上传）。
 - 事件同时写调试日志（`kind:"net"`，`ev`=ckpt_accepted / ckpt_upload_start / ckpt_upload_end，含 `mb` 与 `ws` 工作区名）。
-- **快照上传记录列表**（卡片右栏；窄窗口 <860px 退回单栏）：每个 workspace 一行 = 记录时间（今天 HH:MM，跨天 MM-DD HH:MM）/ 工作区名（workspacePath 末段）/ 加密后大小 / 状态（**上传中 ⬆ / 待传 / 已接受 ✓**），排序 = 上传中 > 待传 > 已接受（同状态按记录时刻倒序），**不截断行数，固定限高 168px 内部上下滚动看完**（不把页面整页撑开；`ckpt_rows` 纯函数，测试 `ckpt_rows_sorted_all_workspaces` 守护）。列表读的是 checkpoints 实况（state.json 只保留各工作区最近一次工件，更早历史不可考），面板未运行期间的最后状态启动即见。
+- **快照上传记录列表**（卡片右栏；窄窗口 <860px 退回单栏）：每个 workspace 一行 = 记录时间（今天 HH:MM，跨天 MM-DD HH:MM）/ 工作区名（workspacePath 末段）/ 加密后大小 / 状态（**上传中 ⬆ / 待传 / 已接受 ✓**），排序 = 上传中 > 待传 > 已接受（同状态按记录时刻倒序），**固定显示 7 行（行高 18px：7×18 + 6×2 间隙 = 138px 限高），其余列表内上下滚动看完**（不把页面整页撑开；`ckpt_rows` 纯函数，测试 `ckpt_rows_sorted_all_workspaces` 守护）。列表读的是 checkpoints 实况（state.json 只保留各工作区最近一次工件，更早历史不可考），面板未运行期间的最后状态启动即见。
 - **复制与导出**：列表文字可选中复制（全局 `user-select:none` 的例外区）；列表头有 **复制 / 导出** 按钮——复制把整份纯文本报告（表头 + 逐行记录 + 当日汇总 + ZCode 两组连接实况）写入剪贴板（`navigator.clipboard`，失败退回 `execCommand`），导出走 `export_text_file` 命令写入 `~/.zcode/speed-panel-exports/zcode快照上传记录-日期-时间.txt`（文件名白名单清洗防路径穿越，右下角轻提示完整路径；浏览器预览模式退化为浏览器下载）。
 
 ### ZCode 连接归属（真实值，仅 Windows）

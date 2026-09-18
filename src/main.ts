@@ -177,6 +177,7 @@ const netUpTodayEl = $("net-up-today");
 const netDownTodayEl = $("net-down-today");
 const netCkptInfo = $("net-ckpt-info");
 const netCkptText = $("net-ckpt-text");
+const netCkptNames = $("net-ckpt-names");
 const netCkptListHead = $("net-ckpt-list-head");
 const netCkptList = $("net-ckpt-list");
 const floatTps = $("float-tps");
@@ -234,34 +235,51 @@ function renderNet(s: Snapshot) {
       : "ZCode 桌面端进程当前无外连";
   }
 
-  // 快照上传状态行：上传中（脉冲）> blocked（ACL 封锁）> 今日有量 > 隐藏
+  // 快照上传状态行：上传中（脉冲）> blocked（ACL 封锁）> 今日有量 > 隐藏。
+  // 今日有量时状态行下方逐行列出工作区名单（不去重折叠），悬停看逐条明细
   if (s.netCkptUploading) {
     netCkptInfo.hidden = false;
     netCkptInfo.classList.add("uploading");
     netCkptText.textContent = "⬆ 快照上传进行中——工作区内容正整包加密上传";
+    netCkptNames.hidden = true;
   } else if (s.netCkptStatus === "blocked") {
     netCkptInfo.hidden = false;
     netCkptInfo.classList.remove("uploading");
     netCkptText.textContent = "checkpoints 目录不可读（可能已被 ACL 封锁，监控不到新上传）";
+    netCkptNames.hidden = true;
   } else if (s.netCkptStatus === "missing") {
     netCkptInfo.hidden = true;
     netCkptInfo.classList.remove("uploading");
+    netCkptNames.hidden = true;
   } else {
     netCkptInfo.hidden = s.netCkptToday === 0;
     netCkptInfo.classList.remove("uploading");
-    // 今日计数附带工件名单（去重工作区，超过 4 个折叠为"等 N 个"）；
-    // 悬停状态行看逐条明细（时间 · 工作区 · 大小）
+    netCkptText.textContent = `今日快照工件上传 ${fmtBytes(s.netCkptToday)}（${s.netCkptTodayCount} 个）`;
+    // 工作区名单：按工作区聚合今日工件（件数 >1 时附件数与字节小计），
+    // 该工作区最新工件越近排越前；每行悬停看该工作区今日逐条明细
     const todayList: CkptStat[] = s.netCkptTodayList ?? [];
-    const names: string[] = [];
+    const byWs = new Map<string, CkptStat[]>();
     for (const r of todayList) {
-      const n = r.workspace || "?";
-      if (!names.includes(n)) names.push(n);
+      const k = r.workspace || "?";
+      const arr = byWs.get(k);
+      if (arr) arr.push(r);
+      else byWs.set(k, [r]);
     }
-    const nameText =
-      names.length > 4 ? `${names.slice(0, 4).join("、")} 等 ${names.length} 个` : names.join("、");
-    netCkptText.textContent =
-      `今日快照工件上传 ${fmtBytes(s.netCkptToday)}（${s.netCkptTodayCount} 个）` +
-      (nameText ? `：${nameText}` : "");
+    netCkptNames.textContent = "";
+    netCkptNames.hidden = todayList.length === 0;
+    // 回补扫描顺序不保证按时间，取组内最大 recordedMs 当"最新"
+    const lastMs = (rows: CkptStat[]) => Math.max(...rows.map((r) => r.recordedMs));
+    const groups = [...byWs.entries()].sort((a, b) => lastMs(b[1]) - lastMs(a[1]));
+    for (const [ws, rows] of groups) {
+      const line = document.createElement("div");
+      line.className = "net-ckpt-name";
+      const bytes = rows.reduce((t, r) => t + r.bytes, 0);
+      line.textContent = `${ws} · ${rows.length > 1 ? `${rows.length} 个 · ` : ""}${fmtBytes(bytes)}`;
+      line.title = rows
+        .map((r) => `${fmtDayClock(r.recordedMs)} · ${fmtBytes(r.bytes)}`)
+        .join("\n");
+      netCkptNames.append(line);
+    }
     netCkptInfo.title = todayList.length
       ? `今日已接受的快照工件（${todayList.length} 个）：\n${todayList
           .map((r) => `${fmtDayClock(r.recordedMs)} · ${r.workspace || "?"} · ${fmtBytes(r.bytes)}`)
@@ -271,7 +289,7 @@ function renderNet(s: Snapshot) {
   netCkptPart.style.display = s.netCkptStatus === "ok" ? "" : "none";
 
   // 快照上传记录：每工作区最近一次工件（时间 / 工作区 / 加密后大小 / 状态），
-  // 上传中 > 待传 > 已接受排序（后端排好）。不截断行数，固定限高内部滚动
+  // 上传中 > 待传 > 已接受排序（后端排好）。固定显示 7 行，其余列表内滚动
   // 看完；文字可选中复制，另有 复制/导出 按钮（见 net-ckpt-tools）
   const ckptRows: CkptStat[] = s.netCkptList ?? [];
   netCkptList.textContent = "";
