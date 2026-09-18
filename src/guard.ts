@@ -130,11 +130,13 @@ export function initGuard(invoke: InvokeFn): void {
     if (action === "apply") {
       title.textContent = "开启快照防护？";
       okBtn.textContent = "确认开启";
-      // 用户明确要求的四点：损失检查点回滚 / 对话不受影响 / 删除现有快照（留档） / 可逆
+      // 知情同意要点（用户逐条要求）：损失检查点回滚 / 对话不受影响 /
+      // 删除现有快照且原始上传记录消失 / 自动备份但只备份清单（明细不备份）/ 可逆
       const lines = [
         "开启后将损失 **「检查点回滚 / 时间线」功能**——无法再回滚到历史检查点",
         "模型对话、代码补全、工具调用**不受任何影响**",
-        `将删除本地已积累的 ${latest.artifactCount} 个加密快照（共 ${fmtBytes(latest.artifactBytes)}）并锁定目录；删除前会把完整清单留档，防护期间仍可在上方列表回看`,
+        `将删除本地已积累的 ${latest.artifactCount} 个加密快照（共 ${fmtBytes(latest.artifactBytes)}）并锁定目录——**原始上传记录会随之消失**`,
+        "删除前会自动备份上传记录清单（时间 / 工作区 / 加密后大小 / 状态），防护期间可在上方列表回看；**只备份清单**——快照文件等明细不备份，删除后无法恢复",
         "随时可解除防护（目录会自动重建）",
       ];
       for (const raw of lines) {

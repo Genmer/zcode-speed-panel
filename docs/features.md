@@ -117,7 +117,7 @@ TCP 连接表（`GetExtendedTcpTable` OWNER_PID，v4+v6，仅 ESTABLISHED）按�
 - **先留档再清空**：apply 删除 checkpoints 前，把当时的上传记录行（每工作区最近一次快照，复用 netio 的解析与行构建，口径与实时列表一致）合并存入 ckpt-history.json——同工作区新行覆盖旧行、按时刻倒序、上限 500 行（`merge_history` 纯函数，测试守护）；重复开启/解除再开启不丢历史。
 - **防护原理与监控边界 hover**：卡片标题悬停展示机制说明（先落盘再上传 → 锁目录 = 断链路）+ 如实声明监控边界（锁状态每拍探测 / 已知机制下 0 新快照为阻断证据 / 整机流量兜底但 mac 无按进程归属，换直传机制只能靠流量异常发现）——不承诺 100% 拦截。
 - **术语**：用户可见文案统一「快照 / 加密快照」，不用内部黑话「工件」（2026-09-18 用户反馈"不要自己取名字"）。
-- **命令**：`snapshot_guard_status` / `snapshot_guard_apply` / `snapshot_guard_release`（均注册在 generate_handler）；状态另随 metrics payload 的 `guard` 字段每拍附带。apply = 先 nouchg（幂等）→ 清空 → 重建空目录 → uchg → 写入探测校验 → 记 guard.json；release = nouchg + 清空计数，目录内容留空由 ZCode 自动重建。**确认弹窗在前端**（`#guard-confirm`，复用模型弹窗遮罩风格）——开启文案必须明示损失检查点回滚 / 对话不受影响 / 删除现有工件 / 可逆（key-rules #16 知情同意）。
+- **命令**：`snapshot_guard_status` / `snapshot_guard_apply` / `snapshot_guard_release`（均注册在 generate_handler）；状态另随 metrics payload 的 `guard` 字段每拍附带。apply = 先 nouchg（幂等）→ 清空 → 重建空目录 → uchg → 写入探测校验 → 记 guard.json；release = nouchg + 清空计数，目录内容留空由 ZCode 自动重建。**确认弹窗在前端**（`#guard-confirm`，复用模型弹窗遮罩风格）——开启文案五点缺一不可：损失检查点回滚 / 对话不受影响 / 删除现有快照且原始上传记录随之消失 / 自动备份上传记录清单（只备份清单，快照文件等明细不备份、删后不可恢复）/ 可逆（key-rules #16 知情同意）。
 - **平台**：`chflags` 仅 macOS——其他平台卡片仍显示但按钮禁用、标题右侧标注"文件锁仅支持 macOS"（沿用连接明细"仅 Windows"的如实降级先例）。
 - **守护测试**：`state_summary_parse_and_aggregate`（failureCount 求和 / 工件体积累计 / 损坏容错）、`guard_status_serializes_locked_fields`（状态字段 camelCase 序列化契约 + guard.json 往返）。
 
