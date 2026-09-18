@@ -249,7 +249,24 @@ function renderNet(s: Snapshot) {
   } else {
     netCkptInfo.hidden = s.netCkptToday === 0;
     netCkptInfo.classList.remove("uploading");
-    netCkptText.textContent = `今日快照工件上传 ${fmtBytes(s.netCkptToday)}（${s.netCkptTodayCount} 个）`;
+    // 今日计数附带工件名单（去重工作区，超过 4 个折叠为"等 N 个"）；
+    // 悬停状态行看逐条明细（时间 · 工作区 · 大小）
+    const todayList: CkptStat[] = s.netCkptTodayList ?? [];
+    const names: string[] = [];
+    for (const r of todayList) {
+      const n = r.workspace || "?";
+      if (!names.includes(n)) names.push(n);
+    }
+    const nameText =
+      names.length > 4 ? `${names.slice(0, 4).join("、")} 等 ${names.length} 个` : names.join("、");
+    netCkptText.textContent =
+      `今日快照工件上传 ${fmtBytes(s.netCkptToday)}（${s.netCkptTodayCount} 个）` +
+      (nameText ? `：${nameText}` : "");
+    netCkptInfo.title = todayList.length
+      ? `今日已接受的快照工件（${todayList.length} 个）：\n${todayList
+          .map((r) => `${fmtDayClock(r.recordedMs)} · ${r.workspace || "?"} · ${fmtBytes(r.bytes)}`)
+          .join("\n")}`
+      : "";
   }
   netCkptPart.style.display = s.netCkptStatus === "ok" ? "" : "none";
 
@@ -301,6 +318,9 @@ function buildCkptReport(s: Snapshot): string {
   }
   lines.push("");
   lines.push(`今日快照工件上传：${fmtBytes(s.netCkptToday)}（${s.netCkptTodayCount} 个）`);
+  for (const r of s.netCkptTodayList ?? []) {
+    lines.push(`  ${fmtDayClock(r.recordedMs)}  ${(r.workspace || "?").padEnd(27).slice(0, 27)}  ${fmtBytes(r.bytes)}`);
+  }
   lines.push(`今日整机上传：${fmtBytes(s.netUpToday)} / 下载：${fmtBytes(s.netDownToday)}（全部应用）`);
   lines.push(`会话流量估算：上传 ≈${fmtBytes(s.netSessUpToday)} / 下载 ≈${fmtBytes(s.netSessDownToday)}`);
   if (s.netConnsAvailable) {

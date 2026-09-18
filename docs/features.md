@@ -82,7 +82,7 @@
 
 轮询 `~/.zcode/v2/checkpoints/*/state.json`（2s 一拍）：
 
-- **接受事件**：`lastAcceptedManifestHash` 变化 = 快照工件被服务端接受，按 `lastCompressedSize.encryptedSizeBytes`（加密压缩后字节）计入当日累计；`recordedAt` 早于本地今日 0 点的不计（跨天去重守卫——同一哈希永远归属其记录当天）。
+- **接受事件**：`lastAcceptedManifestHash` 变化 = 快照工件被服务端接受，按 `lastCompressedSize.encryptedSizeBytes`（加密压缩后字节）计入当日累计；`recordedAt` 早于本地今日 0 点的不计（跨天去重守卫——同一哈希永远归属其记录当天）。**当日已接受工件带名单**（workspace/字节/记录时刻，封顶 100 条随 `speed-panel-net.json` 持久化、跨重启/回补保留）——状态行"今日 N 个"后直接列出工作区名（>4 个折叠为"等 N 个"），悬停看逐条明细，复制/导出报告同样包含。
 - **上传进行中**：任一 workspace 的 `activeUpload` 非空 → 状态行脉冲提示「快照上传进行中」。
 - **回补**：当日首次启动时，把 recordedAt 在今天、但面板未在场观测到的接受按当前 `lastCompressedSize` 回补计入（面板今天已运行过则只建基线不回补）。
 - **口径为面板观测期**：面板未运行期间的接受只在上述回补时计入；两拍之间的多次跳变按末态计（下界）。
@@ -143,7 +143,7 @@ TCP 连接表（`GetExtendedTcpTable` OWNER_PID，v4+v6，仅 ESTABLISHED）按�
 |---|---|
 | `~/.zcode/speed-panel-mode.txt` | JSON：mode/style/full_pos/float_pos/pet_size（旧格式纯文本兼容） |
 | `~/.zcode/speed-panel-cal.json` | 系数样本队列（updated_ms + samples，超 14 天过期回先验；见"实时速度"节） |
-| `~/.zcode/speed-panel-net.json` | 网络当日累计（day/up/down/ckpt/ckpt_count，跨天清零；见"网络流量与上传监控"节） |
+| `~/.zcode/speed-panel-net.json` | 网络当日累计（day/up/down/ckpt/ckpt_count + 当日已接受工件名单 uploads，跨天清零；见"网络流量与上传监控"节） |
 | `~/.zcode/speed-panel-debug.jsonl` | 调试日志（8MB 轮转 + 7 天清理） |
 
 ## 应用内更新（updater.rs）

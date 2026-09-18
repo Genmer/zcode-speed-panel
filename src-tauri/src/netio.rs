@@ -137,6 +137,8 @@ pub struct NetNow {
     /// 当日接受的快照工件字节（加密压缩后，面板观测期下界）
     pub ckpt_today_bytes: u64,
     pub ckpt_today_count: u32,
+    /// 当日已接受工件名单（时间/工作区/大小——回答"是哪几个"）
+    pub ckpt_today_list: Vec<crate::metrics::CkptStat>,
     /// 快照上传记录（每工作区最近一次工件的实况，**不设行数上限**——
     /// 全部列出，前端列表限高滚动；上传中 > 待传 > 已接受，同状态按记录时刻倒序）
     pub ckpt_list: Vec<crate::metrics::CkptStat>,
@@ -710,6 +712,9 @@ pub(crate) struct CkptEvent {
     pub kind: &'static str,
     pub workspace: String,
     pub bytes: u64,
+    /// accepted 事件带工件记录时刻（recordedAt；上传起止事件为 0）——
+    /// 供"今日 N 个工件"名单的时间列显示
+    pub recorded_ms: i64,
 }
 
 /// 逐 workspace 应用一轮观测（纯函数，可测）：
@@ -742,6 +747,7 @@ pub(crate) fn apply_ckpt_obs(
                         kind: "accepted",
                         workspace: new.workspace.clone(),
                         bytes: new.artifact_bytes,
+                        recorded_ms: new.recorded_at.unwrap_or(0),
                     });
                 }
             }
@@ -751,6 +757,7 @@ pub(crate) fn apply_ckpt_obs(
                         kind: "accepted",
                         workspace: new.workspace.clone(),
                         bytes: new.artifact_bytes,
+                        recorded_ms: new.recorded_at.unwrap_or(0),
                     });
                 }
                 if !old.uploading && new.uploading {
@@ -758,10 +765,11 @@ pub(crate) fn apply_ckpt_obs(
                         kind: "upload_start",
                         workspace: new.workspace.clone(),
                         bytes: new.artifact_bytes,
+                        recorded_ms: 0,
                     });
                 } else if old.uploading && !new.uploading {
                     // 结束时刻不判成功失败：接受与否由 accepted_hash 差分判定
-                    events.push(CkptEvent { kind: "upload_end", workspace: new.workspace.clone(), bytes: 0 });
+                    events.push(CkptEvent { kind: "upload_end", workspace: new.workspace.clone(), bytes: 0, recorded_ms: 0 });
                 }
             }
         }
@@ -811,6 +819,9 @@ pub struct NetIo {
     down_today: u64,
     ckpt_today_bytes: u64,
     ckpt_today_count: u32,
+    /// 当日已接受工件名单（workspace/bytes/recorded_ms；跨天清零、随
+    /// speed-panel-net.json 持久化）——"今日 N 个工件"要能看出是哪几个
+    today_uploads: Vec<crate::metrics::CkptStat>,
     /// pid → 进程类型标签（"CLI 会话进程"/"主进程"/"渲染进程"/…）
     cli_pids: HashMap<u32, String>,
     app_pids: HashMap<u32, String>,
@@ -837,6 +848,7 @@ impl NetIo {
             down_today: 0,
             ckpt_today_bytes: 0,
             ckpt_today_count: 0,
+            today_uploads: Vec::new(),
             cli_pids: HashMap::new(),
             app_pids: HashMap::new(),
             proc_refresh: None,
@@ -874,6 +886,21 @@ impl NetIo {
         self.down_today = v.get("down").and_then(|x| x.as_u64()).unwrap_or(0);
         self.ckpt_today_bytes = v.get("ckpt").and_then(|x| x.as_u64()).unwrap_or(0);
         self.ckpt_today_count = v.get("ckpt_count").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+        self.today_uploads = v.get("uploads")
+            .and_then(|x| x.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .take(100)
+                    .map(|u| crate::metrics::CkptStat {
+                        workspace: u.get("ws").and_then(|x| x.as_str()).unwrap_or("?").to_string(),
+                        bytes: u.get("bytes").and_then(|x| x.as_u64()).unwrap_or(0),
+                        recorded_ms: u.get("at").and_then(|x| x.as_i64()).unwrap_or(0),
+                        accepted: true,
+                        uploading: false,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         false
     }
 
@@ -891,6 +918,10 @@ impl NetIo {
                 "down": self.down_today,
                 "ckpt": self.ckpt_today_bytes,
                 "ckpt_count": self.ckpt_today_count,
+                // 当日已接受工件名单（旧版文件无此键 → 空名单，只有累计数）
+                "uploads": self.today_uploads.iter().map(|u| serde_json::json!({
+                    "ws": u.workspace, "bytes": u.bytes, "at": u.recorded_ms,
+                })).collect::<Vec<_>>(),
             });
             if let Err(e) = std::fs::write(&path, json.to_string()) {
                 eprintln!("[zcode-speed-panel] net 累计落盘失败: {e}");
@@ -932,6 +963,16 @@ impl NetIo {
                 "accepted" => {
                     self.ckpt_today_bytes += ev.bytes;
                     self.ckpt_today_count += 1;
+                    self.today_uploads.push(crate::metrics::CkptStat {
+                        workspace: ev.workspace.clone(),
+                        bytes: ev.bytes,
+                        recorded_ms: ev.recorded_ms,
+                        accepted: true,
+                        uploading: false,
+                    });
+                    while self.today_uploads.len() > 100 {
+                        self.today_uploads.remove(0);
+                    }
                     self.dirty = true;
                     self.pending_events.push_back(serde_json::json!({
                         "kind": "net", "ev": "ckpt_accepted", "ws": ws,
@@ -973,6 +1014,7 @@ impl NetIo {
             self.down_today = 0;
             self.ckpt_today_bytes = 0;
             self.ckpt_today_count = 0;
+            self.today_uploads.clear();
             self.dirty = true;
         }
 
@@ -1079,6 +1121,7 @@ impl NetIo {
             ckpt_uploading: self.ckpt_uploading,
             ckpt_today_bytes: self.ckpt_today_bytes,
             ckpt_today_count: self.ckpt_today_count,
+            ckpt_today_list: self.today_uploads.clone(),
             ckpt_list: ckpt_rows(&self.ckpt_states),
         }
     }
@@ -1151,7 +1194,7 @@ mod tests {
         assert!(ev.is_empty());
         // 拍 2：接受（recordedAt 今天）→ 计数 + 事件
         let ev = apply_ckpt_obs(&mut states, vec![("a".into(), mk(Some("h"), 100, day_start + 5, false))], day_start, false);
-        assert_eq!(ev, vec![CkptEvent { kind: "accepted", workspace: "ws".into(), bytes: 100 }]);
+        assert_eq!(ev, vec![CkptEvent { kind: "accepted", workspace: "ws".into(), bytes: 100, recorded_ms: day_start + 5 }]);
         // 拍 3：无变化 → 无事件
         let ev = apply_ckpt_obs(&mut states, vec![("a".into(), mk(Some("h"), 100, day_start + 5, false))], day_start, false);
         assert!(ev.is_empty());
@@ -1161,9 +1204,9 @@ mod tests {
         assert_eq!(ev[0].bytes, 250);
         // 上传开始/结束：事件不计数
         let ev = apply_ckpt_obs(&mut states, vec![("a".into(), mk(Some("h2"), 250, day_start + 9, true))], day_start, false);
-        assert_eq!(ev, vec![CkptEvent { kind: "upload_start", workspace: "ws".into(), bytes: 250 }]);
+        assert_eq!(ev, vec![CkptEvent { kind: "upload_start", workspace: "ws".into(), bytes: 250, recorded_ms: 0 }]);
         let ev = apply_ckpt_obs(&mut states, vec![("a".into(), mk(Some("h2"), 250, day_start + 9, false))], day_start, false);
-        assert_eq!(ev, vec![CkptEvent { kind: "upload_end", workspace: "ws".into(), bytes: 0 }]);
+        assert_eq!(ev, vec![CkptEvent { kind: "upload_end", workspace: "ws".into(), bytes: 0, recorded_ms: 0 }]);
         // 昨天的接受（recordedAt < 今日 0 点）不计数——跨天去重
         let mut states2 = HashMap::new();
         let ev = apply_ckpt_obs(&mut states2, vec![("b".into(), mk(Some("old"), 999, day_start - 1, false))], day_start, false);
@@ -1171,7 +1214,7 @@ mod tests {
         // 全新一天的首扫回补：今天记录的接受要计（count=true）
         let mut states3 = HashMap::new();
         let ev = apply_ckpt_obs(&mut states3, vec![("c".into(), mk(Some("n"), 42, day_start + 1, false))], day_start, true);
-        assert_eq!(ev, vec![CkptEvent { kind: "accepted", workspace: "ws".into(), bytes: 42 }]);
+        assert_eq!(ev, vec![CkptEvent { kind: "accepted", workspace: "ws".into(), bytes: 42, recorded_ms: day_start + 1 }]);
         // 面板今天运行过（count=false）的首见不回补
         let mut states4 = HashMap::new();
         let ev = apply_ckpt_obs(&mut states4, vec![("d".into(), mk(Some("n"), 42, day_start + 1, false))], day_start, false);

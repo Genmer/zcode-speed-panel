@@ -127,6 +127,8 @@ pub struct Snapshot {
     /// 当日接受的快照工件字节（非会话上传的真实下界，加密压缩后）
     pub net_ckpt_today: u64,
     pub net_ckpt_today_count: u32,
+    /// 当日已接受工件名单（时间/工作区/大小——回答"是哪几个"，跨重启持久化）
+    pub net_ckpt_today_list: Vec<CkptStat>,
     /// 是否有快照上传进行中（activeUpload）
     pub net_ckpt_uploading: bool,
     /// checkpoints 目录状态：ok / missing / blocked（ACL 封锁）
@@ -361,6 +363,7 @@ impl Aggregator {
             net_sess_down_today: 0,
             net_ckpt_today: 0,
             net_ckpt_today_count: 0,
+            net_ckpt_today_list: Vec::new(),
             net_ckpt_uploading: false,
             net_ckpt_status: String::new(),
             net_ckpt_list: Vec::new(),

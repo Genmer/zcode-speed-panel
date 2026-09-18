@@ -473,6 +473,7 @@ fn build_payload(app: &AppHandle) -> SnapshotPayload {
     snapshot.net_sess_down_today = sess_down;
     snapshot.net_ckpt_today = net_now.ckpt_today_bytes;
     snapshot.net_ckpt_today_count = net_now.ckpt_today_count;
+    snapshot.net_ckpt_today_list = net_now.ckpt_today_list.clone();
     snapshot.net_ckpt_uploading = net_now.ckpt_uploading;
     snapshot.net_ckpt_status = net_now.ckpt_status.clone();
     snapshot.net_ckpt_list = net_now.ckpt_list.clone();

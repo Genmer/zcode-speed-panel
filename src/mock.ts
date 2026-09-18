@@ -65,6 +65,8 @@ export interface Snapshot {
   netSessDownToday: number;
   netCkptToday: number;
   netCkptTodayCount: number;
+  /** 当日已接受工件名单（时间/工作区/大小） */
+  netCkptTodayList: CkptStat[];
   netCkptUploading: boolean;
   netCkptStatus: string;
   /** 快照上传记录（每工作区最近一次工件实况） */
@@ -250,8 +252,14 @@ function snapshot(now: number, pending: MockCall | null): Snapshot {
     // 与后端同口径：上传按未缓存提示（input−cache_read）×5，下载按输出 ×400
     netSessUpToday: Math.max(0, input - cache) * 5,
     netSessDownToday: out * 400,
-    netCkptToday: 549.2 * 1048576,
-    netCkptTodayCount: 1,
+    // 与实机同款：今日 3 个工件（1GB 大件 + 两个 KB 级小件）
+    netCkptToday: 1024.0 * 1048576 + 990 + 1013,
+    netCkptTodayCount: 3,
+    netCkptTodayList: [
+      { workspace: "GenePad-free", bytes: 1024.0 * 1048576, recordedMs: now - 7 * 3600_000, accepted: true, uploading: false },
+      { workspace: "default", bytes: 990, recordedMs: now - 16 * 3600_000, accepted: true, uploading: false },
+      { workspace: "zcode-speed-panel", bytes: 1013, recordedMs: now - 5 * 3600_000, accepted: true, uploading: false },
+    ],
     netCkptUploading: mockCkptUploading,
     netCkptStatus: "ok",
     // 快照上传记录模拟：上传中 > 待传 > 已接受（含跨天记录演示月日显示）
