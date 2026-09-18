@@ -1,5 +1,7 @@
 // 浏览器预览模式：模拟 ZCode 的 model-io 调用流，便于无 Tauri 环境下预览 UI
 
+import type { GuardStatus } from "./guard";
+
 /** 分任务实时明细（多任务并发时才有多个）：一个 CLI 进程 = 一行 */
 export interface TaskStat {
   pid: number;
@@ -77,6 +79,8 @@ export interface Snapshot {
   /** 连接明细（每条含远端 + 归属 pid + 进程类型标签） */
   netCliConnList: ConnStat[];
   netAppConnList: ConnStat[];
+  /** 快照防护状态（snapshot_guard.rs；mock/浏览器预览无此字段 → 按未防护渲染） */
+  guard?: GuardStatus;
 }
 
 interface MockCall {

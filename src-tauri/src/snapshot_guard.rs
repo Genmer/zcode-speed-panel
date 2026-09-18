@@ -19,9 +19,11 @@
 //!   即已锁。纯 std 实现，比解析 `ls -lO` / libc `st_flags` 干净；
 //! - **知情同意在前端**（`#guard-confirm` 确认弹窗必须明示损失检查点回滚，
 //!   见 key-rules #16）；apply/release 收到调用即执行、不再二次确认；
-//! - **防护计数**：锁定时刻与 calls_today 基线持久化在
+//! - **防护计数**：锁定时刻与 calls 基线持久化在
 //!   `~/.zcode/speed-panel-guard.json`；poller 每拍按 calls 增量累计
-//!   `blocked_rounds`（calls_today 跨天回退按 0 增量重置基准拍）；
+//!   `blocked_rounds`，**基准 calls_seen 一并落盘**——否则重启后内存
+//!   last_calls 归零，首拍会把全天计数整包计入（实测 15 分钟虚增至 3412）；
+//!   跨天回退按 0 增量重置基准拍；
 //! - **目录已锁但无记录**（用户看过文档后手动 chflags / 重装面板）：首拍
 //!   探测到即补记基线，从该时刻起算轮次；
 //! - **仅 macOS**：Windows 无等价的用户级不可变标志，`supported=false`，
@@ -105,7 +107,8 @@ pub(crate) fn summarize_scans(scans: &[(Option<StateSummary>, Vec<u64>)]) -> Sca
 }
 
 /// guard.json（~/.zcode/speed-panel-guard.json）：锁定时刻 + calls 基线 +
-/// 累计轮次。锁定三字段缺省即"未防护"，不落盘多余键
+/// 累计轮次 + 最近一拍 calls_seen（重启后增量基准，防全天计数整包计入）。
+/// 锁定四字段缺省即"未防护"，不落盘多余键
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct GuardFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -114,6 +117,14 @@ struct GuardFile {
     calls_baseline: Option<u64>,
     #[serde(default)]
     blocked_rounds: u64,
+    #[serde(default)]
+    calls_seen: u64,
+}
+
+/// blocked_rounds 增量累计（纯函数，可测）：以**持久化的** calls_seen 为基准
+/// （而非内存 last_calls——重启归零会把全天计数整包计入），跨天回退饱和为 0
+pub(crate) fn accrue_rounds(blocked: u64, calls_seen: u64, calls_today: u64) -> (u64, u64) {
+    (blocked + calls_today.saturating_sub(calls_seen), calls_today)
 }
 
 fn checkpoints_dir() -> Option<PathBuf> {
@@ -215,9 +226,13 @@ pub struct SnapshotGuard {
 
 impl SnapshotGuard {
     pub fn new() -> Self {
+        let file = load_guard_file();
+        // 增量基准从 guard.json 恢复：重启后首拍 delta = 真实增量，
+        // 而不是 calls_today - 0（全天计数整包计入 blocked_rounds）
+        let last_calls = file.calls_seen;
         SnapshotGuard {
-            file: load_guard_file(),
-            last_calls: 0,
+            file,
+            last_calls,
             scan: ScanSummary::default(),
             last_scan: None,
         }
@@ -255,16 +270,26 @@ impl SnapshotGuard {
                 self.file.locked_since_ms = Some(now_ms);
                 self.file.calls_baseline = Some(calls_today);
                 self.last_calls = calls_today;
+                self.file.calls_seen = calls_today;
                 save_guard_file(&self.file);
             } else {
                 // calls_today 当日只增；跨天回退（saturating 后为 0 增量）
-                // 并重置基准拍，从新一天的计数继续累加
-                let delta = calls_today.saturating_sub(self.last_calls);
-                if delta > 0 {
-                    self.file.blocked_rounds += delta;
+                // 并重置基准拍，从新一天的计数继续累加。基准用持久化的
+                // calls_seen（new() 已恢复进 last_calls），重启不吃全天计数
+                let (blocked, seen) = accrue_rounds(
+                    self.file.blocked_rounds,
+                    self.last_calls,
+                    calls_today,
+                );
+                self.last_calls = seen;
+                if blocked != self.file.blocked_rounds {
+                    self.file.blocked_rounds = blocked;
+                    self.file.calls_seen = seen;
+                    save_guard_file(&self.file);
+                } else if self.file.calls_seen != seen {
+                    self.file.calls_seen = seen;
                     save_guard_file(&self.file);
                 }
-                self.last_calls = calls_today;
             }
         } else {
             self.last_calls = calls_today;
@@ -304,6 +329,7 @@ impl SnapshotGuard {
             locked_since_ms: Some(now_ms),
             calls_baseline: Some(calls_today),
             blocked_rounds: 0,
+            calls_seen: calls_today,
         };
         self.last_calls = calls_today;
         self.scan = ScanSummary::default();
@@ -392,12 +418,25 @@ mod tests {
         assert_eq!(def["locked"], false);
         assert_eq!(def["lockedSinceMs"], serde_json::Value::Null);
 
-        // guard.json 往返：锁定三字段保留；空对象全缺省；默认实例不落多余键
-        let f = GuardFile { locked_since_ms: Some(123), calls_baseline: Some(456), blocked_rounds: 7 };
+        // guard.json 往返：锁定字段保留（含 calls_seen 增量基准）；空对象全缺省；
+        // 默认实例不落多余键
+        let f = GuardFile { locked_since_ms: Some(123), calls_baseline: Some(456), blocked_rounds: 7, calls_seen: 456 };
         let round: GuardFile = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
         assert_eq!(round, f);
         let empty: GuardFile = serde_json::from_str("{}").unwrap();
         assert_eq!(empty, GuardFile::default());
         assert!(!serde_json::to_string(&GuardFile::default()).unwrap().contains("lockedSinceMs"));
+    }
+
+    /// 增量累计：正常增量相加、跨天回退饱和为 0、基准为持久化 calls_seen
+    /// （重启场景 delta 只算真实增量，不吃全天计数——事故：15 分钟虚增 3412）
+    #[test]
+    fn accrue_rounds_counts_real_delta_only() {
+        assert_eq!(accrue_rounds(5, 100, 120), (25, 120)); // 正常 +20
+        assert_eq!(accrue_rounds(5, 200, 50), (5, 50)); // 跨天回退：0 增量，重置基准
+        // 重启：calls_seen 持久化 456，重启后首拍 calls_today 470 → 只 +14
+        // （旧 bug：内存归零 → 470 - 0 = +470）
+        assert_eq!(accrue_rounds(0, 456, 470), (14, 470));
+        assert_eq!(accrue_rounds(0, 0, 0), (0, 0));
     }
 }

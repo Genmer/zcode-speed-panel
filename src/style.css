@@ -582,6 +582,28 @@ main {
   font-weight: 600;
 }
 
+/* 防护开启后的历史行（今日防护前已上传的工件）：整体压暗，与实时记录区分 */
+.ckpt-row.history {
+  opacity: 0.62;
+}
+
+/* 列表空态占位：防护中 = 锁横幅（琥珀），平时 = 灰字提示。
+   没有它右栏会整块消失，网络卡右侧变成大片空白 */
+.ckpt-empty {
+  color: var(--dim);
+  font-size: 12px;
+  text-align: center;
+  padding: 14px 6px;
+}
+
+.ckpt-empty.locked {
+  color: #fbbf24;
+  padding: 8px 6px;
+  border: 1px dashed rgba(251, 191, 36, 0.35);
+  border-radius: 6px;
+  text-align: left;
+}
+
 footer {
   display: flex;
   gap: 18px;
@@ -1383,16 +1405,19 @@ body.float-mode #model-modal {
   line-height: 1.7;
 }
 
+/* 要点行必须是块级文本流：句内 <b> 加粗段会换行回流。曾用 flex 摆 bullet，
+   把 span/b 拆成不换行的独立子项、长句互相挤压错位（用户看到的"乱码"） */
 .guard-confirm-text p {
   margin: 6px 0;
-  display: flex;
-  gap: 8px;
+  padding-left: 13px;
+  position: relative;
 }
 
 .guard-confirm-text p::before {
   content: "•";
   color: var(--dim);
-  flex: none;
+  position: absolute;
+  left: 0;
 }
 
 .guard-confirm-actions {

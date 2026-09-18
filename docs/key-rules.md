@@ -121,6 +121,9 @@
 
 「开启防护」（snapshot_guard.rs 的 apply）会**删除本地全部快照工件并锁定 `~/.zcode/v2/checkpoints/`**（`chflags uchg`）。用户明确要求：执行前必须弹确认窗（前端 `#guard-confirm`）并**明示损失「检查点回滚 / 时间线」功能**、明示"模型对话/补全/工具调用不受任何影响"、明示删除的工件数量与体积、明示可逆——这是知情同意的固定文案，改弹窗时四点缺一不可。后端 apply/release 收到调用即执行、不做二次确认（防弹窗被绕过后语义分裂）；「解除防护」同样过确认弹窗（简短版）。
 - **不能封网络**：快照上传凭证 API 与模型 API 同域，网络层拦截会打断对话；唯一安全解是文件系统不可变锁（目录写不进 → 快照链路死亡），见 features.md「快照防护」。
-- **锁定判定与幂等**：apply 必须先 `chflags nouchg` 再清空重建（重复开启/目录已锁时直接 remove 会失败）；锁定后用写入探测（create+delete 临时文件失败 = 已锁）校验生效并作为每拍的状态来源——guard.json 只是计数（锁定时刻 + calls 基线 + 累计轮次），**目录实际状态以探测为准**（外部解锁时 poller 清档如实反映）。
+- **锁定判定与幂等**：apply 必须先 `chflags nouchg` 再清空重建（重复开启/目录已锁时直接 remove 会失败）；锁定后用写入探测（create+delete 临时文件失败 = 已锁）校验生效并作为每拍的状态来源——guard.json 只是计数（锁定时刻 + calls 基线 + 累计轮次 + calls_seen 基准），**目录实际状态以探测为准**（外部解锁时 poller 清档如实反映）。
+- **增量计数基准必须落盘（2026-09-18 事故：15 分钟虚增 3412 轮）**：blocked_rounds 按 calls_today 差分累计，但基准只存在内存（`last_calls`）时**重启即归零**，首拍把全天计数整包计入——每重启一次虚增一次。修法：基准 `calls_seen` 持久化进 guard.json，`new()` 恢复，差分走纯函数 `accrue_rounds`（测试 `accrue_rounds_counts_real_delta_only` 守护"重启只算真实增量"）。任何"差分累计"类计数同理：**跨重启的基准要么落盘、要么重扫全量对齐，不能悬在内存里**。
+- **防护与上传记录必须联动（同日二次事故）**：apply 清空 checkpoints 后磁盘扫描必为空——上传记录列表若按"空就整块隐藏"处理，网络卡右栏变 70% 空白（用户以为坏了）。修法：列表为空给占位（防护中 = 🔒 锁横幅 + 今日防护前历史行「已上传 ✓」；平时 = "暂无快照记录"），net 状态行在 locked 时切 🔒 分支（今日量标注"防护前"）。**"数据源被自己删掉"的 UI 必须显式表达因果，不能静默空白**。
+- **确认弹窗文案排版禁用 flex（同日"乱码"事故）**：要点行内嵌 `<b>` 加粗段时，`p{display:flex}` 会把 span/b 拆成不换行的独立子项，长句互相挤压错位、看似乱码。弹窗/文案段落一律块级文本流（bullet 用 `::before` 绝对定位 + padding-left）。
 - **平台如实降级**：chflags 仅 macOS，其他平台卡片显示但按钮禁用 + "文件锁仅支持 macOS"（沿用 netio"连接明细仅 Windows"先例，不假装支持）。
-- 守护测试：`state_summary_parse_and_aggregate`、`guard_status_serializes_locked_fields`（含 guard.json 往返与"未防护不落多余键"）。
+- 守护测试：`state_summary_parse_and_aggregate`、`guard_status_serializes_locked_fields`（含 guard.json 往返与"未防护不落多余键"）、`accrue_rounds_counts_real_delta_only`。

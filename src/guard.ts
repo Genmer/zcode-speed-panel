@@ -56,9 +56,12 @@ export function renderGuard(g: GuardStatus | null): void {
   if (!g.supported) {
     e.scope.textContent = "文件锁仅支持 macOS";
   }
-  e.stats.textContent =
-    `已积累工件 ${g.artifactCount} 个 · ${fmtBytes(g.artifactBytes)} · ` +
-    `覆盖 ${g.workspaceCount} 个工作区 · ZCode 记录上传失败 ${g.failureCount} 次`;
+  // 防护生效时目录已清空，"已积累工件 0 个 · 0 B"没有信息量且像故障——
+  // 换成生效语义；未防护时保留扫描统计（那是 ZCode 已落盘的真实库存）
+  e.stats.textContent = g.locked
+    ? "防护生效中：快照目录已清空并锁定，ZCode 写不进任何新快照（历史工件已随开启删除）"
+    : `已积累工件 ${g.artifactCount} 个 · ${fmtBytes(g.artifactBytes)} · ` +
+      `覆盖 ${g.workspaceCount} 个工作区 · ZCode 记录上传失败 ${g.failureCount} 次`;
   // 防护后追加行：开启以来的对话轮次（锁定期间目录不可写，新快照恒为 0）
   if (g.locked) {
     e.rounds.hidden = false;

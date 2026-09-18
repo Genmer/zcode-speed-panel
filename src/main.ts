@@ -243,8 +243,17 @@ function renderNet(s: Snapshot) {
       : "ZCode 桌面端进程当前无外连";
   }
 
-  // 快照上传状态行：上传中（脉冲）> blocked（ACL 封锁）> 今日有量 > 隐藏
-  if (s.netCkptUploading) {
+  // 快照上传状态行：防护锁定 > 上传中（脉冲）> blocked（ACL 封锁）> 今日有量 > 隐藏。
+  // 防护开启时目录已清空，不可能有"上传中"；今日量是防护开启前的真实历史
+  if (s.guard?.locked) {
+    netCkptInfo.hidden = false;
+    netCkptInfo.classList.remove("uploading");
+    netCkptText.textContent =
+      s.netCkptToday > 0
+        ? `🔒 防护已开启 · 新快照落盘被阻断（今日防护前已上传 ${fmtBytes(s.netCkptToday)} · ${s.netCkptTodayCount} 个）`
+        : "🔒 防护已开启 · 新快照落盘被阻断";
+    netCkptInfo.title = "";
+  } else if (s.netCkptUploading) {
     netCkptInfo.hidden = false;
     netCkptInfo.classList.add("uploading");
     netCkptText.textContent = "⬆ 快照上传进行中——工作区内容正整包加密上传";
@@ -281,13 +290,15 @@ function renderNet(s: Snapshot) {
 
   // 快照上传记录：每工作区最近一次工件（时间 / 工作区 / 加密后大小 / 状态），
   // 上传中 > 待传 > 已接受排序（后端排好）。不截断行数，固定限高内部滚动
-  // 看完；文字可选中复制，另有 复制/导出 按钮（见 net-ckpt-tools）
+  // 看完；文字可选中复制，另有 复制/导出 按钮（见 net-ckpt-tools）。
+  // 列表为空时右栏不能整块消失（防护清空目录后曾变 70% 空白）：
+  // 防护中给锁横幅 + 今日防护前的真实历史；平时给"暂无记录"占位
   const ckptRows: CkptStat[] = s.netCkptList ?? [];
   netCkptList.textContent = "";
-  netCkptListHead.style.display = ckptRows.length > 0 ? "" : "none";
-  for (const r of ckptRows) {
+  netCkptListHead.style.display = "";
+  const appendRow = (r: CkptStat, cls: string, stText: string) => {
     const row = document.createElement("div");
-    row.className = r.uploading ? "ckpt-row uploading" : r.accepted ? "ckpt-row" : "ckpt-row pending";
+    row.className = cls;
     const time = document.createElement("span");
     time.className = "ckpt-time";
     time.textContent = fmtDayClock(r.recordedMs);
@@ -299,9 +310,28 @@ function renderNet(s: Snapshot) {
     size.textContent = fmtBytes(r.bytes);
     const st = document.createElement("span");
     st.className = "ckpt-st";
-    st.textContent = r.uploading ? "上传中 ⬆" : r.accepted ? "已接受 ✓" : "待传";
+    st.textContent = stText;
     row.append(time, ws, size, st);
     netCkptList.append(row);
+  };
+  if (ckptRows.length > 0) {
+    for (const r of ckptRows) {
+      appendRow(r, r.uploading ? "ckpt-row uploading" : r.accepted ? "ckpt-row" : "ckpt-row pending",
+        r.uploading ? "上传中 ⬆" : r.accepted ? "已接受 ✓" : "待传");
+    }
+  } else if (s.guard?.locked) {
+    const banner = document.createElement("div");
+    banner.className = "ckpt-empty locked";
+    banner.textContent = "🔒 防护已开启 · 快照目录已清空并锁定，ZCode 无法落盘新快照";
+    netCkptList.append(banner);
+    for (const r of s.netCkptTodayList ?? []) {
+      appendRow(r, "ckpt-row history", "已上传 ✓");
+    }
+  } else {
+    const empty = document.createElement("div");
+    empty.className = "ckpt-empty";
+    empty.textContent = "暂无快照记录（ZCode 未产生工作区快照工件）";
+    netCkptList.append(empty);
   }
   lastCkptReport = buildCkptReport(s);
   netScope.textContent = s.netConnsAvailable ? "整机 = 本机全部应用流量（非仅 ZCode）" : "整机 = 本机全部应用流量";
@@ -852,7 +882,7 @@ if (hasTauri) {
   (async () => {
     const { listen } = await import("@tauri-apps/api/event");
     await listen<SnapshotPayload>("metrics", (e) => {
-      onSnapshot({ ...e.payload.snapshot, rolloutDir: e.payload.rolloutDir });
+      onSnapshot({ ...e.payload.snapshot, rolloutDir: e.payload.rolloutDir, guard: e.payload.guard });
       renderGuard(e.payload.guard ?? null);
     });
     await listen<string>("mode", (e) => applyModeUi(e.payload));
@@ -871,7 +901,7 @@ if (hasTauri) {
         localStorage.setItem("floatStyle", p.floatStyle);
         applyStyleUi(p.floatStyle);
       }
-      onSnapshot({ ...p.snapshot, rolloutDir: p.rolloutDir });
+      onSnapshot({ ...p.snapshot, rolloutDir: p.rolloutDir, guard: p.guard });
       renderGuard(p.guard ?? null);
     }
     // mac 启动引导（一次性）：页面就绪后主动领取，避免 setup 内 emit 早于加载被丢弃
