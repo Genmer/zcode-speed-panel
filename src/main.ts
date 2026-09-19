@@ -371,7 +371,7 @@ function renderNet(s: Snapshot) {
   } else if (s.guard?.locked) {
     const banner = document.createElement("div");
     banner.className = "ckpt-empty locked";
-    banner.textContent = "🔒 防护已开启 · 快照目录已清空并锁定，ZCode 无法落盘新快照。以下为防护前的原上传记录（留档可回看）：";
+    banner.textContent = "🔒 防护已开启 · 快照目录已清空并锁定。以下为防护前的原上传记录";
     netCkptList.append(banner);
     // 防护前留档（apply 清空前保存）；旧版本未留档时退回今日已上传名单
     const history: CkptStat[] = s.guard.history?.length ? s.guard.history : s.netCkptTodayList ?? [];
@@ -924,10 +924,9 @@ if (hasTauri) {
     currentWindow().then((w) => w.minimize()).catch(() => {});
   });
   $("wc-max").addEventListener("click", () => {
-    // mac 绿色交通灯 = 原生全屏（符合 mac 语言，所在屏进出）；Windows ▢ =
-    // 安全最大化（双击顶栏同款）。mac 的"铺满当前屏"走双击顶栏
-    if (isMac) tauriInvoke("toggle_fullscreen").catch(() => {});
-    else tauriInvoke("toggle_maximize_safe").catch(() => {});
+    // mac 用原生 Overlay 标题栏（真交通灯，绿点=原生全屏），此按钮已隐藏；
+    // Windows ▢ = 安全最大化（与双击顶栏同款）
+    tauriInvoke("toggle_maximize_safe").catch(() => {});
   });
   $("wc-close").addEventListener("click", () => requestMode("float"));
 } else {

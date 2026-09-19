@@ -167,7 +167,7 @@ TCP 连接表（`GetExtendedTcpTable` OWNER_PID，v4+v6，仅 ESTABLISHED）按�
 - 托盘：左键单击显示/隐藏；右键菜单**顶部为实时状态行**（disabled 不可点，poller 每拍按快照更新：生成中 `x.x t/s` / 估算中 `≈x.x t/s` / 待机；文本变化才写入，托盘 tooltip 同步为 `ZCode 速度仪表盘 · 状态`），其后是菜单项（显示面板 / 隐藏到托盘 / 悬浮窗切换 / 退出）。重复启动唤起已有窗口（single-instance 插件）。
 - 窗口标题实时同步当前速度（任务栏/Alt+Tab 可见）。
 - **mac 差异**：
-  - 应用为 **Accessory 模式**（`set_activation_policy`，setup 内尽早调用）：无 Dock 图标、不进 Cmd+Tab，常驻菜单栏托盘。
+  - **Dock 两态（动态激活策略，2026-09-19）**：完整面板 = **Regular**（`apply_mode` 切换）——亮出 Dock 图标、进 Cmd+Tab，且只有 Regular 应用身份的窗口绿键才给**原生 Space 全屏**（Accessory 恒为辅助全屏：铺满但菜单栏不隐藏，实测定论）；收起悬浮窗/桌宠 = **Accessory**——Dock 图标自动隐藏、回菜单栏常驻，应用不退出。
   - 自定义应用菜单：`Cmd+Q` 被拦截为"隐藏为悬浮窗"（菜单中**不含任何系统退出项**，保证退出只走托盘与悬浮窗右键）；附"编辑" submenu（cut/copy/paste/select_all）保住 WebView 的 Cmd+C/V/X/A。
   - 退出兜底：`RunEvent::ExitRequested { code: None }` 一律 `prevent_exit` + 保存 + 折叠为悬浮窗（真退出 `app.exit(0)` 时 code=Some 放行，`RunEvent::Exit` 再保存一次）。**真退出只有托盘菜单"退出"与悬浮窗右键"退出程序"两条路**。
   - **引导提示**：前端右上角显示"应用常驻菜单栏 ↗ 点菜单栏图标可显示面板 / 退出"（深色半透明、顶部小箭头指向菜单栏），6 秒自动淡出、点击立即关闭；**仅完整面板模式显示**（悬浮窗/桌宠窗口过小会被裁剪，CSS 按 `body.float-mode` 门控）。触发时机两条：① 启动——setup 阶段早于 WKWebView 加载、emit 发即被弃，改为前端初始化完成后 `invoke("tray_hint_once")` 领取一次性标志（AppState 的 `tray_hint_pending`，mac 初始 true、领取即清零，非 mac 恒 false）；② 托盘"显示面板"/左键 toggle 唤起隐藏窗口（`show_main`，页面已就绪，直接 emit `tray-hint`）。Windows 两条路径都不触发，前端永不显示。

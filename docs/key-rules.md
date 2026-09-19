@@ -130,3 +130,11 @@
 - **确认弹窗文案排版禁用 flex（同日"乱码"事故）**：要点行内嵌 `<b>` 加粗段时，`p{display:flex}` 会把 span/b 拆成不换行的独立子项，长句互相挤压错位、看似乱码。弹窗/文案段落一律块级文本流（bullet 用 `::before` 绝对定位 + padding-left）。
 - **平台如实降级**：chflags 仅 macOS，其他平台卡片显示但按钮禁用 + "文件锁仅支持 macOS"（沿用 netio"连接明细仅 Windows"先例，不假装支持）。
 - 守护测试：`state_summary_parse_and_aggregate`、`guard_status_serializes_locked_fields`（含 guard.json 往返与"未防护不落多余键"）、`accrue_rounds_counts_real_delta_only`。
+
+## 17. mac 窗口全屏/Dock：只信官方身份与默认行为，别跟 AppKit 抠细节（2026-09-19 全屏攻坚定论）
+
+用户要求 mac 绿色交通灯为原生全屏。攻坚过程与教训（一天内多轮实测）：
+
+- **Accessory（菜单栏常驻）应用的窗口永远拿不到原生 Space 全屏**——绿键只给辅助全屏（铺满但菜单栏不隐藏）。`collectionBehavior=FullScreenPrimary`、窗口改不透明、运行时绑 `toggleFullScreen:` 全部无效。**唯一解 = Regular 应用身份**：完整面板 `set_activation_policy(Regular)`（亮 Dock 图标）+ 原生 Overlay 标题栏，绿键即原生全屏；收起悬浮窗切回 Accessory（藏 Dock、应用不退出），两态动态切换已实装。
+- **裸 objc FFI 三坑**：① Cocoa 属性 getter 无 `get` 前缀（`collectionBehavior`，写 `getCollectionBehavior` → unrecognized selector → **ObjC 异常穿过 Rust extern "C" 直接 abort 进程**，且第一现场 panic 信息被吞，要用 lldb 断 `panic_cannot_unwind`/读 `~/Library/Logs/DiagnosticReports/*.ips` 的 `lastExceptionBacktrace` 定位）；② 同一 `#[link_name="objc_msgSend"]` 声明多个不同签名会告警并存隐患，fn 指针 transmute 在新 rustc 有运行期检查；③ 运行时创建 ObjC 类做按钮 target/action，回调里再调 tauri 窗口 API + `setPresentationOptions:` 会抛 NSException 崩溃（自建"沉浸全屏"方案因此废弃，代码已剥离）。**结论：与 AppKit 交互只用 tauri 公开 API；官方没有的能力（原生全屏）靠换应用身份解决，不硬造。**
+- **窗口实验要能秒回滚**：本轮多组未提交实验靠 `git stash` 一键回到已验证状态；"改完先起 dev 让用户看效果，确认后才 build/push"是固定流程（用户明确要求）。

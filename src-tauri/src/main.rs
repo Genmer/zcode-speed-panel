@@ -331,13 +331,25 @@ fn clamp_to_screen(window: &tauri::WebviewWindow, x: i32, y: i32, w: u32, h: u32
     (x.clamp(mp.x, max_x), y.clamp(mp.y, max_y))
 }
 
+
 fn apply_mode(window: &tauri::WebviewWindow, mode: Mode, style: FloatStyle, p: &Persisted, pet_extra: f64) {
     let scale = window.scale_factor().unwrap_or(1.0);
     match mode {
         Mode::Full => {
             let _ = window.set_min_size(Some(LogicalSize::new(720.0, 520.0)));
             let _ = window.set_size(LogicalSize::new(FULL_SIZE.0, FULL_SIZE.1));
-            // 无边框：顶栏为前端自绘（拖动/双击最大化/— ▢ ✕），不再恢复系统装饰
+            // 顶栏：mac 恢复原生 Overlay 标题栏——**真·系统交通灯**（红关/黄最小化/
+            // 绿全屏原生动画），内容延伸到标题栏下，前端给左侧留位；同时切到
+            // Regular 策略亮出 Dock 图标（只有 Regular 应用能原生全屏，见 setup
+            // 注释）。Windows 维持无边框 + 前端自绘 — ▢ ✕（悬浮窗必须无边框）
+            #[cfg(target_os = "macos")]
+            {
+                let _ = window
+                    .app_handle()
+                    .set_activation_policy(tauri::ActivationPolicy::Regular);
+                let _ = window.set_decorations(true);
+            }
+            #[cfg(not(target_os = "macos"))]
             let _ = window.set_decorations(false);
             let _ = window.set_resizable(true);
             let _ = window.set_always_on_top(false);
@@ -369,6 +381,12 @@ fn apply_mode(window: &tauri::WebviewWindow, mode: Mode, style: FloatStyle, p: &
             let _ = window.set_min_size(None::<LogicalSize<f64>>);
             let _ = window.set_size(LogicalSize::new(w, h));
             let _ = window.set_decorations(false);
+            // mac：收回 Accessory——藏 Dock 图标回菜单栏常驻（应用不退出，
+            // 与 Regular 亮出 Dock 的完整面板互为两态，见 setup 注释）
+            #[cfg(target_os = "macos")]
+            let _ = window
+                .app_handle()
+                .set_activation_policy(tauri::ActivationPolicy::Accessory);
             let _ = window.set_resizable(false);
             // 悬浮窗：置顶、不占任务栏、无原生阴影（阴影会盖住圆角外透明区）
             let _ = window.set_always_on_top(true);
@@ -995,15 +1013,6 @@ fn toggle_window_maximize(window: &tauri::WebviewWindow) {
     }
 }
 
-/// 原生全屏切换（mac 绿色交通灯专用，2026-09-19 用户要求符合 mac 语言；
-/// 原生全屏在所在屏进入/退出，无副屏跳屏问题）。与「安全最大化」
-/// （双击顶栏 / Windows ▢）相互独立：退出全屏由系统还原进入前的窗口框
-#[tauri::command]
-fn toggle_fullscreen(window: tauri::WebviewWindow) {
-    let cur = window.is_fullscreen().unwrap_or(false);
-    let _ = window.set_fullscreen(!cur);
-}
-
 /// 多屏安全最大化/还原：macOS 无边框窗口原生 toggle_maximize 会跳回主屏，
 /// 此处按窗口中心点所在显示器铺满（避让菜单栏）；Windows 直接调用系统最大化
 #[tauri::command]
@@ -1508,7 +1517,6 @@ fn main() {
             set_float_size,
             quit_app,
             toggle_maximize_safe,
-            toggle_fullscreen,
             recalibrate,
             tray_hint_once,
             check_update,
@@ -1522,10 +1530,11 @@ fn main() {
             open_checkpoint_dir
         ])
         .setup(|app| {
-            // mac：Accessory 模式——无 Dock 图标、不进 Cmd+Tab，常驻菜单栏托盘；
-            // 必须在跑起来之前尽早设置（真退出只有托盘"退出"与悬浮窗右键"退出程序"）
-            #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            // mac 激活策略**动态切换**（apply_mode 按模式设置，不再固定）：
+            // 完整面板 = Regular（有 Dock 图标——macOS 只把 Regular 应用当
+            // "正经应用"，绿色交通灯才给原生全屏 Space；Accessory 恒为辅助
+            // 全屏：铺满但菜单栏还在，2026-09-19 实测定论）；收起悬浮窗 =
+            // Accessory（藏 Dock 回菜单栏常驻，应用不退出）
 
             // mac：自定义应用菜单拦截 Cmd+Q 为"折叠为悬浮窗"（不注册系统
             // 退出项），并附编辑菜单保住 WebView 的 Cmd+C/V/X/A 快捷键

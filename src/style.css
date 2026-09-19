@@ -75,42 +75,15 @@ header {
   color: #fff;
 }
 
-/* macOS 平台原生红黄绿交通灯控制按钮（左起：红/折叠 黄/最小化 绿/最大化） */
+/* mac：原生 Overlay 标题栏（真·系统交通灯：红关/黄最小化/绿全屏，原生
+   悬停符号与动画）。自绘控制组整体隐藏；顶栏左侧留位避让原生灯
+  （三灯约占左上 78×28pt，2026-09-19 起不再自绘仿品） */
 body.platform-mac #win-controls {
-  order: -1;
-  margin-left: 0;
-  margin-right: 14px;
-  gap: 8px;
-  align-items: center;
+  display: none;
 }
-body.platform-mac #wc-close {
-  order: 1;
-  background: #ff5f56;
-}
-body.platform-mac #wc-min {
-  order: 2;
-  background: #ffbd2e;
-}
-body.platform-mac #wc-max {
-  order: 3;
-  background: #27c93f;
-}
-body.platform-mac #win-controls button {
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
-  border: 1px solid rgba(0, 0, 0, 0.15);
-  color: transparent;
-  font-size: 8px;
-  font-weight: bold;
-  line-height: 1;
-  transition: color 0.15s ease, filter 0.15s ease;
-}
-body.platform-mac #win-controls:hover button {
-  color: rgba(0, 0, 0, 0.65);
-}
-body.platform-mac #win-controls button:hover {
-  filter: brightness(0.9);
+
+body.platform-mac #app-header {
+  padding-left: 82px;
 }
 
 .brand {

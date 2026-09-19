@@ -35,7 +35,7 @@ src-tauri/src/liveio.rs    实时测速：跨平台（platform 子模块：Windo
 src-tauri/src/netio.rs     网络流量与上传监控：整机接口计数（win GetIfTable 32 位逐接口模差 / mac getifaddrs 去重）+ 会话/非会话上传拆分（token 估算 ≈ + checkpoints 工件真实下界）+ TCP 连接按进程分组（仅 win）+ 当日累计持久化
 src-tauri/src/snapshot_guard.rs  快照防护：chflags uchg 锁定 ~/.zcode/v2/checkpoints 阻断工作区快照静默上传（写入探测定状态、calls 增量计轮次、guard.json 持久化；仅 macOS）
 src-tauri/src/updater.rs   应用内更新：GitHub Releases 检查/下载/安装（纯函数 parse_version/is_newer/pick_asset 可测；产物命名耦合见 key-rules #12）
-src-tauri/src/main.rs      应用层：轮询线程、更新检查线程、窗口模式/位置持久化、托盘（mac 菜单栏 + Accessory 模式）、DebugLog
+src-tauri/src/main.rs      应用层：轮询线程、更新检查线程、窗口模式/位置持久化、托盘（mac 菜单栏 + 动态 Dock 两态：完整面板 Regular/悬浮窗 Accessory）、DebugLog
 src-tauri/examples/        dump/verify 调试工具（#[path] include src，改公开 API 须同步）
 src-tauri/capabilities/    Tauri 前端权限白名单（窗口 API 必须在此放行）
 src/                       前端：main.ts 装配 / gauges.ts 绘制 / model_stats.ts 模型趋势弹窗（图例 chips 多选）/ guard.ts 快照防护卡片 / pet.ts 桌宠 / mock.ts 预览
@@ -51,7 +51,7 @@ public/pets/               宠物包资源；scripts/*.py 调试日志分析；.
 ## 约定
 
 - 提交信息用中文，首行概括根因/行为。
-- 无系统标题栏：顶栏自绘（`#app-header` + `data-tauri-drag-region`，左侧为 `app-icon.png` 应用图标）；点 ✕ = 收起为悬浮窗，退出走托盘/右键菜单。mac 为 Accessory 模式（无 Dock/Cmd+Tab），Cmd+Q 也折叠为悬浮窗——真退出只有托盘"退出"与悬浮窗右键"退出程序"（三条防线：自定义菜单无 quit 项、ExitRequested 兜底、prevent_exit）。
+- mac 为原生 Overlay 标题栏（真·系统交通灯，绿点=原生全屏——只有 Regular 应用身份才给全屏，Accessory 恒为辅助全屏）；Dock 两态：完整面板亮出图标（Regular）、收起悬浮窗自动隐藏（Accessory，应用不退出）。Windows 无系统标题栏：顶栏自绘（`#app-header` + `data-tauri-drag-region`，左侧为 `app-icon.png` 应用图标）；点 ✕ = 收起为悬浮窗，退出走托盘/右键菜单。mac Cmd+Q 也折叠为悬浮窗——真退出只有托盘"退出"与悬浮窗右键"退出程序"（三条防线：自定义菜单无 quit 项、ExitRequested 兜底、prevent_exit）。
 - 平台差异集中在 `liveio.rs` 的 `platform` 子模块与 `CleanParams`（Windows/mac 参数表见 `docs/features.md`），改清洗逻辑须核对两平台口径；FFI 结构镜像必须带 `offset_of!` 编译期断言（见 key-rules #10）。
 - UI 下拉一律自绘（`.dropdown`），禁用原生 `<select>`——WebView2 弹层跟随系统浅色主题，深色界面里看不见字（key-rules #8）；顶栏新增交互组件须加入拖动/双击排除选择器。
 - 仪表配色：速度表分档色定义在 `src/gauges.ts` 顶部 `SPEED_TIERS`（六档：0–40 绿 / 40–80 黄绿 / 80–160 黄 / 160–240 橙 / 240–320 红 / 320+ 品红，整弧换色不分段，背景轨道恒灰），主表、迷你仪表、"上轮"角标小表（`BadgeGauge`）与胶囊/桌宠的上轮读数共用（`speedColor()` 统一取色）；浮动窗口尺寸改动须同步 `main.rs` 的 `FLOAT_*_SIZE`、`docs/features.md` 与 README。桌宠窗口为"正方形精灵区 + 顶部 `PET_BUBBLE_RESERVE` 气泡预留带"，多任务（≥2 进程，3 拍防抖）期间再向上加高 `PET_TASK_EXTRA`——尺寸口径分布在 `apply_mode`/`set_float_size`/`apply_pet_size` 三处（`pet.ts` 按画布短边定位精灵区），改其一须同步其余；气泡向上生长、精灵不缩小。
