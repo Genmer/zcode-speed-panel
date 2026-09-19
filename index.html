@@ -103,14 +103,14 @@
           <div class="net-body">
             <div class="net-left">
               <div class="net-speeds">
-                <div class="net-speed up" title="整机口径：本机全部应用（含系统/浏览器/代理隧道）的网络上传，非仅 ZCode。ZCode 的部分见下方拆分与连接归属">
+                <div class="net-speed up" title="整机口径：本机全部应用（含系统/浏览器/代理隧道）的网络上传，非仅 ZCode。约 1 秒滑窗平均，单位为字节；全部非回环接口求和（虚拟网卡/VPN 隧道的流量内外层各计一次）。与任务管理器对比：任务管理器显示比特（×8 ≈ 字节）且 Wi-Fi 页仅统计所选适配器，读数对不上是口径差异。ZCode 的部分见下方拆分与连接归属">
                   <span class="net-arrow">↑</span>
                   <div class="net-speed-body">
                     <span class="net-val" id="net-up-bps">--</span>
                     <span class="net-sub">整机上传 · 全部应用</span>
                   </div>
                 </div>
-                <div class="net-speed down" title="整机口径：本机全部应用（含系统/浏览器/代理隧道）的网络下载，非仅 ZCode。会话（模型输出）的估算值见下方">
+                <div class="net-speed down" title="整机口径：本机全部应用（含系统/浏览器/代理隧道）的网络下载，非仅 ZCode。约 1 秒滑窗平均，单位为字节；全部非回环接口求和（虚拟网卡/VPN 隧道的流量内外层各计一次）。与任务管理器对比：任务管理器显示比特（×8 ≈ 字节）且 Wi-Fi 页仅统计所选适配器，读数对不上是口径差异。会话（模型输出）的估算值见下方">
                   <span class="net-arrow">↓</span>
                   <div class="net-speed-body">
                     <span class="net-val" id="net-down-bps">--</span>
@@ -127,18 +127,19 @@
                   <span class="net-today-label">今日上传</span>
                   <span class="net-part">会话 ≈<b id="net-sess-up">--</b></span>
                   <span class="net-part warn" id="net-ckpt-part">快照上传 <b id="net-ckpt">--</b><span class="dim" id="net-ckpt-count"></span></span>
-                  <span class="net-part">整机 <b id="net-up-today">--</b></span>
+                  <span class="net-part" title="仅面板运行时段的接口计数差分累加，面板未运行时段不计入；与旁边的快照上传（按 state.json 接受事件整包计入、当日首启回补）相互独立口径">整机 <b id="net-up-today">--</b></span>
                 </div>
                 <div class="net-today-row">
                   <span class="net-today-label">今日下载</span>
                   <span class="net-part">会话 ≈<b id="net-sess-down">--</b></span>
-                  <span class="net-part">整机 <b id="net-down-today">--</b></span>
+                  <span class="net-part" title="仅面板运行时段的接口计数差分累加，面板未运行时段不计入">整机 <b id="net-down-today">--</b></span>
                 </div>
               </div>
               <div class="net-ckpt" id="net-ckpt-info" hidden>
                 <span class="dot live" id="net-ckpt-dot"></span>
                 <span id="net-ckpt-text"></span>
               </div>
+              <div class="net-ckpt-names" id="net-ckpt-names" hidden></div>
             </div>
             <div class="net-right">
               <div class="net-ckpt-list-head" id="net-ckpt-list-head">

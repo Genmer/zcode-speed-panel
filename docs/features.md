@@ -53,7 +53,7 @@
 **Windows 非管理员下没有"按进程的网络收发字节"公开原语**，2026-09-18 本机实验定论（详见 key-rules #15）：
 
 - Winsock 收发字节**不进** `GetProcessIoCounters` 的任何计数（20MB 下载期间 Read 仅 7.8KB）——进程 IO 计数器只含文件/管道/设备，liveio 的流式测速因此天然不受网络污染；
-- TCP ESTATS（`SetPerTcpConnectionEStats`，唯一的每连接字节 API）在新版 Windows 上对所有连接（含本进程自有的）返回 `ERROR_NOT_SUPPORTED`，管理员也一样；
+- TCP ESTATS（`Set/GetPerTcpConnectionEStats`，唯一的每连接字节 API）不可用——2026-09-18 复验归档（`python scripts/estats_probe.py`，build 26200、普通权限）：v4/v6 共 4 个导出符号都存在，但 `Set`（启用 Data 采集）对自有/他人连接一律 `ERROR_ACCESS_DENIED`(5)（启用需特权、与连接归属无关），未启用时 `Get` 恒失败（`ERROR_INVALID_USER_BUFFER`(1784) 居多、个别连接 `ERROR_NOT_SUPPORTED`(50)），调用姿势变体（Get 附 Rw / Set 附 Rod 缓冲）无效；
 - ETW 内核网络事件需要管理员。
 
 因此按三层诚实分层，前端 UI 上逐项标注口径：
@@ -68,8 +68,9 @@
 
 - **Windows**：`GetIfTable` 全部非回环接口的 `dwIn/dwOutOctets` 求和。计数器为 **32 位**，必须**逐接口**做模 2³² 差分（各接口回绕时机不同，先求和再差分会错——测试 `wrap_delta_handles_32bit_wrap_and_resets` 守护）；单接口单拍增量 ≥2³¹ 视为计数器重置/索引复用，钳 0。`MIB_IF_ROW` 镜像关键字段偏移（dwInOctets=552 / dwOutOctets=556）编译期断言。
 - **macOS**：`getifaddrs` 求和 `ifi_obytes/ifi_ibytes`（64 位不回绕，裸差分、回退钳 0），排除 `lo0`；每接口按地址族返回多行，**必须按接口名去重**否则字节翻倍。`if_data64` 镜像 ibytes=64/obytes=72 编译期断言（按 xnu SDK 布局，mac 侧换 SDK 后若断言失败须实测复核）。
-- 速度 = 10s 滑窗差分；当日累计跨天清零、跨重启持久化续算（`~/.zcode/speed-panel-net.json`，30s 节流落盘 + 退出强制保存）。
+- 速度 = ~1s 滑窗差分（对齐任务管理器 ~1s 的刷新节奏；比旧 10s 窗读数更跳，属预期）；当日累计跨天清零、跨重启持久化续算（`~/.zcode/speed-panel-net.json`，30s 节流落盘 + 退出强制保存）。
 - **整机口径的含义（UI 显式标注）**：整机 = **本机全部应用**的网络流量（含系统/浏览器/代理隧道加密开销），**非仅 ZCode**——速度值标签写明"全部应用"、卡片右上角注明"整机 = 本机全部应用流量（非仅 ZCode）"、速度块悬停 tooltip 有完整说明。它回答"这台机器今天上传了多少"，不回答"其中多少是 ZCode"（后者由下两层回答）；本机走本地代理时（ZCode → 127.0.0.1 代理 → 外网）尤其须注意隧道开销的放大。
+- **与任务管理器对比**：任务管理器网卡页显示**比特**（Mbps/Kbps，×8 ≈ 字节）且仅统计**所选适配器**；本面板为**字节**、全部非回环接口求和（虚拟网卡/VPN 隧道流量内外层各计一次，可大于单网卡读数）且为 ~1s 滑窗平均（突发被摊平、采样时刻也不同）——两边瞬时读数对不上是口径差异而非计数错误，UI tooltip 已注明。
 
 ### 会话流量（估算 ≈）
 
@@ -82,13 +83,13 @@
 
 轮询 `~/.zcode/v2/checkpoints/*/state.json`（2s 一拍）：
 
-- **接受事件**：`lastAcceptedManifestHash` 变化 = 快照工件被服务端接受，按 `lastCompressedSize.encryptedSizeBytes`（加密压缩后字节）计入当日累计；`recordedAt` 早于本地今日 0 点的不计（跨天去重守卫——同一哈希永远归属其记录当天）。**当日已接受工件带名单**（workspace/字节/记录时刻，封顶 100 条随 `speed-panel-net.json` 持久化、跨重启/回补保留）——状态行"今日 N 个"后直接列出工作区名（>4 个折叠为"等 N 个"），悬停看逐条明细，复制/导出报告同样包含。
+- **接受事件**：`lastAcceptedManifestHash` 变化 = 快照工件被服务端接受，按 `lastCompressedSize.encryptedSizeBytes`（加密压缩后字节）计入当日累计；`recordedAt` 早于本地今日 0 点的不计（跨天去重守卫——同一哈希永远归属其记录当天）。**当日已接受工件带名单**（workspace/字节/记录时刻，封顶 100 条随 `speed-panel-net.json` 持久化、跨重启/回补保留）——状态行「今日 N 个」下方逐行列出工作区名单（按工作区聚合，件数 >1 时附「n 个 · 字节小计」；该工作区最新工件越近排越前——回补扫描顺序不保证按时间，取组内最大 recordedMs 排序；悬停名单行看该工作区今日逐条明细），复制/导出报告同样包含。
 - **上传进行中**：任一 workspace 的 `activeUpload` 非空 → 状态行脉冲提示「快照上传进行中」。
 - **回补**：当日首次启动时，把 recordedAt 在今天、但面板未在场观测到的接受按当前 `lastCompressedSize` 回补计入（面板今天已运行过则只建基线不回补）。
 - **口径为面板观测期**：面板未运行期间的接受只在上述回补时计入；两拍之间的多次跳变按末态计（下界）。
 - **目录状态**：`ok` / `missing`（无目录）/ `blocked`（不可读——用户用 ACL 封锁 checkpoints 后的如实显示，此时监控不到新上传）。
 - 事件同时写调试日志（`kind:"net"`，`ev`=ckpt_accepted / ckpt_upload_start / ckpt_upload_end，含 `mb` 与 `ws` 工作区名）。
-- **快照上传记录列表**（卡片右栏；窄窗口 <860px 退回单栏）：每个 workspace 一行 = 记录时间（今天 HH:MM，跨天 MM-DD HH:MM）/ 工作区名（workspacePath 末段）/ 加密后大小 / 状态（**上传中 ⬆ / 待传 / 已接受 ✓**），排序 = 上传中 > 待传 > 已接受（同状态按记录时刻倒序），**不截断行数，固定限高 168px 内部上下滚动看完**（不把页面整页撑开；`ckpt_rows` 纯函数，测试 `ckpt_rows_sorted_all_workspaces` 守护）。列表读的是 checkpoints 实况（state.json 只保留各工作区最近一次工件，更早历史不可考），面板未运行期间的最后状态启动即见。
+- **快照上传记录列表**（卡片右栏；窄窗口 <860px 退回单栏）：每个 workspace 一行 = 记录时间（今天 HH:MM，跨天 MM-DD HH:MM）/ 工作区名（workspacePath 末段）/ 加密后大小 / 状态（**上传中 ⬆ / 待传 / 已接受 ✓**），排序 = 上传中 > 待传 > 已接受（同状态按记录时刻倒序），**固定显示 5 行（行高 18px：5×18 + 4×2 间隙 = 98px 限高），其余列表内上下滚动看完**（不把页面整页撑开；`ckpt_rows` 纯函数，测试 `ckpt_rows_sorted_all_workspaces` 守护）。列表读的是 checkpoints 实况（state.json 只保留各工作区最近一次工件，更早历史不可考），面板未运行期间的最后状态启动即见。
 - **复制与导出**：列表文字可选中复制（全局 `user-select:none` 的例外区）；列表头有 **复制 / 导出** 按钮——复制把整份纯文本报告（表头 + 逐行记录 + 当日汇总 + ZCode 两组连接实况）写入剪贴板（`navigator.clipboard`，失败退回 `execCommand`），导出走 `export_text_file` 命令写入 `~/.zcode/speed-panel-exports/zcode快照上传记录-日期-时间.txt`（文件名白名单清洗防路径穿越，右下角轻提示完整路径；浏览器预览模式退化为浏览器下载）。
 
 ### ZCode 连接归属（真实值，仅 Windows）
@@ -98,7 +99,7 @@ TCP 连接表（`GetExtendedTcpTable` OWNER_PID，v4+v6，仅 ESTABLISHED）按�
 - **会话组（ZCode 会话进程）**：命令行含 `zcode.cjs` 的 CLI（app-server）进程——对话 API 流量的承载者；进程发现口径与 liveio 一致，5s 刷新一次 pid 分组，连接表每拍枚举；
 - **桌面端组（ZCode 桌面端）**：其余 `zcode.exe` = ZCode 桌面端的 Electron 壳（主/渲染/GPU/工具/崩溃报告进程）——快照上传、遥测等**非对话**流量的承载者。
 
-每条连接都标注**归属进程**（类型标签 + pid，按 Electron `--type` 参数区分：CLI 会话进程 / 主进程 / 渲染进程 / GPU 进程 / 工具进程 / 崩溃报告进程，`proc_label` 纯函数、测试 `proc_label_by_command_line` 守护）；两组各行显示按 远端+pid 去重的条数，**悬停 tooltip 逐条列出 `远端 ip:port · 进程类型(pid)`**。**证据链用法**：整机上传速度飙升 + 桌面端组出现新连接 + activeUpload = 快照上传正在发生的现场证据。mac 侧连接归属未实现（面板隐藏该行，接口计数仍可用）。
+每条连接都标注**归属进程**（类型标签 + pid，按 Electron `--type` 参数区分：CLI 会话进程 / 主进程 / 渲染进程 / GPU 进程 / 工具进程 / 崩溃报告进程，`proc_label` 纯函数、测试 `proc_label_by_command_line` 守护）；两组各行显示按 远端+pid 去重的条数，**悬停 tooltip 逐条列出 `远端 ip:port · 进程类型(pid)`**。**证据链用法**：整机上传速度飙升 + 桌面端组出现新连接 + activeUpload = 快照上传正在发生的现场证据。mac 侧连接归属未实现（面板隐藏该行，接口计数仍可用）。**两组连接不显示各自的速度**：按进程网络字节在非管理员下无公开原语（见上"平台限制"，ESTATS 已复验定论），真实速度只有整机层可测。
 
 ## 快照防护（snapshot_guard.rs + src/guard.ts）
 

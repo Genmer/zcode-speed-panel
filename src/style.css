@@ -519,14 +519,34 @@ main {
   border-radius: 6px;
 }
 
-/* 快照上传记录列表：每工作区一行（时间/工作区/大小/状态），不截断行数
- * 全部列出；固定限高内部上下滚动看完（不把页面整页撑开）。文字可选中
- * 复制（全局 user-select:none 的例外） */
+/* 今日快照工件的工作区名单：状态行下方逐行列出（与状态行文字对齐），
+ * 每行 = 工作区 · n 个 · 字节小计，超宽省略（悬停看明细）；可选中复制 */
+.net-ckpt-names {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding-left: 17px;
+  font-size: 11.5px;
+  line-height: 16px;
+  color: var(--dim);
+  user-select: text;
+  cursor: text;
+}
+
+.net-ckpt-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 快照上传记录列表：每工作区一行（时间/工作区/大小/状态），固定显示
+ * 5 行（行高 18px：5×18 + 4×2 间隙 = 98px），其余列表内上下滚动看完
+ * （不把页面整页撑开）。文字可选中复制（全局 user-select:none 的例外） */
 .net-ckpt-list {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  max-height: 168px;
+  max-height: 98px;
   overflow-y: auto;
   font-size: 12px;
   font-variant-numeric: tabular-nums;
@@ -550,6 +570,7 @@ main {
   gap: 10px;
   align-items: baseline;
   min-width: 0;
+  line-height: 18px;
 }
 
 .ckpt-time {

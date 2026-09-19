@@ -266,12 +266,18 @@ function snapshot(now: number, pending: MockCall | null): Snapshot {
     ],
     netCkptUploading: mockCkptUploading,
     netCkptStatus: "ok",
-    // 快照上传记录模拟：上传中 > 待传 > 已接受（含跨天记录演示月日显示）
+    // 快照上传记录模拟：上传中 > 待传 > 已接受（含跨天记录演示月日显示），
+    // 共 9 行演示"固定显示 5 行、其余滚动"
     netCkptList: [
       { workspace: "GenePad", bytes: 549.2 * 1048576, recordedMs: now - 3600_000, accepted: !mockCkptUploading, uploading: mockCkptUploading },
       { workspace: "GenePad-free", bytes: 1024.0 * 1048576, recordedMs: now - 7 * 3600_000, accepted: true, uploading: false },
       { workspace: "zcode-speed-panel", bytes: 990, recordedMs: now - 4 * 3600_000, accepted: true, uploading: false },
       { workspace: "Gene_Editor-master", bytes: 522.5 * 1048576, recordedMs: now - 13 * 86400_000, accepted: true, uploading: false },
+      { workspace: "notes-sync", bytes: 18.4 * 1048576, recordedMs: now - 2 * 86400_000, accepted: true, uploading: false },
+      { workspace: "dotfiles", bytes: 2048, recordedMs: now - 3 * 86400_000, accepted: true, uploading: false },
+      { workspace: "blog-hugo", bytes: 96.7 * 1048576, recordedMs: now - 4 * 86400_000, accepted: true, uploading: false },
+      { workspace: "ml-bench", bytes: 733.0 * 1048576, recordedMs: now - 6 * 86400_000, accepted: true, uploading: false },
+      { workspace: "scrape-tools", bytes: 4400, recordedMs: now - 8 * 86400_000, accepted: true, uploading: false },
     ],
     netConnsAvailable: true,
     netCliConns: isLive ? 2 : 1,

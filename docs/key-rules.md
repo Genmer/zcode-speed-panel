@@ -110,10 +110,11 @@
 背景：2026-09-17 发现 ZCode 静默上传整仓快照（含 `.git/` 历史，单工件 549MB）到阿里云 OSS，需要流量监控区分会话/非会话上传。2026-09-18 本机实验定论（netio.rs 分层口径的依据）：
 
 - **Winsock 收发字节不进进程 IO 计数器的任何一项**：curl 下载 20MB 期间 `ReadTransferCount` 仅 7.8KB（`Write` 12MB 全是往 NUL 设备的落盘镜像，`Other` 82KB 是杂项 IOCTL）。=> ① liveio 的 `WriteTransferCount` 流式测速**天然不受网络污染**，勿往里加网络语义；② 想从 IO 计数器反推网络字节是死路。旧文档把"调用开始瞬间 >100KB 写突发"解释为"请求体上传"是误判——实为提示文本写 message 行/rollout 的落盘。
-- **TCP ESTATS 已坏**：`SetPerTcpConnectionEStats`/`GetPerTcpConnectionEStats`（注意**导出名是 EStats 大写 S**，与 MSDN 文档名 Estat 不同，直接 `#[link]` 会 LNK2019，须 LoadLibrary+GetProcAddress）在新版 Windows 10/11 上对所有连接——**包括本进程自有的**——返回 `ERROR_NOT_SUPPORTED`(50)，管理员也一样。唯一的每连接字节数公开 API 不可用。
+- **TCP ESTATS 已坏（2026-09-18 二次复验归档 `scripts/estats_probe.py`，勿再空手重试）**：`SetPerTcpConnectionEStats`/`GetPerTcpConnectionEStats`（注意**导出名是 EStats 大写 S**，与 MSDN 文档名 Estat 不同，直接 `#[link]` 会 LNK2019，须 LoadLibrary+GetProcAddress）。首验（代码未留档）：所有连接含本进程自有的返回 `ERROR_NOT_SUPPORTED`(50)，管理员也一样。复验（build 26200、普通权限）：v4/v6 共 4 个导出符号全部存在；`Set`（启用 Data 采集）对**自有与他人进程的连接一律 `ERROR_ACCESS_DENIED`(5)**——启用采集是特权操作、与连接归属无关；未启用时 `Get` 恒失败（`ERROR_INVALID_USER_BUFFER`(1784) 居多、个别连接 50），换调用姿势（Get 附 Rw 缓冲 / Set 附 Rod 缓冲）不改变结果。=> 唯一的每连接字节数公开 API 在普通权限下不可用（面板不以管理员为前提），**按进程真实网络速度因此不可实现**，只能走估算口径（整机真值 + 会话 token 估算 + 工件下界三层）。
 - **ETW 内核网络事件需要管理员**，桌面工具不可依赖。
 - **Windows 接口计数器（`GetIfTable` 的 dwIn/dwOutOctets）是 32 位**：必须**逐接口**模 2³² 差分——各接口回绕时机不同，先求和再差分在任一接口回绕后即错（初版实现就是这个 bug，靠测试抓住）。mac `getifaddrs` 的 ifi_*bytes 为 64 位，但**每接口按地址族返回多行，必须按接口名去重**否则字节翻倍。
 - **缓存命中的提示不重发**：98% 命中下整机当日上传仅数十 KB——会话上传估算的分子必须用 `input − cache_read`（未缓存部分），按全量重发估算会虚高数十倍。会话下载密度实测 ~731 B/token（整机含杂流上界）/ UI 管道 bpt≈320（下界），估算系数取 400。
+- **"与任务管理器对不上"是口径差异，不是计数 bug**（2026-09-18 用户报告过一次）：① 单位——任务管理器为比特（Mbps/Kbps），面板为字节，×8 才可比；② 范围——任务管理器 Wi-Fi 页仅所选适配器，面板为全部非回环接口求和（虚拟网卡/VPN 隧道流量内外层各计一次）；③ 时间——面板 ~1s 滑窗平均（`NET_WINDOW_MS`，对齐任务管理器刷新节奏），突发被摊平且采样时刻不同。另：整机当日累计只含面板在场时段（重启基线重打、无回补），与按接受事件回补的快照工件口径独立，"工件 GB 级、整机 MB 级"可同时为真。
 
 => 现行方案（netio.rs）：整机接口计数（真实）+ 会话 token 估算（≈）+ checkpoints `state.json` 工件接受事件（真实下界）三层分层，UI 逐项标注口径；连接归属用 `GetExtendedTcpTable`(OWNER_PID) 按进程分组（命令行含 `zcode.cjs` = 会话组，其余 `zcode.exe` = 桌面端非会话组）。**证据链**：整机上传飙升 + 桌面端组新连接 + `activeUpload` = 快照上传现场。守护测试：`wrap_delta_handles_32bit_wrap_and_resets`（回绕/重置钳 0）、`apply_ckpt_obs_counts_acceptance_diffs`（接受差分/跨天去重/回补）、`parse_ckpt_state_fields`。
 
