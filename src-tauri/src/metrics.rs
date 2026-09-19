@@ -61,20 +61,24 @@ pub struct ConnStat {
 
 /// 快照上传记录行（netio 填充）：每个 workspace 的**最近一次**快照实况，
 /// 来自 `~/.zcode/v2/checkpoints/*/state.json`。Deserialize 供防护历史
-/// 文件（speed-panel-ckpt-history.json）读回
+/// 文件（speed-panel-ckpt-history.json）读回；hash = checkpoints 下的
+/// 工作区子目录名（点行"打开目录"用；留档旧行没有 → None）
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CkptStat {
     /// 工作区显示名（workspacePath 末段）
     pub workspace: String,
-    /// 最近一次压缩加密工件字节数
+    /// 最近一次压缩加密快照字节数
     pub bytes: u64,
-    /// 工件记录时刻（recordedAt，epoch ms；0 = 未知）
+    /// 快照记录时刻（recordedAt，epoch ms；0 = 未知）
     pub recorded_ms: i64,
-    /// 最近工件已被服务端接受（lastAcceptedManifestHash 非空）
+    /// 最近快照已被服务端接受（lastAcceptedManifestHash 非空）
     pub accepted: bool,
     /// activeUpload 进行中
     pub uploading: bool,
+    /// checkpoints 下的工作区子目录名（哈希）；留档旧行可为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
 }
 
 /// 推送给前端的指标快照

@@ -313,8 +313,10 @@ function renderNet(s: Snapshot) {
   // 快照上传记录：每工作区最近一次快照（时间 / 工作区 / 加密后大小 / 状态），
   // 上传中 > 待传 > 已接受排序（后端排好）。固定显示 5 行，其余列表内滚动
   // 看完；文字可选中复制，另有 复制/导出 按钮（见 net-ckpt-tools）。
+  // 行尾 📂 = 在系统文件管理器中打开该快照目录（mac Finder / Win 资源管理器，
+  // 跨平台；只有磁盘上真实存在的行才有——留档历史行没有）。
   // 列表为空时右栏不能整块消失（防护清空目录后曾变 70% 空白）：
-  // 防护中给锁横幅 + 留档的防护前历史；平时给"暂无记录"占位
+  // 防护中给锁横幅（保留/删除两态）+ 留档历史；平时给"暂无记录"占位
   const ckptRows: CkptStat[] = s.netCkptList ?? [];
   netCkptList.textContent = "";
   netCkptListHead.style.display = "";
@@ -334,12 +336,37 @@ function renderNet(s: Snapshot) {
     st.className = "ckpt-st";
     st.textContent = stText;
     row.append(time, ws, size, st);
+    if (r.hash) {
+      const open = document.createElement("button");
+      open.className = "ckpt-open";
+      open.type = "button";
+      open.textContent = "📂";
+      open.title = "在文件管理器中打开该工作区的快照目录（~/.zcode/v2/checkpoints）";
+      open.addEventListener("click", () => {
+        tauriInvoke("open_checkpoint_dir", { hash: r.hash }).catch((err: unknown) => {
+          open.textContent = "⚠️";
+          open.title = `打开失败：${err}`;
+          window.setTimeout(() => {
+            open.textContent = "📂";
+          }, 2500);
+        });
+      });
+      row.append(open);
+    }
     netCkptList.append(row);
   };
   if (ckptRows.length > 0) {
     for (const r of ckptRows) {
       appendRow(r, r.uploading ? "ckpt-row uploading" : r.accepted ? "ckpt-row" : "ckpt-row pending",
         r.uploading ? "上传中 ⬆" : r.accepted ? "已接受 ✓" : "待传");
+    }
+    if (s.guard?.locked) {
+      // 保留模式：快照还在（递归锁，只读可扫），行照常显示且可点开——
+      // 横幅说明状态即可，不挡内容
+      const banner = document.createElement("div");
+      banner.className = "ckpt-empty locked";
+      banner.textContent = "🔒 防护已开启 · 以下快照已锁定保留（只读），ZCode 无法写入新快照";
+      netCkptList.prepend(banner);
     }
   } else if (s.guard?.locked) {
     const banner = document.createElement("div");

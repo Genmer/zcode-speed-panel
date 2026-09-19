@@ -105,22 +105,26 @@ TCP 连接表（`GetExtendedTcpTable` OWNER_PID，v4+v6，仅 ESTABLISHED）按�
 
 完整面板"网络流量与上传监控"卡下方的独立卡片：**阻断 ZCode 工作区快照的静默上传**。
 
-- **机制**：ZCode 登录后会把整个工作区（含 `.git/` 全历史）打成加密 tar.gz 写入 `~/.zcode/v2/checkpoints/<工作区hash>/pending/*.tar.gz.enc`，经 zcode.z.ai 拿凭证直传阿里云 OSS；设置开关无效，凭证 API 与模型 API 同域**不能封网络**（2026-09 本机验证，[机制分析文章](https://blog.ferstar.org/posts/zcode-silent-workspace-snapshot-upload/)）。防护 = 清空该目录后对目录本身 `chflags uchg`（macOS 用户级不可变标志，用户自有目录无需 sudo）——ZCode 写不进去，快照链路死亡。**不碰网络、不碰进程**，对运行中的 ZCode 无侵入。
-- **代价与可逆**：唯一功能损失是**「检查点回滚 / 时间线」**（无法再回滚到历史检查点）；模型对话、代码补全、工具调用完全不受影响。`chflags nouchg` 随时可逆，目录留空时 ZCode 会自动重建内容。开启防护还会**删除本地已积累的全部快照工件**（开启前弹确认窗明示数量与体积）。
+- **机制**：ZCode 登录后会把整个工作区（含 `.git/` 全历史）打成加密 tar.gz 写入 `~/.zcode/v2/checkpoints/<工作区hash>/pending/*.tar.gz.enc`，经 zcode.z.ai 拿凭证直传阿里云 OSS；设置开关无效，凭证 API 与模型 API 同域**不能封网络**（2026-09 本机验证，[机制分析文章](https://blog.ferstar.org/posts/zcode-silent-workspace-snapshot-upload/)）。防护 = `chflags uchg` 不可变锁（macOS 用户级，无需 sudo）——ZCode 写不进去，快照链路死亡。**不碰网络、不碰进程**，对运行中的 ZCode 无侵入。
+- **两种开启模式**（确认弹窗二选一，2026-09-19）：
+  - **保留并锁定**（推荐）：现有快照**原地保留（加密、只读）**，**递归锁整棵树**（`chflags -R uchg`）——必须递归：uchg 只锁目录自身的条目表，只锁根目录挡不住已存在子目录内的写入（key-rules #16）。上传记录照常实时显示、行尾 📂 可打开快照目录；
+  - **删除并锁定**：先留档记录清单再清空全部快照，重建空目录后锁根目录——原始上传记录随之消失（仅剩留档），确认弹窗明示。
+  - 共同代价：损失**「检查点回滚 / 时间线」**（state.json 无法更新）；对话/补全/工具调用不受影响；随时解除（保留模式快照原地恢复可写，删除模式空目录由 ZCode 自动重建）。
 - **卡片口径**：
   - 状态徽标 🔒 已防护（绿色描边）/ 🔓 未防护，由**写入探测**判定（在目录里 create+delete 临时文件，创建失败 = 已锁；目录不存在 = 未锁）；
-  - 数据行随状态切换：未防护 = `已积累工件 N 个 · X · 覆盖 M 个工作区 · ZCode 记录上传失败 K 次`（工件 = `**/pending/*.enc` 逐文件实测体积，K = 各 `state.json` 的 `failureCount` 求和，损坏的跳过但仍计工件与目录数；扫描 5s 节流）；防护中 = `防护生效中：快照目录已清空并锁定…`（清空后全零统计没有信息量，改说生效语义）；
+  - 数据行三态：未防护 = `本地已积累加密快照 N 个 · X · 覆盖 M 个项目 · 上传失败 K 次`（N = `**/pending/*.enc` 逐文件实测，K = 各 `state.json` 的 `failureCount` 求和；扫描 5s 节流，**保留模式锁定后只读扫描照常工作**）；防护中·快照已保留 = `防护生效中（快照已保留）：N 个只读锁定（共 X）…`；防护中·快照已删除 = `防护生效中（快照已删除）：目录已清空并锁定…（留档 N 条可回看）`；
   - 防护中追加 `防护开启后 P 轮对话 · 新快照落盘 0 个`——P 为锁定后的对话轮次：锁定时刻的 `calls_today` 基线存 `~/.zcode/speed-panel-guard.json`，poller 每拍按 calls 增量累计并落盘。**增量基准 `calls_seen` 同样落盘并在启动时恢复**（只存内存时重启归零，首拍把全天计数整包计入——实测 15 分钟虚增至 3412；差分走纯函数 `accrue_rounds`，跨天回退按 0 增量重置基准拍）；目录已锁但 guard.json 无记录（用户手动 chflags / 重装面板）时首拍补记基线。
-- **与上传记录联动**（防护清空目录后磁盘扫描必为空，右栏不能静默空白）：
-  - 网络卡"快照上传记录"列表为空时渲染占位——防护中 = 🔒 锁横幅 + **防护前的原上传记录**（`~/.zcode/speed-panel-ckpt-history.json` 留档，状态「已上传 ✓」整体压暗，旧版本未留档时退回今日名单）；平时 = "暂无快照记录"灰字；
+- **与上传记录联动**：
+  - 网络卡"快照上传记录"行尾 **📂 按钮**：在系统文件管理器中打开该工作区的快照目录（`open_checkpoint_dir` 命令，mac `open` / Windows `explorer`，**跨平台**；目录名经 `valid_hash_name` 白名单校验防路径穿越，目录不存在如实报错）。只有磁盘上真实存在的行（实时扫描）才渲染——留档历史行没有 hash 不出按钮；
+  - 防护中：保留模式横幅 `🔒 以下快照已锁定保留（只读）` + 实时行照常显示且可点开；删除模式（扫描为空）= 🔒 锁横幅 + **防护前留档行**（`~/.zcode/speed-panel-ckpt-history.json`，状态「已上传 ✓」整体压暗，旧版本未留档时退回今日名单）；平时列表空 = "暂无快照记录"灰字——右栏任何状态不静默空白；
   - net 状态行（`net-ckpt-info`）locked 时切 🔒 分支：`防护已开启 · 新快照落盘被阻断`，今日量标注"防护前"（防护开启后不可能再有"上传中"脉冲）；
-  - 复制/导出报告在防护中追加「防护前原上传记录」节（取证仍完整）。
-- **先留档再清空**：apply 删除 checkpoints 前，把当时的上传记录行（每工作区最近一次快照，复用 netio 的解析与行构建，口径与实时列表一致）合并存入 ckpt-history.json——同工作区新行覆盖旧行、按时刻倒序、上限 500 行（`merge_history` 纯函数，测试守护）；重复开启/解除再开启不丢历史。
+  - 复制/导出报告在防护中（删除模式）追加「防护前原上传记录」节（取证仍完整）。
+- **先留档再清空（删除模式）**：apply 删除 checkpoints 前，把当时的上传记录行（每工作区最近一次快照，复用 netio 的解析与行构建，口径与实时列表一致）合并存入 ckpt-history.json——同工作区新行覆盖旧行、按时刻倒序、上限 500 行（`merge_history` 纯函数，测试守护）；重复开启/解除再开启不丢历史。保留模式不写留档（记录未销毁）。
 - **防护原理与监控边界 hover**：卡片标题悬停展示机制说明（先落盘再上传 → 锁目录 = 断链路）+ 如实声明监控边界（锁状态每拍探测 / 已知机制下 0 新快照为阻断证据 / 整机流量兜底但 mac 无按进程归属，换直传机制只能靠流量异常发现）——不承诺 100% 拦截。
 - **术语**：用户可见文案统一「快照 / 加密快照」，不用内部黑话「工件」（2026-09-18 用户反馈"不要自己取名字"）。
-- **命令**：`snapshot_guard_status` / `snapshot_guard_apply` / `snapshot_guard_release`（均注册在 generate_handler）；状态另随 metrics payload 的 `guard` 字段每拍附带。apply = 先 nouchg（幂等）→ 清空 → 重建空目录 → uchg → 写入探测校验 → 记 guard.json；release = nouchg + 清空计数，目录内容留空由 ZCode 自动重建。**确认弹窗在前端**（`#guard-confirm`，复用模型弹窗遮罩风格）——开启文案五点缺一不可：损失检查点回滚 / 对话不受影响 / 删除现有快照且原始上传记录随之消失 / 自动备份上传记录清单（只备份清单，快照文件等明细不备份、删后不可恢复）/ 可逆（key-rules #16 知情同意）。
-- **平台**：`chflags` 仅 macOS——其他平台卡片仍显示但按钮禁用、标题右侧标注"文件锁仅支持 macOS"（沿用连接明细"仅 Windows"的如实降级先例）。
-- **守护测试**：`state_summary_parse_and_aggregate`（failureCount 求和 / 工件体积累计 / 损坏容错）、`guard_status_serializes_locked_fields`（状态字段 camelCase 序列化契约 + guard.json 往返）。
+- **命令**：`snapshot_guard_status` / `snapshot_guard_apply(keepFiles)` / `snapshot_guard_release` / `open_checkpoint_dir(hash)`（均注册在 generate_handler）；状态另随 metrics payload 的 `guard` 字段每拍附带。apply(keep=true) = 递归 uchg（快照保留）；apply(keep=false) = 留档 → 清空 → 重建 → uchg 根目录；release = **递归 nouchg**（兼容保留模式的整树锁）+ 清空计数，**文件一律不动**。**确认弹窗在前端**（`#guard-confirm`）——双模式按钮：「保留快照并锁定」（主按钮）/「删除快照并锁定」（红色 danger 样式）；删除模式的五点知情同意缺一不可：损失检查点回滚 / 对话不受影响 / 原始上传记录随之消失 / 自动备份仅清单（快照文件等明细删后不可恢复）/ 可逆（key-rules #16）。
+- **平台**：`chflags` 仅 macOS——其他平台卡片仍显示但按钮禁用、标题右侧标注"文件锁仅支持 macOS"（沿用连接明细"仅 Windows"的如实降级先例）。**📂 打开目录是独立命令，Windows 同样可用**（记录列表本身跨平台）。
+- **守护测试**：`state_summary_parse_and_aggregate`（failureCount 求和 / 快照体积累计 / 损坏容错）、`guard_status_serializes_locked_fields`（状态字段 camelCase 序列化契约 + guard.json 往返）、`accrue_rounds_counts_real_delta_only`、`merge_history_replaces_same_workspace_keeps_rest`、`valid_hash_name_rejects_traversal`（路径穿越拒绝）。
 
 ## 仪表与曲线（gauges.ts）
 

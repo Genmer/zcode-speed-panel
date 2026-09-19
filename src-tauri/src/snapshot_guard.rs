@@ -134,7 +134,19 @@ pub(crate) fn accrue_rounds(blocked: u64, calls_seen: u64, calls_today: u64) -> 
     (blocked + calls_today.saturating_sub(calls_seen), calls_today)
 }
 
-fn checkpoints_dir() -> Option<PathBuf> {
+/// checkpoints 下的工作区子目录名校验（纯函数，可测）：白名单字符 +
+/// 长度上限——"打开目录"命令按它拼路径，必须拒绝路径穿越（..、斜杠、
+/// 绝对路径、隐藏名等统统不放行）
+pub(crate) fn valid_hash_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// checkpoints 目录（main.rs 的"打开目录"命令与防护共用）
+pub(crate) fn checkpoints_dir() -> Option<PathBuf> {
     crate::metrics::home_dir().map(|h| h.join(".zcode").join("v2").join("checkpoints"))
 }
 
@@ -205,10 +217,16 @@ fn save_guard_file(f: &GuardFile) {
 }
 
 /// chflags uchg/nouchg（std::process::Command，用户自有目录无需 sudo）。
-/// 仅在 SUPPORTED 平台被调用
-fn set_immutable(dir: &Path, lock: bool) -> Result<(), String> {
+/// 仅在 SUPPORTED 平台被调用。recursive = 连同子目录/文件整树上锁
+/// （保留模式必须递归：uchg 只管目录自身的条目表，只锁根目录挡不住
+/// 已存在工作区子目录内的写入，见 key-rules #16）
+fn set_immutable(dir: &Path, lock: bool, recursive: bool) -> Result<(), String> {
     let flag = if lock { "uchg" } else { "nouchg" };
-    let st = std::process::Command::new("chflags")
+    let mut cmd = std::process::Command::new("chflags");
+    if recursive {
+        cmd.arg("-R");
+    }
+    let st = cmd
         .arg(flag)
         .arg(dir)
         .status()
@@ -216,7 +234,7 @@ fn set_immutable(dir: &Path, lock: bool) -> Result<(), String> {
     if st.success() {
         Ok(())
     } else {
-        Err(format!("chflags {flag} 未成功（exit {:?}）", st.code()))
+        Err(format!("chflags {}{} 未成功（exit {:?}）", if recursive { "-R " } else { "" }, flag, st.code()))
     }
 }
 
@@ -362,33 +380,50 @@ impl SnapshotGuard {
         self.status(locked)
     }
 
-    /// 开启防护（前端已过确认弹窗）：**先留档再清空**（当时的上传记录行
-    /// 合并进 ckpt-history.json，防护期间可完整回看）→ 解锁（幂等）→
-    /// 清空 checkpoints → 重建空目录 → uchg 锁定 → 写入探测校验 →
-    /// 记录 guard.json（锁定时刻 + calls 基线）
-    pub fn apply(&mut self, calls_today: u64, now_ms: i64) -> Result<SnapshotGuardStatus, String> {
+    /// 开启防护（前端已过确认弹窗，keep_files = 用户选择保留/删除现有快照）：
+    ///
+    /// - **保留模式**（keep_files=true）：上传记录清点后**递归锁定整棵树**
+    ///   （`chflags -R uchg`）——快照文件原地保留（加密、只读），列表仍可
+    ///   查看与打开；记录未销毁，不写历史留档。必须递归：uchg 只管目录自身
+    ///   条目表，只锁根目录挡不住已存在子目录里的写入；
+    /// - **删除模式**（keep_files=false）：**先留档再清空**（上传记录行合并
+    ///   进 ckpt-history.json，防护期间可回看）→ 重建空目录 → uchg 锁根目录。
+    ///
+    /// 两条路都过写入探测校验后记录 guard.json（锁定时刻 + calls 基线）
+    pub fn apply(
+        &mut self,
+        calls_today: u64,
+        now_ms: i64,
+        keep_files: bool,
+    ) -> Result<SnapshotGuardStatus, String> {
         if !SUPPORTED {
             return Err("文件锁仅支持 macOS（chflags）".into());
         }
         let dir = checkpoints_dir().ok_or("无法定位用户目录")?;
-        // 留档：清空前把每工作区最近一次快照的记录行存下来（复用 netio
-        // 的解析与行构建，口径与实时列表完全一致）
-        let (_, obs) = crate::netio::scan_ckpt_states(&dir);
-        let states: HashMap<String, _> = obs.into_iter().collect();
-        let rows = crate::netio::ckpt_rows(&states);
-        if !rows.is_empty() || !self.history.is_empty() {
-            let merged = merge_history(std::mem::take(&mut self.history), rows);
-            save_history(&GuardHistory { saved_at_ms: now_ms, rows: merged.clone() });
-            self.history = merged;
-        }
+        // 上代防护可能是递归锁（保留模式），先整树解锁才能改动（幂等）
         if probe_locked(&dir) {
-            set_immutable(&dir, false)?;
+            set_immutable(&dir, false, true)?;
         }
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir).map_err(|e| format!("清空 checkpoints 失败: {e}"))?;
+        if keep_files {
+            std::fs::create_dir_all(&dir).map_err(|e| format!("重建 checkpoints 目录失败: {e}"))?;
+            set_immutable(&dir, true, true)?;
+        } else {
+            // 留档：清空前把每工作区最近一次快照的记录行存下来（复用 netio
+            // 的解析与行构建，口径与实时列表完全一致）
+            let (_, obs) = crate::netio::scan_ckpt_states(&dir);
+            let states: HashMap<String, _> = obs.into_iter().collect();
+            let rows = crate::netio::ckpt_rows(&states);
+            if !rows.is_empty() || !self.history.is_empty() {
+                let merged = merge_history(std::mem::take(&mut self.history), rows);
+                save_history(&GuardHistory { saved_at_ms: now_ms, rows: merged.clone() });
+                self.history = merged;
+            }
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir).map_err(|e| format!("清空 checkpoints 失败: {e}"))?;
+            }
+            std::fs::create_dir_all(&dir).map_err(|e| format!("重建 checkpoints 目录失败: {e}"))?;
+            set_immutable(&dir, true, false)?;
         }
-        std::fs::create_dir_all(&dir).map_err(|e| format!("重建 checkpoints 目录失败: {e}"))?;
-        set_immutable(&dir, true)?;
         if !probe_locked(&dir) {
             return Err("锁定未生效（写入探测仍成功），请检查目录权限".into());
         }
@@ -401,19 +436,24 @@ impl SnapshotGuard {
         self.last_calls = calls_today;
         self.scan = ScanSummary::default();
         self.last_scan = Some(std::time::Instant::now());
+        // 保留模式下立即重扫一次，让状态行如实显示"快照已保留 N 个"
+        if keep_files {
+            self.scan = scan_checkpoints(&dir);
+        }
         save_guard_file(&self.file);
         Ok(self.status(true))
     }
 
-    /// 解除防护：nouchg 解锁（目录留空，ZCode 检测不到内容会自动重建
-    /// state.json/pending 等）；清空 guard.json 计数
+    /// 解除防护：递归 nouchg 解锁（兼容保留模式的整树锁）；文件一律不动——
+    /// 删除模式目录本就为空，保留模式快照原地恢复可写，ZCode 自动续上。
+    /// 清空 guard.json 计数
     pub fn release(&mut self, calls_today: u64) -> Result<SnapshotGuardStatus, String> {
         if !SUPPORTED {
             return Err("文件锁仅支持 macOS（chflags）".into());
         }
         let dir = checkpoints_dir().ok_or("无法定位用户目录")?;
         if probe_locked(&dir) {
-            set_immutable(&dir, false)?;
+            set_immutable(&dir, false, true)?;
         }
         self.file = GuardFile::default();
         self.last_calls = calls_today;
@@ -476,6 +516,7 @@ mod tests {
                 recorded_ms: 1_788_000_000_000,
                 accepted: true,
                 uploading: false,
+                hash: Some("ab12cd34".into()),
             }],
         };
         let json = serde_json::to_value(&st).unwrap();
@@ -527,6 +568,7 @@ mod tests {
             recorded_ms: ms,
             accepted: true,
             uploading: false,
+            hash: None,
         };
         let old = vec![row("a", 100, 10), row("b", 200, 20), row("c", 300, 30)];
         let new = vec![row("b", 900, 99), row("d", 800, 40)];
@@ -538,5 +580,22 @@ mod tests {
         let many = (0..600).map(|i| row(&format!("w{i}"), i, 1)).collect();
         assert_eq!(merge_history(Vec::new(), many).len(), 500);
         assert_eq!(merge_history(Vec::new(), Vec::new()), Vec::new());
+    }
+
+    /// "打开目录"的目录名白名单：路径穿越（../、斜杠、绝对路径、点开头）
+    /// 一律拒绝，只放行 ZCode 生成的哈希形态
+    #[test]
+    fn valid_hash_name_rejects_traversal() {
+        assert!(valid_hash_name("ab12cd34"));
+        assert!(valid_hash_name("A-b_C9"));
+        assert!(!valid_hash_name(""));
+        assert!(!valid_hash_name(".."));
+        assert!(!valid_hash_name("a/b"));
+        assert!(!valid_hash_name("a\\b"));
+        assert!(!valid_hash_name("/etc"));
+        assert!(!valid_hash_name(".hidden"));
+        assert!(!valid_hash_name("a b"));
+        assert!(!valid_hash_name("哈希"));
+        assert!(!valid_hash_name(&"x".repeat(129)));
     }
 }

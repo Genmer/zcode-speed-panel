@@ -20,6 +20,8 @@ export interface CkptStat {
   recordedMs: number;
   accepted: boolean;
   uploading: boolean;
+  /** checkpoints 下的工作区子目录名（点 📂 打开该目录）；留档旧行无此字段 */
+  hash?: string;
 }
 
 /** ZCode 连接明细行（与后端 ConnStat 同形）：两组均为 ZCode 自身进程 */

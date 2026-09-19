@@ -59,10 +59,13 @@ export function renderGuard(g: GuardStatus | null): void {
   if (!g.supported) {
     e.scope.textContent = "文件锁仅支持 macOS";
   }
-  // 未防护 = 实时扫描统计（那是 ZCode 已落盘的真实库存）；防护中 = 生效
-  // 语义（清空后全零统计没有信息量）。术语用"加密快照"，不用内部黑话
+  // 状态三态（术语用平实词，不用内部黑话）：
+  // 未防护 = 实时扫描统计；防护中·快照已保留 = 递归锁、文件只读留原地；
+  // 防护中·快照已删除 = 空目录锁定，仅剩留档清单可回看
   e.stats.textContent = g.locked
-    ? `防护生效中：快照目录已清空并锁定，ZCode 写不进新快照；防护前的上传记录在上方列表完整保留（${g.history.length} 条）`
+    ? g.artifactCount > 0
+      ? `防护生效中（快照已保留）：${g.artifactCount} 个加密快照锁定在本地只读（共 ${fmtBytes(g.artifactBytes)}）· ZCode 写不进新快照；记录仍可看、可点 📂 打开`
+      : `防护生效中（快照已删除）：目录已清空并锁定，ZCode 写不进新快照；防护前的上传记录在上方列表完整保留（${g.history.length} 条）`
     : g.artifactCount > 0
       ? `本地已积累加密快照 ${g.artifactCount} 个 · 共 ${fmtBytes(g.artifactBytes)} · ` +
         `覆盖 ${g.workspaceCount} 个项目 · ZCode 记录上传失败 ${g.failureCount} 次`
@@ -93,6 +96,7 @@ export function initGuard(invoke: InvokeFn): void {
   const title = $("guard-confirm-title");
   const text = $("guard-confirm-text");
   const okBtn = $<HTMLButtonElement>("guard-confirm-ok");
+  const keepBtn = $<HTMLButtonElement>("guard-confirm-keep");
 
   /** 弹窗当前待执行的动作（null = 关闭态） */
   let pendingAction: "apply" | "release" | null = null;
@@ -123,21 +127,47 @@ export function initGuard(invoke: InvokeFn): void {
     modal.style.display = "none";
   };
 
+  /** 执行防护开启/解除；apply 带 keepFiles（保留模式递归锁，删除模式清空后锁） */
+  const runAction = (cmd: string, args: Record<string, unknown>, okMsg: string, btn: HTMLButtonElement) => {
+    if (busy) return;
+    busy = true;
+    btn.disabled = true;
+    invoke<GuardStatus>(cmd, args)
+      .then((st) => {
+        if (st) renderGuard(st);
+        flashMsg(okMsg);
+        closeConfirm();
+      })
+      .catch((err) => flashMsg(`执行失败：${err}`, true))
+      .finally(() => {
+        busy = false;
+        btn.disabled = false;
+      });
+  };
+
   const openConfirm = (action: "apply" | "release") => {
     if (!latest) return;
     pendingAction = action;
     text.replaceChildren();
     if (action === "apply") {
+      // 双模式确认：保留（推荐，快照只读留原地）与删除（必须明示原始记录
+      // 消失 + 仅备份清单——key-rules #16 知情同意）。共同要点两条在前，
+      // 模式差异各自标明
       title.textContent = "开启快照防护？";
-      okBtn.textContent = "确认开启";
-      // 知情同意要点（用户逐条要求）：损失检查点回滚 / 对话不受影响 /
-      // 删除现有快照且原始上传记录消失 / 自动备份但只备份清单（明细不备份）/ 可逆
+      keepBtn.hidden = false;
+      okBtn.hidden = false;
+      okBtn.textContent = "删除快照并锁定";
+      okBtn.classList.add("danger-btn");
       const lines = [
+        // 共同
         "开启后将损失 **「检查点回滚 / 时间线」功能**——无法再回滚到历史检查点",
         "模型对话、代码补全、工具调用**不受任何影响**",
-        `将删除本地已积累的 ${latest.artifactCount} 个加密快照（共 ${fmtBytes(latest.artifactBytes)}）并锁定目录——**原始上传记录会随之消失**`,
-        "删除前会自动备份上传记录清单（时间 / 工作区 / 加密后大小 / 状态），防护期间可在上方列表回看；**只备份清单**——快照文件等明细不备份，删除后无法恢复",
-        "随时可解除防护（目录会自动重建）",
+        // 保留模式
+        `**「保留并锁定」**：本地已积累的 ${latest.artifactCount} 个加密快照（共 ${fmtBytes(latest.artifactBytes)}）**原地保留（只读）**，上传记录仍完整可看、可点 📂 打开快照目录`,
+        // 删除模式（用户逐条要求的知情同意）
+        `**「删除并锁定」**：删除全部快照——**原始上传记录会随之消失**；删除前自动备份记录清单（时间 / 工作区 / 加密后大小 / 状态），防护期间可在上方列表回看，**只备份清单**，快照文件等明细删除后无法恢复`,
+        // 共同
+        "随时可解除防护（保留的快照原地恢复，空目录由 ZCode 自动重建）",
       ];
       for (const raw of lines) {
         const p = document.createElement("p");
@@ -146,9 +176,12 @@ export function initGuard(invoke: InvokeFn): void {
       }
     } else {
       title.textContent = "解除快照防护？";
+      keepBtn.hidden = true;
+      okBtn.hidden = false;
       okBtn.textContent = "确认解除";
+      okBtn.classList.remove("danger-btn");
       const p = document.createElement("p");
-      p.textContent = "解除后 ZCode 将恢复快照捕获与上传（再次开启可随时阻断）。";
+      p.textContent = "解除后 ZCode 将恢复快照捕获与上传（再次开启可随时阻断；保留的快照原地恢复可写）。";
       text.append(p);
     }
     modal.style.display = "flex";
@@ -156,23 +189,18 @@ export function initGuard(invoke: InvokeFn): void {
 
   els.applyBtn.addEventListener("click", () => openConfirm("apply"));
   els.releaseBtn.addEventListener("click", () => openConfirm("release"));
+  keepBtn.addEventListener("click", () => {
+    if (pendingAction !== "apply") return;
+    runAction("snapshot_guard_apply", { keepFiles: true }, "已开启防护（快照已保留锁定）✓", keepBtn);
+  });
   okBtn.addEventListener("click", () => {
     const action = pendingAction;
-    if (!action || busy) return;
-    busy = true;
-    okBtn.disabled = true;
-    const cmd = action === "apply" ? "snapshot_guard_apply" : "snapshot_guard_release";
-    invoke<GuardStatus>(cmd)
-      .then((st) => {
-        if (st) renderGuard(st);
-        flashMsg(action === "apply" ? "已开启防护 ✓" : "已解除防护 ✓");
-        closeConfirm();
-      })
-      .catch((err) => flashMsg(`执行失败：${err}`, true))
-      .finally(() => {
-        busy = false;
-        okBtn.disabled = false;
-      });
+    if (!action) return;
+    if (action === "apply") {
+      runAction("snapshot_guard_apply", { keepFiles: false }, "已开启防护（快照已删除）✓", okBtn);
+    } else {
+      runAction("snapshot_guard_release", {}, "已解除防护 ✓", okBtn);
+    }
   });
   $("guard-confirm-cancel").addEventListener("click", closeConfirm);
   $("guard-confirm-close").addEventListener("click", closeConfirm);

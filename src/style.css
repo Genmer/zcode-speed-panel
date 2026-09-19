@@ -603,6 +603,37 @@ main {
   font-weight: 600;
 }
 
+/* 行尾"打开快照目录"按钮（mac Finder / Win 资源管理器；仅磁盘上真实
+   存在的行渲染——留档历史行没有 hash 不出按钮） */
+.ckpt-open {
+  flex: none;
+  margin-left: 2px;
+  padding: 0 4px;
+  font-size: 12px;
+  line-height: 18px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.ckpt-open:hover {
+  border-color: rgba(255, 255, 255, 0.2);
+  color: var(--text);
+}
+
+/* 弹窗里的破坏性确认按钮（删除快照并锁定）——红字红框与普通确认区分 */
+.ghost-btn.danger-btn {
+  border-color: rgba(248, 113, 113, 0.45);
+  color: #f87171;
+}
+
+.ghost-btn.danger-btn:hover {
+  border-color: rgba(248, 113, 113, 0.8);
+  background: rgba(248, 113, 113, 0.08);
+}
+
 /* 防护开启后的历史行（今日防护前已上传的工件）：整体压暗，与实时记录区分 */
 .ckpt-row.history {
   opacity: 0.62;

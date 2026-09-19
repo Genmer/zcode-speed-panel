@@ -778,23 +778,57 @@ fn snapshot_guard_status(app: AppHandle) -> snapshot_guard::SnapshotGuardStatus 
     guard.tick(calls, epoch_ms())
 }
 
-/// 开启防护：清空并锁定 ~/.zcode/v2/checkpoints（前端已过确认弹窗）
+/// 开启防护（前端已过确认弹窗，keep_files = 保留现有快照递归锁 / 删除后锁空目录）
 #[tauri::command]
-fn snapshot_guard_apply(app: AppHandle) -> Result<snapshot_guard::SnapshotGuardStatus, String> {
+fn snapshot_guard_apply(
+    app: AppHandle,
+    keep_files: Option<bool>,
+) -> Result<snapshot_guard::SnapshotGuardStatus, String> {
     let state = app.state::<AppState>();
     // 锁定时刻的 calls_today 基线取实时真值（Engine 只读聚合，一次性开销可接受）
     let calls = state.engine.lock().unwrap().snapshot().calls_today;
-    let result = state.guard.lock().unwrap().apply(calls, epoch_ms());
+    let result = state
+        .guard
+        .lock()
+        .unwrap()
+        .apply(calls, epoch_ms(), keep_files.unwrap_or(false));
     result
 }
 
-/// 解除防护：解锁目录（内容留空，ZCode 自动重建），清空计数
+/// 解除防护：递归解锁（文件不动——删除模式目录本就为空，保留模式快照原地恢复可写）
 #[tauri::command]
 fn snapshot_guard_release(app: AppHandle) -> Result<snapshot_guard::SnapshotGuardStatus, String> {
     let state = app.state::<AppState>();
     let calls = state.engine.lock().unwrap().snapshot().calls_today;
     let result = state.guard.lock().unwrap().release(calls);
     result
+}
+
+/// 在系统文件管理器中打开某工作区的快照目录（上传记录行的 📂，跨平台：
+/// mac Finder / Windows 资源管理器）。hash 为 checkpoints 下子目录名，
+/// 白名单校验防路径穿越；目录不存在（快照已删除/未生成）如实报错
+#[tauri::command]
+fn open_checkpoint_dir(hash: String) -> Result<(), String> {
+    if !snapshot_guard::valid_hash_name(&hash) {
+        return Err("非法的工作区目录名".into());
+    }
+    let dir = snapshot_guard::checkpoints_dir()
+        .ok_or("无法定位用户目录")?
+        .join(&hash);
+    if !dir.is_dir() {
+        return Err("该工作区的快照目录不存在（快照可能已被删除或尚未生成）".into());
+    }
+    #[cfg(target_os = "macos")]
+    let st = std::process::Command::new("open").arg(&dir).spawn();
+    #[cfg(target_os = "windows")]
+    let st = std::process::Command::new("explorer").arg(&dir).spawn();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = &dir;
+        return Err("仅支持 macOS / Windows".into());
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    st.map(|_| ()).map_err(|e| format!("打开目录失败: {e}"))
 }
 
 /// 模型速度趋势：只读查询 usage 库按模型 × 桶聚合（详情弹窗打开期间前端每 5s 拉取）。
@@ -1474,7 +1508,8 @@ fn main() {
             open_url,
             snapshot_guard_status,
             snapshot_guard_apply,
-            snapshot_guard_release
+            snapshot_guard_release,
+            open_checkpoint_dir
         ])
         .setup(|app| {
             // mac：Accessory 模式——无 Dock 图标、不进 Cmd+Tab，常驻菜单栏托盘；

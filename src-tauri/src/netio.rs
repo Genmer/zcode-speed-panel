@@ -76,13 +76,15 @@ pub fn sess_bytes_est(uncached_input_tokens: u64, output_tokens: u64) -> (u64, u
 /// 不截断——全部工作区都要能列出（用户明确要求，2026-09-18）
 pub(crate) fn ckpt_rows(states: &HashMap<String, CkptState>) -> Vec<crate::metrics::CkptStat> {
     let mut rows: Vec<crate::metrics::CkptStat> = states
-        .values()
-        .map(|s| crate::metrics::CkptStat {
+        .iter()
+        .map(|(hash, s)| crate::metrics::CkptStat {
             workspace: if s.workspace.is_empty() { "?".into() } else { s.workspace.clone() },
             bytes: s.artifact_bytes,
             recorded_ms: s.recorded_at.unwrap_or(0),
             accepted: s.accepted_hash.is_some(),
             uploading: s.uploading,
+            // 子目录名 = 工作区哈希，前端"打开目录"按它拼路径
+            hash: Some(hash.clone()),
         })
         .collect();
     rows.sort_by(|a, b| {
@@ -919,6 +921,7 @@ impl NetIo {
                         recorded_ms: u.get("at").and_then(|x| x.as_i64()).unwrap_or(0),
                         accepted: true,
                         uploading: false,
+                        hash: None, // 持久化 JSON 只存名单字段，无目录名
                     })
                     .collect()
             })
@@ -975,6 +978,7 @@ impl NetIo {
                         recorded_ms: ev.recorded_ms,
                         accepted: true,
                         uploading: false,
+                        hash: None, // 今日名单按工作区记，不掺目录名
                     });
                     while self.today_uploads.len() > 100 {
                         self.today_uploads.remove(0);
