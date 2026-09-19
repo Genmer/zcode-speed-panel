@@ -924,7 +924,10 @@ if (hasTauri) {
     currentWindow().then((w) => w.minimize()).catch(() => {});
   });
   $("wc-max").addEventListener("click", () => {
-    tauriInvoke("toggle_maximize_safe").catch(() => {});
+    // mac 绿色交通灯 = 原生全屏（符合 mac 语言，所在屏进出）；Windows ▢ =
+    // 安全最大化（双击顶栏同款）。mac 的"铺满当前屏"走双击顶栏
+    if (isMac) tauriInvoke("toggle_fullscreen").catch(() => {});
+    else tauriInvoke("toggle_maximize_safe").catch(() => {});
   });
   $("wc-close").addEventListener("click", () => requestMode("float"));
 } else {

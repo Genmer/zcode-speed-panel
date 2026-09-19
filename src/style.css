@@ -212,11 +212,12 @@ main {
 }
 
 /* 当前速度卡右上角的"上一轮调用速度"小圆环：小而独立，不占主表布局；
-   尺寸受卡片顶角留白限制（窗口最小宽度 720 时主表弧线已贴近顶角） */
+   尺寸受卡片顶角留白限制（窗口最小宽度 720 时主表弧线已贴近顶角）。
+   inset 与左上角 ⟳ 按钮（8/8）呼应平衡，不贴卡片边缘 */
 .gauge-card canvas.corner-gauge {
   position: absolute;
-  top: 6px;
-  right: 8px;
+  top: 8px;
+  right: 10px;
   width: 56px;
   height: 56px;
 }
@@ -902,11 +903,12 @@ body.float-mode.style-pill #float-pill {
   height: 100%;
 }
 
-/* 仪表悬浮窗右上角的上轮小环（与完整面板当前速度卡的角标同款，尺寸随窗口缩小） */
+/* 仪表悬浮窗右上角的上轮小环（与完整面板当前速度卡的角标同款，尺寸随窗口缩小）；
+   top/right 对称留白，不贴窗边（原 right:4 太靠边） */
 .float-badge {
   position: absolute;
-  top: 6px;
-  right: 4px;
+  top: 8px;
+  right: 8px;
   width: 46px;
   height: 46px;
 }

@@ -995,6 +995,15 @@ fn toggle_window_maximize(window: &tauri::WebviewWindow) {
     }
 }
 
+/// 原生全屏切换（mac 绿色交通灯专用，2026-09-19 用户要求符合 mac 语言；
+/// 原生全屏在所在屏进入/退出，无副屏跳屏问题）。与「安全最大化」
+/// （双击顶栏 / Windows ▢）相互独立：退出全屏由系统还原进入前的窗口框
+#[tauri::command]
+fn toggle_fullscreen(window: tauri::WebviewWindow) {
+    let cur = window.is_fullscreen().unwrap_or(false);
+    let _ = window.set_fullscreen(!cur);
+}
+
 /// 多屏安全最大化/还原：macOS 无边框窗口原生 toggle_maximize 会跳回主屏，
 /// 此处按窗口中心点所在显示器铺满（避让菜单栏）；Windows 直接调用系统最大化
 #[tauri::command]
@@ -1499,6 +1508,7 @@ fn main() {
             set_float_size,
             quit_app,
             toggle_maximize_safe,
+            toggle_fullscreen,
             recalibrate,
             tray_hint_once,
             check_update,
