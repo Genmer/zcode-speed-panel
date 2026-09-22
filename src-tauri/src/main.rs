@@ -432,7 +432,26 @@ fn switch_mode(app: &AppHandle, mode: Mode) {
     let p = state.persist.lock().unwrap().clone();
     let pet_extra = *state.pet_task_extra.lock().unwrap();
     if let Some(window) = app.get_webview_window("main") {
-        apply_mode(&window, mode, style, &p, pet_extra);
+        // 原生全屏中收起：先退出全屏，等系统还原动画走完再套悬浮窗尺寸——
+        // 过渡期 set_size 会被系统还原帧覆盖，出现"全屏大小的悬浮窗"
+        //（2026-09-19 用户实测报告）
+        #[cfg(target_os = "macos")]
+        let in_fullscreen = window.is_fullscreen().unwrap_or(false);
+        #[cfg(not(target_os = "macos"))]
+        let in_fullscreen = false;
+        if in_fullscreen {
+            let _ = window.set_fullscreen(false);
+            let win = window.clone();
+            let app2 = app.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(700));
+                let _ = app2.run_on_main_thread(move || {
+                    apply_mode(&win, mode, style, &p, pet_extra);
+                });
+            });
+        } else {
+            apply_mode(&window, mode, style, &p, pet_extra);
+        }
     }
     save_all(app);
     let _ = app.emit("mode", mode.as_str());
